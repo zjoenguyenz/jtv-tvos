@@ -1,5 +1,22 @@
 import SwiftUI
 
+private struct TVBrowseConditionalFocusSection: ViewModifier {
+    let enabled: Bool
+    func body(content: Content) -> some View {
+        if enabled {
+            content.focusSection()
+        } else {
+            content
+        }
+    }
+}
+
+private extension View {
+    func browseFocusSection(if enabled: Bool) -> some View {
+        modifier(TVBrowseConditionalFocusSection(enabled: enabled))
+    }
+}
+
 /// JTV tvOS Phase 2 — per-source browse (the iOS CategoryDetailView
 /// port), the shared poster grid, the filter sheet, and the shared
 /// navigation plumbing (route destinations + the per-tab nav path
@@ -111,12 +128,20 @@ struct TVPosterGrid: View {
                     .preference(key: TVWidthKey.self, value: proxy.size.width)
             }
         }
-        .onPreferenceChange(TVWidthKey.self) { measuredWidth = $0 }
+        .onPreferenceChange(TVWidthKey.self) { [binding = $measuredWidth] in binding.wrappedValue = $0 }
+    }
+}
+
+extension Array where Element == Movie {
+    /// Order-preserving dedupe by id — first occurrence wins.
+    func uniquedById() -> [Movie] {
+        var seen = Set<String>()
+        return filter { seen.insert($0.id).inserted }
     }
 }
 
 struct TVWidthKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
+    static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
     }
@@ -161,7 +186,6 @@ struct TVBrowseView: View {
     @State private var showFilters = false
     @State private var loadGeneration = 0
     @FocusState private var filterFocused: Bool
-    @Namespace private var focusNS
 
     init(pluginId: String, slug: String, title: String, initialFilters: ListFilters) {
         self.pluginId = pluginId
@@ -177,13 +201,12 @@ struct TVBrowseView: View {
                 headerBand
                     .focusSection()
                 contentBand
-                    .focusSection()
             }
             .padding(.horizontal, 80)
             .padding(.vertical, 36)
         }
         .tvThemedBackground()
-        .focusScope(focusNS)
+        .defaultFocus($filterFocused, true)
         .onAppear { session.touch() }
         .task { if !didLoad { await reload() } }
         .onChange(of: filters) { _, _ in Task { await reload() } }
@@ -231,6 +254,7 @@ struct TVBrowseView: View {
         } else if let loadError, items.isEmpty {
             TVErrorState(message: loadError) { Task { await reload() } }
                 .frame(minHeight: 300)
+                .focusSection()
         } else if didLoad && items.isEmpty {
             TVEmptyState(icon: "film.stack", title: "Không có nội dung")
                 .frame(minHeight: 300)
@@ -238,7 +262,7 @@ struct TVBrowseView: View {
             TVPosterGrid(items: items, pluginId: pluginId,
                          isLoadingMore: isLoadingMore,
                          onLoadMore: { Task { await loadMore() } })
-                .prefersDefaultFocus(true, in: focusNS)
+                .browseFocusSection(if: !items.isEmpty)
         }
     }
 
@@ -250,7 +274,7 @@ struct TVBrowseView: View {
         do {
             let result = try await service.list(pluginId: pluginId, slug: slug, filters: filters, page: 1)
             guard gen == loadGeneration else { return }
-            items = result.items
+            items = result.items.uniquedById()
             page = result.pagination.currentPage
             totalPages = max(result.pagination.totalPages, 1)
         } catch {
@@ -320,7 +344,6 @@ struct TVFilterSheet: View {
                         .foregroundStyle(theme.textPrimary)
                     Spacer()
                 }
-                .focusSection()
 
                 groupBand(title: "Thể loại", key: "category",
                           options: categories.map { NameValue(name: $0.name, value: $0.slug) })
@@ -332,14 +355,13 @@ struct TVFilterSheet: View {
                 }
 
                 HStack(spacing: 24) {
-                    actionButton(title: "Đặt lại", primary: false) {
+                    TVSheetActionButton(title: "Đặt lại", primary: false) {
                         draft = ListFilters()
                     }
-                    actionButton(title: "Áp dụng", primary: true) {
+                    TVSheetActionButton(title: "Áp dụng", primary: true, focusBinding: $applyFocused) {
                         filters = draft
                         dismiss()
                     }
-                    .focused($applyFocused)
                 }
                 .focusSection()
             }
@@ -383,17 +405,8 @@ struct TVFilterSheet: View {
         TVChip(title: title, selected: selected, onSelect: onTap)
     }
 
-    private func actionButton(title: String, primary: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 28, weight: .bold))
-                .foregroundStyle(primary ? theme.onAccent : theme.textPrimary)
-                .padding(.horizontal, 44)
-                .padding(.vertical, 18)
-                .background(Capsule().fill(primary ? theme.accent : theme.cardFill))
-        }
-        .tvCardButton()
-    }
+    // Action buttons are built by TVSheetActionButton below
+    // (own focus state + inset ring, mirroring TVStateActionLabel).
 
     static func title(for key: String) -> String {
         switch key {
@@ -403,5 +416,44 @@ struct TVFilterSheet: View {
             let spaced = key.replacingOccurrences(of: "_", with: " ")
             return spaced.prefix(1).uppercased() + spaced.dropFirst()
         }
+    }
+}
+
+// MARK: - Filter sheet action button
+
+/// Sheet action button with its own focus rendering: capsule
+/// fill (accent for primary, cardFill otherwise) PLUS an inset
+/// ring keyed to its focus state (focusRing colour/width when
+/// focused, clear otherwise) — mirroring TVStateActionLabel.
+/// When a parent focus binding is supplied (Áp dụng, so the
+/// sheet's `.defaultFocus` keeps working) it drives both the
+/// focus and the ring; otherwise the button uses its internal
+/// @FocusState (Đặt lại).
+private struct TVSheetActionButton: View {
+    let title: String
+    let primary: Bool
+    var focusBinding: FocusState<Bool>.Binding? = nil
+    let action: () -> Void
+
+    @Environment(\.tvTheme) private var theme
+    @FocusState private var internalFocused: Bool
+
+    private var isFocused: Bool {
+        focusBinding?.wrappedValue ?? internalFocused
+    }
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 28, weight: .bold))
+                .foregroundStyle(primary ? theme.onAccent : theme.textPrimary)
+                .padding(.horizontal, 44)
+                .padding(.vertical, 18)
+                .background(Capsule().fill(primary ? theme.accent : theme.cardFill))
+                .overlay(Capsule().strokeBorder(isFocused ? theme.focusRing : .clear,
+                                                lineWidth: isFocused ? theme.ringWidth : 0))
+        }
+        .tvCardButton()
+        .modifier(TVEntryFocusModifier(binding: focusBinding ?? $internalFocused))
     }
 }

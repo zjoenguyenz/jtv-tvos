@@ -1,5 +1,22 @@
 import SwiftUI
 
+private struct TVLibraryConditionalFocusSection: ViewModifier {
+    let enabled: Bool
+    func body(content: Content) -> some View {
+        if enabled {
+            content.focusSection()
+        } else {
+            content
+        }
+    }
+}
+
+private extension View {
+    func libraryFocusSection(if enabled: Bool) -> some View {
+        modifier(TVLibraryConditionalFocusSection(enabled: enabled))
+    }
+}
+
 /// JTV tvOS Phase 2 — Library tab (the iOS LibraryView port,
 /// survey §1.6): segmented Đang xem tiếp / Yêu thích at a fixed,
 /// findable position (its own tab — FL-071). History shows ALL
@@ -21,22 +38,26 @@ struct TVLibraryView: View {
     }
 
     @State private var segment: Segment = .history
+    @State private var measuredWidth: CGFloat = 0
+    @Namespace private var focusNS
 
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 34) {
                 segmentBand
                     .focusSection()
+                    .prefersDefaultFocus(true, in: focusNS)
                 if segment == .history {
                     historyBand
-                        .focusSection()
+                        .libraryFocusSection(if: !history.records.isEmpty)
                 } else {
                     favoritesBand
-                        .focusSection()
+                        .libraryFocusSection(if: !favorites.records.isEmpty)
                 }
             }
             .padding(.horizontal, 80)
             .padding(.vertical, 36)
+            .focusScope(focusNS)
         }
         .tvThemedBackground()
         .onAppear { session.touch() }
@@ -86,16 +107,25 @@ struct TVLibraryView: View {
 
     // MARK: Favourites
 
+    private var favoritesColumns: [GridItem] {
+        let count = TVGridGeometry.columnCount(forWidth: measuredWidth)
+        return Array(repeating: GridItem(.fixed(favoritesCellWidth), spacing: 24), count: count)
+    }
+
+    private var favoritesCellWidth: CGFloat {
+        TVGridGeometry.cellWidth(forWidth: measuredWidth, spacing: 24)
+    }
+
     @ViewBuilder
     private var favoritesBand: some View {
         if favorites.records.isEmpty {
             TVEmptyState(icon: "heart", title: "Chưa có mục yêu thích")
                 .frame(minHeight: 300)
         } else {
-            LazyVGrid(columns: Array(repeating: GridItem(.fixed(250), spacing: 24), count: 6),
+            LazyVGrid(columns: favoritesColumns,
                       spacing: 30) {
                 ForEach(favorites.records) { record in
-                    TVGridPosterCell(movie: record.movie, width: 250, isFavorite: true,
+                    TVGridPosterCell(movie: record.movie, width: favoritesCellWidth, isFavorite: true,
                                      onSelect: {
                                          nav.push(.movie(MovieRoute(pluginId: record.pluginId,
                                                                     movie: record.movie,
@@ -106,6 +136,14 @@ struct TVLibraryView: View {
                                      })
                 }
             }
+            .frame(maxWidth: .infinity)
+            .background {
+                GeometryReader { proxy in
+                    Color.clear
+                        .preference(key: TVWidthKey.self, value: proxy.size.width)
+                }
+            }
+            .onPreferenceChange(TVWidthKey.self) { [binding = $measuredWidth] in binding.wrappedValue = $0 }
         }
     }
 }
@@ -133,7 +171,7 @@ private struct TVHistoryRow: View {
             HStack(spacing: 24) {
                 TVRemoteImage(urlString: record.movie.posterUrl, bucket: 480)
                     .frame(width: 108, height: 162)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: theme.posterRadius, style: .continuous))
                 VStack(alignment: .leading, spacing: 10) {
                     Text(record.movie.title)
                         .font(.system(size: 28, weight: .bold))

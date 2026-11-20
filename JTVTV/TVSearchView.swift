@@ -13,6 +13,23 @@ import SwiftUI
 
 private let recentSearchesKey = "jtv_recent_searches"
 
+private struct TVConditionalFocusSection: ViewModifier {
+    let enabled: Bool
+    func body(content: Content) -> some View {
+        if enabled {
+            content.focusSection()
+        } else {
+            content
+        }
+    }
+}
+
+private extension View {
+    func focusSection(if enabled: Bool) -> some View {
+        modifier(TVConditionalFocusSection(enabled: enabled))
+    }
+}
+
 enum TVSearchText {
     static func normalise(_ s: String) -> String {
         s.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
@@ -58,6 +75,7 @@ struct TVSearchView: View {
     @State private var generation = 0
     @State private var debounceTask: Task<Void, Never>?
     @FocusState private var fieldFocused: Bool
+    @FocusState private var clearHistoryFocused: Bool
 
     private var activeId: String { plugins.activePlugin?.id ?? "" }
     private var trimmedQuery: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -112,7 +130,7 @@ struct TVSearchView: View {
         }
         .padding(.horizontal, 80)
         .padding(.top, 28)
-        .focusSection()
+        .focusSection(if: !plugins.visiblePlugins.isEmpty)
     }
 
     private var fieldBand: some View {
@@ -161,7 +179,7 @@ struct TVSearchView: View {
                                      recents = TVSearchText.loadRecents()
                                  },
                                  onLoadMore: { Task { await loadMoreServer() } })
-                        .focusSection()
+                        .focusSection(if: !results.isEmpty)
                 }
                 .padding(.horizontal, 80)
                 .padding(.vertical, 30)
@@ -198,13 +216,16 @@ struct TVSearchView: View {
                         .foregroundStyle(theme.accent)
                         .padding(.horizontal, 26)
                         .padding(.vertical, 13)
+                        .overlay(Capsule().strokeBorder(clearHistoryFocused ? theme.focusRing : .clear,
+                                                         lineWidth: clearHistoryFocused ? theme.ringWidth : 0))
                     }
                     .tvCardButton()
+                    .focused($clearHistoryFocused)
                 }
             }
             .padding(.horizontal, 80)
             .padding(.vertical, 30)
-            .focusSection()
+            .focusSection(if: !recents.isEmpty)
         }
     }
 
@@ -230,6 +251,8 @@ struct TVSearchView: View {
 
     private func runSearch(term: String) async {
         generation += 1
+        serverPage = 0
+        serverTotalPages = 1
         let gen = generation
         let pid = activeId
         guard !pid.isEmpty else { return }
@@ -257,10 +280,10 @@ struct TVSearchView: View {
             guard gen == generation else { return }
             serverPage = page.pagination.currentPage
             serverTotalPages = max(page.pagination.totalPages, 1)
-            let shown = Set(results.map(\.id))
+            var shown = Set(results.map(\.id))
             var exact: [Movie] = []
             var rest: [Movie] = []
-            for movie in page.items where !shown.contains(movie.id) {
+            for movie in page.items where shown.insert(movie.id).inserted {
                 if TVSearchText.normalise(movie.title) == needle {
                     exact.append(movie)
                 } else {
@@ -286,8 +309,8 @@ struct TVSearchView: View {
         do {
             let page = try await service.search(pluginId: activeId, keyword: term, page: serverPage + 1)
             guard gen == generation else { isLoadingMore = false; return }
-            let shown = Set(results.map(\.id))
-            results.append(contentsOf: page.items.filter { !shown.contains($0.id) })
+            var shown = Set(results.map(\.id))
+            results.append(contentsOf: page.items.filter { shown.insert($0.id).inserted })
             serverPage = page.pagination.currentPage
             serverTotalPages = max(page.pagination.totalPages, 1)
         } catch {
@@ -317,6 +340,7 @@ struct TVSearchResultsView: View {
     @State private var isLoadingMore = false
     @State private var loadError: String?
     @State private var didLoad = false
+    @State private var loadGeneration = 0
 
     var body: some View {
         ScrollView {
@@ -324,7 +348,6 @@ struct TVSearchResultsView: View {
                 Text(query)
                     .font(.system(size: 40, weight: .bold))
                     .foregroundStyle(theme.textPrimary)
-                    .focusSection()
                 contentBand
                     .focusSection()
             }
@@ -342,44 +365,53 @@ struct TVSearchResultsView: View {
 
     @ViewBuilder
     private var contentBand: some View {
-        if isLoading && items.isEmpty {
-            ProgressView()
-                .tint(.white)
-                .frame(maxWidth: .infinity, minHeight: 300)
-        } else if loadError != nil, items.isEmpty {
-            TVErrorState(message: "Tìm kiếm thất bại") { Task { await reload() } }
-                .frame(minHeight: 300)
-        } else if didLoad && items.isEmpty {
-            TVEmptyState(icon: "magnifyingglass", title: "Không tìm thấy kết quả")
-                .frame(minHeight: 300)
-        } else {
+        if !items.isEmpty {
             TVPosterGrid(items: items, pluginId: pluginId,
                          isLoadingMore: isLoadingMore,
                          onLoadMore: { Task { await loadMore() } })
+        } else if loadError != nil {
+            TVErrorState(message: "Tìm kiếm thất bại") { Task { await reload() } }
+                .frame(minHeight: 300)
+        } else if didLoad {
+            TVEmptyState(icon: "magnifyingglass", title: "Không tìm thấy kết quả",
+                         actionTitle: "Thử lại",
+                         action: { Task { await reload() } },
+                         actionIsDefaultFocus: true)
+                .frame(minHeight: 300)
+        } else {
+            TVLoadingState(onRetry: { Task { await reload() } })
+                .frame(minHeight: 300)
         }
     }
 
     private func reload() async {
+        loadGeneration += 1
+        let gen = loadGeneration
         isLoading = true
         loadError = nil
         do {
             let result = try await service.search(pluginId: pluginId, keyword: query, page: 1)
-            items = result.items
+            guard gen == loadGeneration else { return }
+            items = result.items.uniquedById()
             page = result.pagination.currentPage
             totalPages = max(result.pagination.totalPages, 1)
         } catch {
+            guard gen == loadGeneration else { return }
             loadError = "Tìm kiếm thất bại"
             DiagLog.log("search", "results failed plugin=\(pluginId) kind=\((error as NSError).domain)#\((error as NSError).code)")
         }
+        guard gen == loadGeneration else { return }
         isLoading = false
         didLoad = true
     }
 
     private func loadMore() async {
         guard didLoad, !isLoading, !isLoadingMore, page >= 1, page < totalPages else { return }
+        let gen = loadGeneration
         isLoadingMore = true
         do {
             let result = try await service.search(pluginId: pluginId, keyword: query, page: page + 1)
+            guard gen == loadGeneration else { isLoadingMore = false; return }
             let known = Set(items.map(\.id))
             items.append(contentsOf: result.items.filter { !known.contains($0.id) })
             page = result.pagination.currentPage

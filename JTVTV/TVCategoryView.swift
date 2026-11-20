@@ -18,6 +18,21 @@ struct TVCategoryView: View {
     @State private var countries: [NameValue] = []
     @State private var years: [NameValue] = []
     @State private var isLoading = false
+    @State private var loadGeneration = 0
+    @State private var didLoad = false
+    @Namespace private var focusNS
+
+    private var firstBlock: String? {
+        if !primary.isEmpty { return "primary" }
+        if !categories.isEmpty { return "categories" }
+        if !countries.isEmpty { return "countries" }
+        if !years.isEmpty { return "years" }
+        return nil
+    }
+
+    private var allEmpty: Bool {
+        primary.isEmpty && categories.isEmpty && countries.isEmpty && years.isEmpty
+    }
 
     var body: some View {
         ScrollView {
@@ -29,9 +44,15 @@ struct TVCategoryView: View {
                         Task { await plugins.syncAll() }
                     }
                     .focusSection()
+                } else if didLoad && allEmpty {
+                    TVEmptyState(icon: "square.grid.2x2", title: "Chưa có danh mục",
+                                 actionTitle: "Thử lại",
+                                 action: { Task { await load() } },
+                                 actionIsDefaultFocus: true)
+                        .focusSection()
                 } else {
                     if !primary.isEmpty {
-                        block(title: "Danh mục") {
+                        block(title: "Danh mục", isDefaultFocusTarget: firstBlock == "primary") {
                             ForEach(primary) { item in
                                 chip(item.name) {
                                     push(CategoryRoute(pluginId: activeId, slug: item.slug,
@@ -41,7 +62,7 @@ struct TVCategoryView: View {
                         }
                     }
                     if !categories.isEmpty {
-                        block(title: "Thể loại") {
+                        block(title: "Thể loại", isDefaultFocusTarget: firstBlock == "categories") {
                             ForEach(categories) { item in
                                 chip(item.name) {
                                     push(CategoryRoute(pluginId: activeId, slug: item.slug,
@@ -51,7 +72,7 @@ struct TVCategoryView: View {
                         }
                     }
                     if !countries.isEmpty {
-                        block(title: "Quốc gia") {
+                        block(title: "Quốc gia", isDefaultFocusTarget: firstBlock == "countries") {
                             ForEach(countries) { item in
                                 chip(item.name) {
                                     var f = ListFilters()
@@ -63,7 +84,7 @@ struct TVCategoryView: View {
                         }
                     }
                     if !years.isEmpty {
-                        block(title: "Năm phát hành") {
+                        block(title: "Năm phát hành", isDefaultFocusTarget: firstBlock == "years") {
                             ForEach(years) { item in
                                 chip(item.name) {
                                     var f = ListFilters()
@@ -83,6 +104,7 @@ struct TVCategoryView: View {
             }
             .padding(.horizontal, 80)
             .padding(.vertical, 36)
+            .focusScope(focusNS)
         }
         .tvThemedBackground()
         .onAppear { session.touch() }
@@ -97,12 +119,13 @@ struct TVCategoryView: View {
         nav.push(.category(route))
     }
 
-    private func block<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
+    private func block<Content: View>(title: String, isDefaultFocusTarget: Bool = false, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 18) {
             TVSectionHeader(title: title)
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 280), spacing: 16)], spacing: 16) {
                 content()
             }
+            .prefersDefaultFocus(isDefaultFocusTarget, in: focusNS)
         }
         .focusSection()
     }
@@ -113,15 +136,26 @@ struct TVCategoryView: View {
 
     private func load() async {
         guard let pid = plugins.activePlugin?.id else { return }
+        loadGeneration += 1
+        let gen = loadGeneration
         isLoading = true
         async let primaryResult = service.primaryCategories(pluginId: pid)
         async let categoriesResult = service.categories(pluginId: pid)
         async let countriesResult = service.countries(pluginId: pid)
         async let yearsResult = service.years(pluginId: pid)
-        primary = await primaryResult
-        categories = await categoriesResult
-        countries = await countriesResult
-        years = await yearsResult
+        let p = await primaryResult
+        let c = await categoriesResult
+        let co = await countriesResult
+        let y = await yearsResult
+        guard gen == loadGeneration else { return }
+        primary = p
+        categories = c
+        countries = co
+        years = y
+        didLoad = true
+        if p.isEmpty && c.isEmpty && co.isEmpty && y.isEmpty {
+            DiagLog.log("category", "all lists empty plugin=\(pid)")
+        }
         isLoading = false
     }
 }

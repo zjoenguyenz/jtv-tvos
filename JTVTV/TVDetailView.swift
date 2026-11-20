@@ -1,5 +1,22 @@
 import SwiftUI
 
+private struct TVDetailConditionalFocusSection: ViewModifier {
+    let enabled: Bool
+    func body(content: Content) -> some View {
+        if enabled {
+            content.focusSection()
+        } else {
+            content
+        }
+    }
+}
+
+private extension View {
+    func detailFocusSection(if enabled: Bool) -> some View {
+        modifier(TVDetailConditionalFocusSection(enabled: enabled))
+    }
+}
+
 /// JTV tvOS Phase 2 — title Detail (the iOS MovieDetailView port,
 /// survey §1.5) over a FULL-SCREEN backdrop with the theme's
 /// Ultra treatment (owner amendment: backdrop full màn hình,
@@ -27,7 +44,9 @@ struct TVDetailView: View {
     @State private var bundle: MovieService.DetailBundle?
     @State private var isLoading = false
     @State private var loadError: String?
+    @State private var loadGeneration = 0
     @State private var recoveredId: String?
+    @State private var didAutoResume = false
     @State private var selectedServer = 0
     @State private var descExpanded = false
     @FocusState private var playFocused: Bool
@@ -40,10 +59,15 @@ struct TVDetailView: View {
     private var isManga: Bool { plugins.installedPlugin(id: pluginId)?.manifest.isManga ?? false }
     private var isFavorite: Bool { favorites.isFavorite(pluginId: pluginId, movieId: navId) }
     private var historyRecord: HistoryRecord? { history.record(for: pluginId, movieId: navId) }
+    private var hasPlayableEpisode: Bool {
+        detail?.servers.contains { !$0.episodes.isEmpty } ?? false
+    }
 
     private var backdropURL: String {
         if let detail {
-            return detail.backdropUrl.isEmpty ? detail.posterUrl : detail.backdropUrl
+            if !detail.backdropUrl.isEmpty { return detail.backdropUrl }
+            if !detail.posterUrl.isEmpty { return detail.posterUrl }
+            return movie.displayBackdrop
         }
         return movie.displayBackdrop
     }
@@ -78,19 +102,17 @@ struct TVDetailView: View {
                                 .focusSection()
                         }
                         serversBlock(detail)
-                            .focusSection()
                     }
                     .padding(.horizontal, 80)
                     .padding(.vertical, 40)
                 }
-                .defaultFocus(autoResume && historyRecord != nil ? $resumeFocused : $playFocused, true)
-            } else if isLoading {
-                ProgressView()
-                    .tint(.white)
+                .defaultFocus(hasPlayableEpisode ? $playFocused : $favFocused, true)
             } else if loadError != nil {
                 TVErrorState(message: "Không tải được thông tin phim") {
                     Task { await load() }
                 }
+            } else {
+                TVLoadingState(onRetry: { Task { await load() } })
             }
         }
         .onAppear { session.touch() }
@@ -166,7 +188,7 @@ struct TVDetailView: View {
             }
             .tvCardButton()
             .focused($playFocused)
-            .disabled(detail.servers.isEmpty)
+            .disabled(!hasPlayableEpisode)
 
             Button {
                 favorites.toggle(pluginId: pluginId, movie: snapshotMovie(for: detail))
@@ -332,51 +354,84 @@ struct TVDetailView: View {
                     }
                 }
             }
+            .detailFocusSection(if: detail.servers.count > 1 || !detail.servers[min(selectedServer, detail.servers.count - 1)].episodes.isEmpty)
         }
     }
 
     // MARK: Load (iOS two-stage + healing)
 
+    /// F-C1: keep the grid's initial server in agreement with
+    /// playFirstEpisode. If the clamped selected server has no
+    /// episodes but some server does, move the selection to the
+    /// first non-empty server (playFirstEpisode's own rule).
+    /// A non-empty selection is never overridden, and when no
+    /// server has episodes the selection is left untouched.
+    private func selectFirstPlayableServerIfNeeded(servers: [EpisodeServer]) {
+        guard !servers.isEmpty else { return }
+        let sel = min(selectedServer, servers.count - 1)
+        guard servers[sel].episodes.isEmpty,
+              let firstPlayable = servers.firstIndex(where: { !$0.episodes.isEmpty }) else { return }
+        selectedServer = firstPlayable
+    }
+
     private func load() async {
+        loadGeneration += 1
+        let gen = loadGeneration
         isLoading = true
         loadError = nil
         do {
             let first = try await service.detailMeta(pluginId: pluginId, movieId: movie.id)
+            guard gen == loadGeneration else { return }
             bundle = first
+            selectFirstPlayableServerIfNeeded(servers: first.detail.servers)
             isLoading = false
             warmEmbedPrefetch(detail: first.detail)
             if first.detail.servers.first?.episodes.first?.id.hasPrefix("jtvstreams:") == true {
                 let full = await service.detailStreams(pluginId: pluginId, movieId: movie.id,
                                                        detail: first.detail)
-                if full.servers.map({ $0.episodes.map(\.id) }) != first.detail.servers.map({ $0.episodes.map(\.id) }) {
+                guard gen == loadGeneration else { return }
+                if full.servers != first.detail.servers {
                     bundle = MovieService.DetailBundle(detail: full, detailStream: first.detailStream)
+                    selectFirstPlayableServerIfNeeded(servers: full.servers)
                 }
             }
         } catch {
-            await recoverByTitle()
+            guard gen == loadGeneration else { return }
+            await recoverByTitle(generation: gen)
+        }
+        guard gen == loadGeneration else { return }
+        if autoResume, !didAutoResume, let detail, let record = historyRecord {
+            didAutoResume = true
+            resume(record, detail: detail)
         }
     }
 
-    private func recoverByTitle() async {
+    private func recoverByTitle(generation gen: Int) async {
         do {
             let page = try await service.search(pluginId: pluginId, keyword: movie.title, page: 1)
+            guard gen == loadGeneration else { return }
             let target = TVSearchText.normalise(movie.title)
             let found = page.items.first { TVSearchText.normalise($0.title) == target }
                 ?? (movie.id.isEmpty ? page.items.first : nil)
             guard let found else {
+                guard gen == loadGeneration else { return }
                 loadError = "Không tải được thông tin phim"
                 isLoading = false
                 return
             }
             let healed = try await service.detail(pluginId: pluginId, movieId: found.id)
+            guard gen == loadGeneration else { return }
             recoveredId = found.id
             bundle = healed
+            selectFirstPlayableServerIfNeeded(servers: healed.detail.servers)
             favorites.repairMovieId(pluginId: pluginId, from: movie.id, title: movie.title, to: found.id)
             warmEmbedPrefetch(detail: healed.detail)
         } catch {
+            guard gen == loadGeneration else { return }
             loadError = "Không tải được thông tin phim"
             DiagLog.log("detail", "recover failed plugin=\(pluginId) kind=\((error as NSError).domain)#\((error as NSError).code)")
         }
+        guard gen == loadGeneration else { return }
         isLoading = false
     }
 
@@ -398,8 +453,10 @@ struct TVDetailView: View {
     // MARK: Play intents (iOS §1.5, exact)
 
     private func playFirstEpisode(_ detail: MovieDetail) {
-        guard let server = detail.servers.first, let episode = server.episodes.first else { return }
-        selectedServer = 0
+        guard let serverIndex = detail.servers.firstIndex(where: { !$0.episodes.isEmpty }),
+              let episode = detail.servers[serverIndex].episodes.first else { return }
+        let server = detail.servers[serverIndex]
+        selectedServer = serverIndex
         let known = bundle?.detailStream.url ?? ""
         play(episode: episode, server: server, detail: detail, startPosition: 0,
              knownStreamURL: MediaURL.isDirectMedia(known) ? known : "")

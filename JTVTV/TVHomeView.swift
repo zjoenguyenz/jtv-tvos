@@ -17,20 +17,14 @@ final class TVHomeStore {
     private(set) var sectionErrors: [String: String] = [:]
     private(set) var isLoading = false
     private(set) var loadedPluginId: String?
+    private(set) var didLoad = false
+    /// The iOS hero rule, computed ONCE at the end of load()
+    /// from the final sections/items: first movie, in section
+    /// order, whose displayBackdrop is non-empty.
+    private(set) var heroMovie: Movie?
 
     private var loadedAt: Date?
     private var generation = 0
-
-    /// The iOS hero rule: first movie, in section order, whose
-    /// displayBackdrop is non-empty.
-    var heroMovie: Movie? {
-        for section in sections {
-            if let movie = items[section.id]?.first(where: { !$0.displayBackdrop.isEmpty }) {
-                return movie
-            }
-        }
-        return nil
-    }
 
     /// Every loaded movie for the currently loaded plugin,
     /// deduped by id — Search's on-device pool (JoeTV mechanism:
@@ -48,28 +42,38 @@ final class TVHomeStore {
     }
 
     func load(plugins: PluginManager, service: MovieService, force: Bool = false) async {
+        generation &+= 1
+        let gen = generation
         guard let pid = plugins.activePlugin?.id else {
             sections = []
             items = [:]
             sectionErrors = [:]
             loadedPluginId = nil
             loadedAt = nil
+            heroMovie = nil
+            isLoading = false
             return
         }
-        if !force, loadedPluginId == pid, let loadedAt,
+        if !force, !isLoading, loadedPluginId == pid, let loadedAt,
            Date().timeIntervalSince(loadedAt) < 600 {
+            isLoading = false
             return
         }
-        generation += 1
-        let gen = generation
+        if loadedPluginId != pid {
+            heroMovie = nil
+            items = [:]
+            sectionErrors = [:]
+        }
         isLoading = true
         let secs = await service.homeSections(pluginId: pid)
         guard gen == generation else { return }
         sections = secs
         loadedPluginId = pid
-        loadedAt = Date()
         if secs.isEmpty {
+            heroMovie = nil
+            didLoad = true
             isLoading = false
+            loadedAt = Date()
             return
         }
         // Per-section page-1 fetches in parallel; each row
@@ -90,7 +94,7 @@ final class TVHomeStore {
                 guard gen == self.generation else { continue }
                 switch result {
                 case .success(let movies):
-                    items[sectionId] = movies
+                    items[sectionId] = movies.uniquedById()
                     sectionErrors[sectionId] = nil
                     if !movies.isEmpty {
                         ImageCacheManager.shared.prefetch(urlStrings: movies.map(\.posterUrl))
@@ -104,7 +108,20 @@ final class TVHomeStore {
                 }
             }
         }
-        if gen == generation { isLoading = false }
+        if gen == generation {
+            // Hero computed ONCE from the final sections/items.
+            var hero: Movie?
+            for section in sections {
+                if let movie = items[section.id]?.first(where: { !$0.displayBackdrop.isEmpty }) {
+                    hero = movie
+                    break
+                }
+            }
+            heroMovie = hero
+            didLoad = true
+            isLoading = false
+            loadedAt = Date()
+        }
     }
 }
 
@@ -166,13 +183,13 @@ struct TVHomeView: View {
                            selected: plugin.id == plugins.activePluginId) {
                         plugins.activePluginId = plugin.id
                     }
+                    .prefersDefaultFocus(plugin.id == plugins.activePluginId, in: focusNS)
                 }
             }
             .padding(.horizontal, 80)
             .padding(.vertical, 18)
         }
         .focusSection()
-        .prefersDefaultFocus(true, in: focusNS)
     }
 
     private var content: some View {
@@ -187,8 +204,19 @@ struct TVHomeView: View {
                         .focusSection()
                 }
                 ForEach(store.sections) { section in
-                    sectionBand(section)
-                        .focusSection()
+                    if let error = store.sectionErrors[section.id], (store.items[section.id] ?? []).isEmpty {
+                        sectionBand(section)
+                            .focusSection()
+                    } else if !(store.items[section.id] ?? []).isEmpty {
+                        sectionBand(section)
+                            .focusSection()
+                    }
+                }
+                if store.didLoad && store.sections.isEmpty && !store.isLoading {
+                    TVEmptyState(icon: "film.stack", title: "Chưa có nội dung", actionTitle: "Tải lại") {
+                        Task { await store.load(plugins: plugins, service: service, force: true) }
+                    }
+                    .focusSection()
                 }
                 if store.isLoading && store.sections.isEmpty {
                     ProgressView()
@@ -246,19 +274,9 @@ struct TVHomeView: View {
                                                      title: section.title, filters: ListFilters())))
                 }
                 if section.isGrid {
-                    LazyVGrid(columns: Array(repeating: GridItem(.fixed(250), spacing: 24), count: 6),
-                              spacing: 30) {
-                        ForEach(Array(movies.prefix(9))) { movie in
-                            TVGridPosterCell(movie: movie, width: 250,
-                                             isFavorite: favorites.isFavorite(pluginId: pid, movieId: movie.id),
-                                             onSelect: {
-                                                 nav.push(.movie(MovieRoute(pluginId: pid, movie: movie)))
-                                             },
-                                             onLongPress: {
-                                                 favorites.toggle(pluginId: pid, movie: movie)
-                                             })
-                        }
-                    }
+                    TVPosterGrid(items: Array(movies.prefix(9)), pluginId: pid,
+                                 isLoadingMore: false, onSelect: nil,
+                                 onLoadMore: {})
                 } else {
                     ScrollView(.horizontal, showsIndicators: false) {
                         LazyHStack(spacing: 24) {
@@ -327,17 +345,27 @@ private struct TVHeroCard: View {
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var isFocused: Bool
+    @State private var imageFailed = false
+    @State private var retryToken = 0
 
     private let radius: CGFloat = 22
 
     var body: some View {
         Button {
-            onSelect()
+            if imageFailed {
+                retryToken += 1
+            } else {
+                onSelect()
+            }
         } label: {
             ZStack {
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
                     .fill(theme.cardFill)
-                TVRemoteImage(urlString: movie.displayBackdrop, bucket: 1920)
+                TVRemoteImage(urlString: movie.displayBackdrop, bucket: 1920,
+                              failed: $imageFailed, retryToken: retryToken)
+                if imageFailed {
+                    theme.backgroundGradient
+                }
                 LinearGradient(
                     stops: [
                         .init(color: .clear, location: 0.35),
@@ -398,5 +426,6 @@ private struct TVHeroCard: View {
         }
         .tvCardButton()
         .focused($isFocused)
+        .onChange(of: movie.id) { imageFailed = false; retryToken = 0 }
     }
 }

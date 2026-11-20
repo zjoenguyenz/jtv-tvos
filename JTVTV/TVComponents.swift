@@ -207,6 +207,7 @@ struct TVPosterCard: View {
         }
         .tvCardButton()
         .focused($isFocused)
+        .onChange(of: movie.id) { imageFailed = false; retryToken = 0 }
         .onLongPressGesture(minimumDuration: 0.5) {
             onLongPress()
         }
@@ -497,27 +498,39 @@ struct TVBackdropView: View {
     let fallbackTitle: String
 
     @Environment(\.tvTheme) private var theme
+    @State private var imageFailed = false
 
     init(urlString: String, fallbackTitle: String) {
         self.urlString = urlString
         self.fallbackTitle = fallbackTitle
     }
 
+    /// Designed stand-in for the no-backdrop case — also used
+    /// when the backdrop image fails to load.
+    private var standIn: some View {
+        ZStack {
+            theme.backgroundGradient
+            Text(fallbackTitle)
+                .font(.system(size: 64, weight: .bold))
+                .foregroundStyle(theme.textFaint)
+                .multilineTextAlignment(.center)
+                .lineLimit(3)
+                .padding(80)
+        }
+    }
+
     var body: some View {
         GeometryReader { geo in
             ZStack {
                 if urlString.isEmpty {
-                    theme.backgroundGradient
-                    Text(fallbackTitle)
-                        .font(.system(size: 64, weight: .bold))
-                        .foregroundStyle(theme.textFaint)
-                        .multilineTextAlignment(.center)
-                        .lineLimit(3)
-                        .padding(80)
+                    standIn
                 } else {
-                    TVRemoteImage(urlString: urlString, bucket: 1920, contentMode: .fill)
+                    TVRemoteImage(urlString: urlString, bucket: 1920, contentMode: .fill, failed: $imageFailed)
                         .frame(width: geo.size.width, height: geo.size.height)
                         .clipped()
+                    if imageFailed {
+                        standIn
+                    }
                 }
                 // Horizontal scrim (text zone, leading → trailing).
                 LinearGradient(
@@ -535,6 +548,7 @@ struct TVBackdropView: View {
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
+        .onChange(of: urlString) { imageFailed = false }
     }
 }
 
@@ -562,13 +576,19 @@ private struct TVStateActionLabel: View {
 }
 
 /// Designed empty surface: centred icon + title (+ message),
-/// with an optional focusable action button.
+/// with an optional focusable action button. The action can
+/// opt in to being the default focus via `actionIsDefaultFocus`
+/// (default false, so existing call sites are unchanged): a
+/// state surface that is the ONLY focusable on a pushed screen
+/// must declare its landing, otherwise the screen is a focus
+/// dead state.
 struct TVEmptyState: View {
     let icon: String
     let title: String
     var message: String? = nil
     var actionTitle: String? = nil
     var action: (() -> Void)? = nil
+    var actionIsDefaultFocus: Bool = false
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var actionFocused: Bool
@@ -577,12 +597,14 @@ struct TVEmptyState: View {
          title: String,
          message: String? = nil,
          actionTitle: String? = nil,
-         action: (() -> Void)? = nil) {
+         action: (() -> Void)? = nil,
+         actionIsDefaultFocus: Bool = false) {
         self.icon = icon
         self.title = title
         self.message = message
         self.actionTitle = actionTitle
         self.action = action
+        self.actionIsDefaultFocus = actionIsDefaultFocus
     }
 
     var body: some View {
@@ -613,6 +635,47 @@ struct TVEmptyState: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(60)
+        .defaultFocus($actionFocused, actionIsDefaultFocus && action != nil)
+    }
+}
+
+/// Designed loading surface: spinner + message + a focusable
+/// "Thử lại" button built exactly like TVErrorState's retry
+/// (TVStateActionLabel + tvCardButton + own @FocusState), so a
+/// loading screen is never a focus dead zone. The retry button
+/// is the default focus inside the component.
+struct TVLoadingState: View {
+    let message: String
+    let onRetry: () -> Void
+
+    @Environment(\.tvTheme) private var theme
+    @FocusState private var retryFocused: Bool
+
+    init(message: String = "Đang tải…", onRetry: @escaping () -> Void) {
+        self.message = message
+        self.onRetry = onRetry
+    }
+
+    var body: some View {
+        VStack(spacing: 20) {
+            ProgressView()
+                .tint(.white)
+            Text(message)
+                .font(.system(size: 28, weight: .medium))
+                .foregroundStyle(theme.textPrimary)
+                .multilineTextAlignment(.center)
+            Button {
+                onRetry()
+            } label: {
+                TVStateActionLabel(title: "Thử lại", isFocused: retryFocused)
+            }
+            .tvCardButton()
+            .focused($retryFocused)
+            .padding(.top, 12)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(60)
+        .defaultFocus($retryFocused, true)
     }
 }
 
