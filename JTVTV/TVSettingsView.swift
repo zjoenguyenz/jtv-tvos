@@ -32,6 +32,12 @@ import SwiftUI
 struct TVSettingsView: View {
     @EnvironmentObject private var session: PinSession
 
+    /// Theme choice (Phase 2): the same @AppStorage key the
+    /// root binds; writing it re-renders the whole app with the
+    /// picked theme's tokens (runtime-selectable themes, owner
+    /// ruling 2026-11-20 — default glossy black "Đen bóng Ultra").
+    @AppStorage(TVThemeStore.defaultsKey) private var themeRaw = JTVThemeID.ultraBlack.rawValue
+
     /// Entry focus (Diagnosis §4.1.6, JoeSettings.swift:306
     /// shape): declared on the first focusable — the first
     /// credential status row.
@@ -64,6 +70,9 @@ struct TVSettingsView: View {
                     .font(.system(size: 56, weight: .heavy))
 
                 credentialsSection
+                    .focusSection()
+
+                themeSection
                     .focusSection()
 
                 if BundledSecrets.pinConfigured {
@@ -120,6 +129,26 @@ struct TVSettingsView: View {
 
     private static func isConfigured(_ value: String) -> Bool {
         !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    // MARK: - Appearance (Phase 2 theme picker)
+
+    private var themeSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Giao diện")
+                .font(.system(size: 30, weight: .semibold))
+            HStack(spacing: 16) {
+                ForEach(JTVThemeID.allCases) { id in
+                    TVChip(title: id.displayName,
+                           selected: themeRaw == id.rawValue) {
+                        themeRaw = id.rawValue
+                    }
+                }
+            }
+            Text("Theme áp dụng ngay cho toàn bộ app. Mặc định: Đen bóng Ultra.")
+                .font(.system(size: 23))
+                .foregroundStyle(.secondary)
+        }
     }
 
     // MARK: - App lock

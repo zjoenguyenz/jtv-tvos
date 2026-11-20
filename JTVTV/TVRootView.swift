@@ -1,63 +1,111 @@
 import SwiftUI
 
-/// The post-unlock shell (Phase 1).
+/// The post-unlock shell — Phase 2: the five-tab browse app
+/// (Trang chủ · Thể loại · Tìm kiếm · Thư viện · Cài đặt, the
+/// iOS tab order; Torrent joins in Phase 4). Each browse tab
+/// owns a NavigationStack and a TVNavPath; the shared core
+/// objects (PluginManager, MovieService, favourites, history,
+/// the playback presenter) are created ONCE here and injected,
+/// and the picked theme's tokens ride the environment from
+/// this root (one theme constant source for the whole app —
+/// FL-125).
 ///
-/// This is deliberately a SHELL, not the catalogue: browse and
-/// playback arrive in later phases. What exists now is real and
-/// navigable — a TabView with the home placeholder and the
-/// Settings tab — over a full-bleed true-black background
-/// (register R-10: the root background ignores the safe area
-/// from the very first shell, the JoeTV bright-rim fault).
+/// Access control: the PIN gate is this app's adult gate. The
+/// core's session adult flag starts OFF at every launch (its
+/// iOS rule), which would leave `visiblePlugins` empty by
+/// construction; content exists only after the gate, so the
+/// shell enables the flag as it appears — inside the gate, the
+/// full plugin set is visible.
 ///
-/// Activity hooks for the PIN idle rule (survey §4): the
-/// shell's appearance and every tab change refresh
-/// `PinSession.lastActivity` via `touch()`. Later phases add
-/// their own `touch()` calls at their interaction points and
-/// drive `setPlaybackActive(_:)` from the players.
+/// Activity hooks for the PIN idle rule: the shell's appearance
+/// and every tab change refresh `PinSession.lastActivity` via
+/// `touch()`; play actions will drive `setPlaybackActive(_:)`
+/// from the Phase 3 player.
 struct TVRootView: View {
     @EnvironmentObject private var session: PinSession
+
+    @StateObject private var plugins: PluginManager
+    @StateObject private var service: MovieService
+    @StateObject private var favorites = FavoritesManager()
+    @StateObject private var history = WatchHistoryManager()
+    @StateObject private var presenter = PlaybackPresenter()
+
+    @State private var homeStore = TVHomeStore()
+    @State private var homeNav = TVNavPath()
+    @State private var categoryNav = TVNavPath()
+    @State private var searchNav = TVNavPath()
+    @State private var libraryNav = TVNavPath()
+
+    @AppStorage(TVThemeStore.defaultsKey) private var themeRaw = JTVThemeID.ultraBlack.rawValue
     @State private var selection = 0
+
+    init() {
+        let plugins = PluginManager()
+        _plugins = StateObject(wrappedValue: plugins)
+        _service = StateObject(wrappedValue: MovieService(manager: plugins))
+    }
+
+    private var theme: TVThemeTokens {
+        (JTVThemeID(rawValue: themeRaw) ?? .ultraBlack).tokens
+    }
 
     var body: some View {
         TabView(selection: $selection) {
-            HomePlaceholderView()
-                .tabItem {
-                    Label("Trang chủ", systemImage: "house")
-                }
-                .tag(0)
+            NavigationStack(path: $homeNav.path) {
+                TVHomeView()
+                    .tvNavigationDestinations()
+            }
+            .environment(homeNav)
+            .tabItem { Label("Trang chủ", systemImage: "house") }
+            .tag(0)
+
+            NavigationStack(path: $categoryNav.path) {
+                TVCategoryView()
+                    .tvNavigationDestinations()
+            }
+            .environment(categoryNav)
+            .tabItem { Label("Thể loại", systemImage: "square.grid.2x2") }
+            .tag(1)
+
+            NavigationStack(path: $searchNav.path) {
+                TVSearchView()
+                    .tvNavigationDestinations()
+            }
+            .environment(searchNav)
+            .tabItem { Label("Tìm kiếm", systemImage: "magnifyingglass") }
+            .tag(2)
+
+            NavigationStack(path: $libraryNav.path) {
+                TVLibraryView()
+                    .tvNavigationDestinations()
+            }
+            .environment(libraryNav)
+            .tabItem { Label("Thư viện", systemImage: "books.vertical") }
+            .tag(3)
 
             TVSettingsView()
-                .tabItem {
-                    Label("Cài đặt", systemImage: "gearshape")
-                }
-                .tag(1)
+                .tabItem { Label("Cài đặt", systemImage: "gearshape") }
+                .tag(4)
         }
-        .background(Color.black.ignoresSafeArea())
-        .onAppear { session.touch() }
+        .environmentObject(plugins)
+        .environmentObject(service)
+        .environmentObject(favorites)
+        .environmentObject(history)
+        .environmentObject(presenter)
+        .environment(homeStore)
+        .environment(\.tvTheme, theme)
+        .background(theme.backgroundGradient.ignoresSafeArea())
+        .fullScreenCover(item: $presenter.request) { request in
+            TVPlaybackPlaceholderView(request: request)
+        }
+        .onAppear {
+            session.touch()
+            if !plugins.adultEnabled {
+                plugins.adultEnabled = true
+            }
+        }
         .onChange(of: selection) { _, _ in
             session.touch()
         }
-    }
-}
-
-/// Phase-1 home placeholder: the disguised display name and one
-/// honest line that the catalogue arrives in the next phase.
-/// No fake shelves, no stand-in content.
-private struct HomePlaceholderView: View {
-    @EnvironmentObject private var session: PinSession
-
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            VStack(spacing: 24) {
-                Text("Media Service")
-                    .font(.system(size: 54, weight: .bold))
-                    .foregroundStyle(.white)
-                Text("Danh mục sẽ có trong giai đoạn tiếp theo.")
-                    .font(.system(size: 28))
-                    .foregroundStyle(.white.opacity(0.7))
-            }
-        }
-        .onAppear { session.touch() }
     }
 }
