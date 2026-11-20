@@ -17,7 +17,7 @@ import UIKit
 //
 // Access shape (the owner's accepted JoeTV design, register
 // R-63): the address carries a random 6-digit token IN ITS
-// PATH — http://<LAN-IP>:18080/<token>/jtv-log.txt — minted
+// PATH — http://<LAN-IP>:18081/<token>/jtv-log.txt — minted
 // fresh every time the screen opens. The server serves ONLY
 // that exact path; every other request gets a 404 and no
 // content. The server lives only while the screen is open
@@ -39,15 +39,27 @@ import UIKit
 // added to it here. The token and the serving URL are never
 // written to the log.
 //
-// Phase C (L-T02, Diagnosis §4.2/§4.3): this screen is now
-// presented by fullScreenCover from Settings (not a
-// NavigationLink push), so it carries no navigation chrome —
-// the in-body title above is the screen's title. The server
-// gained the process-level port gate documented at the class
-// below: single owner for port 18080, rebind gated on the
-// previous listener's .cancelled, allowLocalEndpointReuse as
-// adjunct only, and per-instance transition logging. Port,
-// token model, lockout and serving behaviour are unchanged.
+// Presentation (Phase C, L-T02): this screen is presented
+// by fullScreenCover from Settings (not a NavigationLink
+// push), so it carries no navigation chrome — the in-body
+// title above is the screen's title.
+//
+// Server mechanism (L-T02 round 2, 2026-11-20 — see
+// JTV-TVOS-JOETV-LOG-DIFF.md): the server below is JoeTV's
+// DiagLogServer mechanism EXACTLY — per-screen-instance
+// lifetime, plain NWParameters.tcp, fire-and-forget stop(),
+// no process gate, no deferral, no bind retry. The Phase C
+// hardening (process-level port gate, .cancelled-gated
+// rebind, EADDRINUSE backstop, allowLocalEndpointReuse)
+// was removed after build #4 failed the device retest with
+// the identical NWError 48: the difference table proved the
+// failing bind faced a holder OUTSIDE this process, against
+// which in-process machinery is structurally blind. ONE
+// adaptation to JoeTV: the port is 18081, not JoeTV's
+// 18080 — this app coexists with JoeTV on the same Apple
+// TV, and 18080 is the collision surface (JoeTV's own
+// export server binds it whenever its screen is open).
+// Token model, lockout and serving behaviour are unchanged.
 
 /// The one-file HTTP server behind LogExportView.
 ///
@@ -101,102 +113,22 @@ final class JTVLogExportServer {
     /// Main-actor isolation comes from the class.
     private static var lockoutUntil: Date?
 
-    // MARK: Process-level port ownership (Phase C, Diagnosis §4.3.2/§4.3.3)
-    //
-    // Port 18080 is a PROCESS-wide resource, but this server is
-    // owned per view instance (@State in LogExportView) — an
-    // instance-only `listener == nil` guard cannot stop a
-    // second instance binding over a first instance's live
-    // listener, nor a rebind racing a previous listener's
-    // asynchronous cancel (cancel() has NO synchronous-release
-    // guarantee; the documented completion signal is the
-    // .cancelled state delivery — Ch.3 §2.3). This gate is the
-    // single process-level owner: it records the identity of
-    // the one live listener and of a listener that is still
-    // cancelling. The gate's cancelling entry clears ONLY when
-    // that listener's stateUpdateHandler delivers .cancelled
-    // with the matching identity (§4.3.3) — and that clearing
-    // is INSTANCE-INDEPENDENT: terminal-state gate updates run
-    // through the static helpers below, invoked from the
-    // handler's main-actor Task whether or not the owning
-    // instance still exists. The instance is owned by the
-    // view's @State and can deinit after stop() but before
-    // .cancelled is delivered; a dismissed screen's teardown
-    // still completes, because the handler keeps the listener
-    // (and its identity) alive on its own. Statics here are
-    // main-actor isolated state of this @MainActor class
-    // (Ch.4 §20.1 legal shape) — no locks, no unchecked
-    // conformances.
-    private static var gateLiveID: ObjectIdentifier?
-    private static var gateCancellingID: ObjectIdentifier?
-
-    /// True while any listener in the process is live on
-    /// 18080 or still tearing down.
-    private static var gateBusy: Bool {
-        gateLiveID != nil || gateCancellingID != nil
-    }
-
-    /// Terminal-state gate bookkeeping for .cancelled,
-    /// performed STATICALLY so it never depends on the owning
-    /// instance still being alive: the instance is owned by
-    /// LogExportView's @State, and on cover dismissal stop()
-    /// runs and the instance can deinit BEFORE the framework
-    /// delivers .cancelled — a weak-self hop would then drop
-    /// the delivery and leave the gate busy forever. The
-    /// listener's stateUpdateHandler captures the listener
-    /// strongly, so its identity is available in the handler's
-    /// main-actor Task even when the instance is gone, and the
-    /// gate fields live at class level, so clearing them needs
-    /// no instance. Clears ONLY on identity match (§4.3.3).
-    /// This static context has no instance tag, so the
-    /// gate-cleared line is logged without one — never the
-    /// token, never the URL.
-    private static func noteListenerCancelled(id: ObjectIdentifier) {
-        guard gateCancellingID == id || gateLiveID == id else { return }
-        if gateLiveID == id { gateLiveID = nil }
-        if gateCancellingID == id { gateCancellingID = nil }
-        DiagLog.log("logexport", "listener cancelled — port gate cleared")
-    }
-
-    /// Terminal-state gate bookkeeping for .failed: the same
-    /// instance-independence as noteListenerCancelled — the
-    /// live-gate entry is cleared on identity match even if
-    /// the owning instance has already been destroyed.
-    /// Instance-level .failed handling (surfacing, EADDRINUSE
-    /// retry) stays in listenerStateChanged for the alive
-    /// path; this helper owns ONLY the gate field.
-    private static func noteListenerFailed(id: ObjectIdentifier) {
-        if gateLiveID == id { gateLiveID = nil }
-        if gateCancellingID == id { gateCancellingID = nil }
-    }
-
     /// Short per-instance ID tagged onto every transition log
-    /// line (§4.3.6), so a recurrence of the NWError-48 fault
-    /// is discriminable between mechanisms from the exported
+    /// line, so a recurrence of the NWError-48 fault is
+    /// discriminable between mechanisms from the exported
     /// log itself. Never the token, never the URL.
+    /// (Instrumentation only — JoeTV's server logs nothing;
+    /// these lines change no bind behaviour, and they are the
+    /// only evidence source if the fault recurs, since the
+    /// export is the log's only way off the box.)
     private let instanceTag = String(UUID().uuidString.prefix(8))
 
-    /// True between a start() request and stop(): a deferred
-    /// or retried bind may only proceed while this holds.
-    private var wantsServing = false
-
-    /// Bounded EADDRINUSE backstop retries (§4.3.3): a bind
-    /// that still lands in .failed with address-in-use gets
-    /// this many fresh attempts before .failed is surfaced.
-    private var bindRetries = 0
-    private static let maxBindRetries = 3
-
-    /// The pending deferred/retry bind, if any. Stored so
-    /// stop() can cancel it; it captures only a weak self and
-    /// touches nothing after the instance is gone.
-    private var pendingBindTask: Task<Void, Never>?
-
-    /// Deadline for a deferred bind: set when a start first
-    /// defers behind a busy port gate, cleared on bind and on
-    /// stop(). Bounds the total deferral to 30 seconds (see
-    /// schedulePendingBind).
-    private var deferDeadline: Date?
-
+    /// Start serving on port 18081 (JoeTV uses 18080 — see
+    /// the header note for why this app must not). Idempotent
+    /// while a listener is alive. Reports .starting
+    /// immediately, then .serving / .failed from the
+    /// listener's own state. JoeTV's DiagLogServer.start()
+    /// shape, verbatim in structure.
     func start() {
         DiagLog.log("logexport", "[\(instanceTag)] start requested")
         if let until = Self.lockoutUntil, until > Date() {
@@ -204,76 +136,23 @@ final class JTVLogExportServer {
             return
         }
         guard listener == nil else { return }
-        guard pendingBindTask == nil else { return }
-        wantsServing = true
-        bindRetries = 0
         token = String(format: "%06d", Int.random(in: 0...999_999))
         failedAttempts = 0
         emit(.starting)
-        if Self.gateBusy {
-            // Another instance's listener is live or still
-            // cancelling: this start must NOT bind (§4.3.2).
-            // Defer on the main actor until the gate clears;
-            // the view state stays .starting meanwhile.
-            DiagLog.log("logexport", "[\(instanceTag)] start deferred — port gate busy")
-            schedulePendingBind(after: .milliseconds(250))
-            return
-        }
-        bindNow()
-    }
-
-    /// Construct and start a FRESH NWListener (§4.3.1: every
-    /// start constructs a new listener; a cancelled or failed
-    /// listener is never restarted). Callers guarantee the
-    /// port gate is clear and this instance has no listener.
-    private func bindNow() {
-        guard wantsServing, listener == nil else { return }
-        deferDeadline = nil
-        guard let port = NWEndpoint.Port(rawValue: 18080) else {
+        guard let port = NWEndpoint.Port(rawValue: 18081) else {
             emit(.failed("Không mở được kênh gửi log (cổng không hợp lệ)."))
             return
         }
-        let parameters = NWParameters.tcp
-        // §4.3.4 adjunct ONLY, set BEFORE listener creation.
-        // Limits (Ch.3 §2.5): allowLocalEndpointReuse permits
-        // reuse of a LINGERING local endpoint (TIME_WAIT
-        // class); it does NOT evict or share a live listener,
-        // does NOT make cancel() synchronous, and does NOT
-        // substitute for the gate above or the .cancelled
-        // wait — those remain the actual fix.
-        parameters.allowLocalEndpointReuse = true
         let created: NWListener
         do {
-            created = try NWListener(using: parameters, on: port)
+            created = try NWListener(using: NWParameters.tcp, on: port)
         } catch {
-            DiagLog.log("logexport", "[\(instanceTag)] listener construction failed")
             emit(.failed("Không mở được kênh gửi log: \(error.localizedDescription)"))
             return
         }
-        // Claim the port gate synchronously, before start, so
-        // no other instance can slip a bind in between.
-        Self.gateLiveID = ObjectIdentifier(created)
         listener = created
         created.stateUpdateHandler = { [weak self] state in
             Task { @MainActor in
-                // Terminal-state GATE clearing runs FIRST and
-                // does NOT route through the weak self: this
-                // handler captures `created` strongly, so the
-                // listener and its identity outlive the server
-                // instance, which the view's @State can destroy
-                // after stop() but before .cancelled arrives.
-                // The static helpers own the gate fields, so
-                // the gate clears even when self is already
-                // nil; instance-level handling then follows
-                // via self? exactly as before.
-                switch state {
-                case .cancelled:
-                    Self.noteListenerCancelled(id: ObjectIdentifier(created))
-                case .failed:
-                    Self.noteListenerFailed(id: ObjectIdentifier(created))
-                default:
-                    break
-                }
                 self?.listenerStateChanged(state, listener: created)
             }
         }
@@ -285,60 +164,17 @@ final class JTVLogExportServer {
         created.start(queue: queue)
     }
 
-    /// Main-actor polling behind a deferred start or an
-    /// EADDRINUSE retry (§4.3.3): waits until the port gate
-    /// clears, then binds. The deferral is bounded by a total
-    /// budget of 30 seconds from the first deferral
-    /// (deferDeadline, aligned to the Ch.5 §2.2 measured
-    /// worst case of ~26–30 s): if the budget is exhausted
-    /// while the gate is still busy, polling stops, one
-    /// timeout line is logged, and a terminal .failed is
-    /// emitted — it never binds over a busy gate. No
-    /// continuations, no locks. The task is stored so stop()
-    /// can cancel it, and it holds only a weak self.
-    private func schedulePendingBind(after delay: Duration) {
-        if deferDeadline == nil {
-            deferDeadline = Date().addingTimeInterval(30)
-        }
-        pendingBindTask?.cancel()
-        pendingBindTask = Task { [weak self] in
-            try? await Task.sleep(for: delay)
-            guard let self, !Task.isCancelled else { return }
-            self.pendingBindTask = nil
-            guard self.wantsServing, self.listener == nil else { return }
-            if Self.gateBusy {
-                if let deadline = self.deferDeadline, Date() >= deadline {
-                    self.deferDeadline = nil
-                    DiagLog.log("logexport", "[\(self.instanceTag)] start deferred timeout — port gate still busy after 30s")
-                    self.emit(.failed("Kênh gửi log lỗi: cổng gửi log đang bận — đóng màn hình này, chờ một chút rồi mở lại."))
-                    return
-                }
-                self.schedulePendingBind(after: .milliseconds(250))
-                return
-            }
-            self.bindNow()
-        }
-    }
-
-    /// Cancel the listener and every live connection — the
-    /// server never outlives its screen. The cancelling
-    /// listener's identity is RECORDED in the port gate
-    /// (§4.3.3): the gate clears only when that listener's
-    /// .cancelled is delivered, so a later start can never
-    /// rebind over a teardown still in flight.
+    /// Cancel the listener and every live connection. The
+    /// export view calls this on disappear/dismiss, so the
+    /// server never outlives its screen. JoeTV's shape:
+    /// fire-and-forget — nothing tracks the teardown, and the
+    /// next start() rebinds as soon as `listener == nil`.
     func stop() {
-        wantsServing = false
-        deferDeadline = nil
-        pendingBindTask?.cancel()
-        pendingBindTask = nil
-        if let live = listener {
-            let id = ObjectIdentifier(live)
-            if Self.gateLiveID == id { Self.gateLiveID = nil }
-            Self.gateCancellingID = id
+        if listener != nil {
             DiagLog.log("logexport", "[\(instanceTag)] listener cancelling")
-            live.cancel()
-            listener = nil
         }
+        listener?.cancel()
+        listener = nil
         for conn in connections.values { conn.cancel() }
         connections.removeAll()
     }
@@ -347,10 +183,9 @@ final class JTVLogExportServer {
 
     private func listenerStateChanged(_ state: NWListener.State,
                                       listener: NWListener) {
-        let id = ObjectIdentifier(listener)
         switch state {
         case .ready:
-            DiagLog.log("logexport", "[\(instanceTag)] listener bound on 18080")
+            DiagLog.log("logexport", "[\(instanceTag)] listener bound on 18081")
             guard let ip = Self.lanIPAddress(), let port = listener.port else {
                 emit(.failed("Không tìm thấy địa chỉ mạng nội bộ."))
                 return
@@ -358,21 +193,6 @@ final class JTVLogExportServer {
             emit(.serving(url: "http://\(ip):\(port.rawValue)\(expectedPath)"))
         case .failed(let error):
             if self.listener === listener { self.listener = nil }
-            if Self.gateLiveID == id { Self.gateLiveID = nil }
-            // Backstop only (§4.3.3): a bind that still lands
-            // in .failed with EADDRINUSE — e.g. a holder
-            // outside this process's gate — gets a bounded
-            // number of fresh attempts with short waits before
-            // the failure is surfaced. The failed listener
-            // itself is released, never restarted (§4.3.5).
-            if wantsServing, bindRetries < Self.maxBindRetries,
-               case .posix(let code) = error, code == .EADDRINUSE {
-                bindRetries += 1
-                DiagLog.log("logexport", "[\(instanceTag)] bind failed: address in use — retry \(bindRetries)/\(Self.maxBindRetries)")
-                emit(.starting)
-                schedulePendingBind(after: .seconds(1))
-                return
-            }
             DiagLog.log("logexport", "[\(instanceTag)] listener failed")
             emit(.failed("Kênh gửi log lỗi: \(error.localizedDescription)"))
         case .cancelled:
@@ -434,18 +254,9 @@ final class JTVLogExportServer {
         }
         respondNotFound(to: conn) { [weak self] in
             guard let self, locking else { return }
-            // Same gate discipline as stop(): record the
-            // cancelling identity so no rebind can race this
-            // teardown (§4.3.3).
-            if let live = self.listener {
-                let id = ObjectIdentifier(live)
-                if Self.gateLiveID == id { Self.gateLiveID = nil }
-                Self.gateCancellingID = id
-                DiagLog.log("logexport", "[\(self.instanceTag)] listener cancelling (lockout)")
-                live.cancel()
-                self.listener = nil
-            }
-            self.wantsServing = false
+            DiagLog.log("logexport", "[\(self.instanceTag)] listener cancelling (lockout)")
+            self.listener?.cancel()
+            self.listener = nil
             for other in self.connections.values { other.cancel() }
             self.connections.removeAll()
             self.emit(.failed("Quá 3 lần nhập sai mã — kênh gửi log đã tạm dừng 60 giây. Đóng màn hình này, chờ một chút rồi mở lại."))
