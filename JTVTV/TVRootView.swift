@@ -96,7 +96,16 @@ struct TVRootView: View {
         .environment(\.tvTheme, theme)
         .background(theme.backgroundGradient.ignoresSafeArea())
         .fullScreenCover(item: $presenter.request) { request in
-            TVPlayerView(request: request)
+            // L-T06: the player's dependencies ride as VALUES
+            // from this root (their owner) — the cover's
+            // subtree reads no @EnvironmentObject, and the
+            // session is built in TVPlayerView.init, before
+            // the cover's body machinery runs (JoeTV's
+            // pre-build shape, player map R-1).
+            TVPlayerView(request: request, service: service, history: history,
+                         pinSession: session) {
+                presenter.request = nil
+            }
         }
         .onAppear {
             session.touch()

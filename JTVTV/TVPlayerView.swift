@@ -14,41 +14,76 @@ import SwiftUI
 struct TVPlayerView: View {
     let request: PlaybackRequest
 
-    init(request: PlaybackRequest) {
+    /// The session, built EAGERLY in init (L-T06 — JoeTV's
+    /// pre-build shape, player map R-1): the session object
+    /// exists before the cover's body/presentation machinery
+    /// runs. Dependencies arrive as VALUES from TVRootView
+    /// (which owns them); nothing in this cover's subtree
+    /// reads an @EnvironmentObject, and no construction hides
+    /// behind a StateObject autoclosure inside the presented
+    /// tree — on device (1.2.3/6, jtv-log_6.txt) the process
+    /// died in exactly that hand-off, after cover.presenting
+    /// and before session.init.begin, on every Play tap.
+    /// The built instance is anchored by TVPlayerSessionView's
+    /// @StateObject box (JoeTV's box): the box's autoclosure
+    /// merely returns this instance, and StateObject storage
+    /// keeps the FIRST installed instance for the whole
+    /// presentation even if this view value is re-created.
+    private let builtSession: TVPlayerSession
+
+    init(request: PlaybackRequest, service: MovieService, history: WatchHistoryManager,
+         pinSession: PinSession, onDismiss: @escaping () -> Void) {
         self.request = request
         // L-T04 probe breadcrumb P1: the cover's content view
         // exists — cover presentation has begun.
         DiagLog.log("player", "cover.presenting plugin=\(request.pluginId) episode=\(request.episode.id)")
+        // L-T06 split breadcrumbs: bracket the eager session
+        // construction (session.init.begin/done print between
+        // these two) — a plain assignment, evaluated NOW, in
+        // init. A session built for a view value SwiftUI never
+        // installs does no work: its init is assignments plus
+        // its two breadcrumb lines, and only start() (from the
+        // cover's onAppear) begins work. A repeated
+        // cover.presenting / cover.session.creating pair in one
+        // presentation's log means this view value was
+        // re-created — read it as that signal, not as a second
+        // presentation.
+        DiagLog.log("player", "cover.session.creating plugin=\(request.pluginId)")
+        builtSession = TVPlayerSession(
+            request: request, service: service, history: history,
+            pinSession: pinSession, onDismiss: onDismiss)
+        DiagLog.log("player", "cover.session.created")
     }
 
-    @EnvironmentObject private var service: MovieService
-    @EnvironmentObject private var history: WatchHistoryManager
-    @EnvironmentObject private var presenter: PlaybackPresenter
-    @EnvironmentObject private var pinSession: PinSession
-
     var body: some View {
-        TVPlayerSessionView(request: request, service: service, history: history,
-                            pinSession: pinSession) {
-            presenter.request = nil
-        }
+        // L-T06 split breadcrumb: the cover root's body was
+        // reached — init and session construction survived.
+        DiagLog.log("player", "cover.view.body")
+        return TVPlayerSessionView(session: builtSession)
     }
 }
 
 // MARK: - Session view
 
 private struct TVPlayerSessionView: View {
+    /// JoeTV's box: the pre-built session is handed to a
+    /// @StateObject whose autoclosure merely returns the
+    /// existing instance — StateObject storage evaluates it
+    /// once and keeps that first instance for the whole
+    /// presentation, so a re-created parent view value can
+    /// never swap the playing session mid-presentation.
     @StateObject private var session: TVPlayerSession
     @Environment(\.tvTheme) private var theme
 
-    init(request: PlaybackRequest, service: MovieService, history: WatchHistoryManager,
-         pinSession: PinSession, onDismiss: @escaping () -> Void) {
-        _session = StateObject(wrappedValue: TVPlayerSession(
-            request: request, service: service, history: history,
-            pinSession: pinSession, onDismiss: onDismiss))
+    init(session: TVPlayerSession) {
+        _session = StateObject(wrappedValue: session)
     }
 
     var body: some View {
-        ZStack {
+        // L-T06 split breadcrumb: the session view's body was
+        // reached with the pre-built session in hand.
+        DiagLog.log("player", "cover.sessionview.body")
+        return ZStack {
             Color.black.ignoresSafeArea()
             content
             if session.presentedPanel == .subtitles {
@@ -87,7 +122,9 @@ private struct TVPlayerSessionView: View {
         case .manga:
             // Phase 4 placeholder state, unchanged behaviour —
             // named so it is not mistaken for a dead end.
-            TVPlaybackPlaceholderView(request: session.currentRequest)
+            TVPlaybackPlaceholderView(request: session.currentRequest) {
+                session.dismiss()
+            }
         case .failed(let failure):
             TVPlayerErrorView(session: session, failure: failure)
         }

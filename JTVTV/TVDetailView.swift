@@ -573,8 +573,14 @@ private struct TVEpisodeChip: View {
 /// (video) / the reader in Phase 4 (manga).
 struct TVPlaybackPlaceholderView: View {
     let request: PlaybackRequest
+    /// Close action, passed as a VALUE by the caller (L-T06):
+    /// this view is mounted inside the player cover for the
+    /// manga phase, and the cover's subtree reads no
+    /// @EnvironmentObject — the caller routes the close
+    /// through the session's dismiss, which is the same
+    /// presenter.request = nil this view used to write itself.
+    let onClose: () -> Void
 
-    @EnvironmentObject private var presenter: PlaybackPresenter
     @Environment(\.tvTheme) private var theme
     @FocusState private var closeFocused: Bool
 
@@ -602,7 +608,7 @@ struct TVPlaybackPlaceholderView: View {
                 .font(.system(size: 27, weight: .medium))
                 .foregroundStyle(theme.heroMeta)
             Button {
-                presenter.request = nil
+                onClose()
             } label: {
                 Text("Đóng")
                     .font(.system(size: 28, weight: .bold))
