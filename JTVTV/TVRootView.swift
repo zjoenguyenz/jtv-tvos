@@ -51,7 +51,7 @@ struct TVRootView: View {
 
     var body: some View {
         TabView(selection: $selection) {
-            NavigationStack(path: $homeNav.path) {
+            NavigationStack(path: homeNav.binding) {
                 TVHomeView()
                     .tvNavigationDestinations()
             }
@@ -59,7 +59,7 @@ struct TVRootView: View {
             .tabItem { Label("Trang chủ", systemImage: "house") }
             .tag(0)
 
-            NavigationStack(path: $categoryNav.path) {
+            NavigationStack(path: categoryNav.binding) {
                 TVCategoryView()
                     .tvNavigationDestinations()
             }
@@ -67,7 +67,7 @@ struct TVRootView: View {
             .tabItem { Label("Thể loại", systemImage: "square.grid.2x2") }
             .tag(1)
 
-            NavigationStack(path: $searchNav.path) {
+            NavigationStack(path: searchNav.binding) {
                 TVSearchView()
                     .tvNavigationDestinations()
             }
@@ -75,7 +75,7 @@ struct TVRootView: View {
             .tabItem { Label("Tìm kiếm", systemImage: "magnifyingglass") }
             .tag(2)
 
-            NavigationStack(path: $libraryNav.path) {
+            NavigationStack(path: libraryNav.binding) {
                 TVLibraryView()
                     .tvNavigationDestinations()
             }

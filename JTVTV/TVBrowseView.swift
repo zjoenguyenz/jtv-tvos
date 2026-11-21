@@ -28,22 +28,59 @@ private extension View {
 
 // MARK: - Per-tab navigation path model
 
+/// Pure path-mutation arithmetic for TVNavPath: every mutation is
+/// computed on a LOCAL copy — append first, then the iOS
+/// NavSanitizer pass — and the result is assigned to the observed
+/// `path` exactly once. Kept free of SwiftUI/@Observable so the
+/// exact functions the app calls can be compiled and exercised
+/// standalone (the L-T04 executable proof).
+enum NavPathMutation {
+    /// `path` with `route` appended and sanitised.
+    static func pushing(_ route: AppRoute, onto path: [AppRoute]) -> [AppRoute] {
+        var next = path
+        next.append(route)
+        NavSanitizer.sanitize(&next)
+        return next
+    }
+
+    /// `path` sanitised (adjacent duplicate .movie routes collapse
+    /// to the newest, exact duplicates drop — NavSanitizer's
+    /// semantics, unchanged).
+    static func sanitized(_ path: [AppRoute]) -> [AppRoute] {
+        var copy = path
+        NavSanitizer.sanitize(&copy)
+        return copy
+    }
+}
+
 /// One instance per tab, created by the tab root and injected into
 /// the environment, so pushed screens (Detail, Browse) append to
 /// the owning stack without needing the path binding threaded
-/// through every destination. Sanitised on every mutation (the
-/// iOS NavSanitizer discipline — collapses adjacent duplicate
-/// .movie routes from the sextop1 push-during-pop race).
+/// through every destination.
+///
+/// L-T04 (convicted on device, 1.2.2): the previous shape ran
+/// `NavSanitizer.sanitize(&path)` from `path`'s own didSet — the
+/// sanitizer mutated the observed property from inside its own
+/// observer (an inout writeback cycle), and `path.append` inside
+/// `push` never returned: the app died between breadcrumb D0 and
+/// D1 on every card tap. The sanitizer's logic was never the
+/// fault (it is byte-identical to the proven iOS copy); the CALL
+/// DISCIPLINE was. Rule from here on: no property is ever mutated
+/// from within its own observer. Every write to `path` — push,
+/// and the NavigationStack's own binding writes (pop / pop-to-
+/// root) — goes through `assign(_:)`, which sanitises a local
+/// copy via NavPathMutation and assigns the observed property
+/// exactly once.
 @MainActor
 @Observable
 final class TVNavPath {
-    var path: [AppRoute] = [] {
-        didSet { NavSanitizer.sanitize(&path) }
-    }
+    private(set) var path: [AppRoute] = []
 
     func push(_ route: AppRoute) {
-        path.append(route)
-        // L-T04 breadcrumb D1: the push landed in the path.
+        assign(NavPathMutation.pushing(route, onto: path))
+        // L-T04 breadcrumb D1: the append + sanitise + assign
+        // completed and push is returning — D1 printing at all is
+        // the proof the convicted append now returns.
         switch route {
         case .movie(let r):
             DiagLog.log("detail", "push.movie plugin=\(r.pluginId) movie=\(r.movie.id)")
@@ -52,6 +89,30 @@ final class TVNavPath {
         case .search(let r):
             DiagLog.log("detail", "push.search plugin=\(r.pluginId)")
         }
+    }
+
+    /// The binding the owning NavigationStack writes through, so
+    /// stack-driven mutations (Back pops, pop-to-root) take the
+    /// same sanitize-then-assign-once door as `push` instead of
+    /// setting the observed property directly. SwiftUI invokes a
+    /// navigation path binding only on the main actor, hence
+    /// `MainActor.assumeIsolated` (the TVAVPlayerHost idiom) to
+    /// satisfy Swift 6 isolation for the @MainActor class.
+    var binding: Binding<[AppRoute]> {
+        Binding(
+            get: { MainActor.assumeIsolated { self.path } },
+            set: { newValue in MainActor.assumeIsolated { self.assign(newValue) } }
+        )
+    }
+
+    /// The single write door for `path`: sanitise the candidate
+    /// on a local copy, then assign the observed property once.
+    /// A candidate that sanitises to the current path is dropped
+    /// — no redundant write, no spurious change notification.
+    private func assign(_ candidate: [AppRoute]) {
+        let sanitized = NavPathMutation.sanitized(candidate)
+        guard sanitized != path else { return }
+        path = sanitized
     }
 }
 
