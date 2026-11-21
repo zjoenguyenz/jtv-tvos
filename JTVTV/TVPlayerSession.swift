@@ -169,11 +169,15 @@ final class TVPlayerSession: ObservableObject {
          history: WatchHistoryManager,
          pinSession: PinSession,
          onDismiss: @escaping () -> Void) {
+        // L-T04 probe breadcrumbs P2/P3: bracket session
+        // construction (the shared segment's first hand-off).
+        DiagLog.log("player", "session.init.begin plugin=\(request.pluginId)")
         self.currentRequest = request
         self.service = service
         self.history = history
         self.pinSession = pinSession
         self.onDismiss = onDismiss
+        DiagLog.log("player", "session.init.done")
     }
 
     // MARK: Lifecycle
@@ -303,7 +307,11 @@ final class TVPlayerSession: ObservableObject {
                 route = .av
                 token = "av"
             }
-            DiagLog.log("player", "resolve.done attempt=\(attempt) ms=\(ms) route=\(token)")
+            // L-T04 probe breadcrumb P7 (extends the §6 line):
+            // route + stream host (host only — redaction-safe)
+            // + proxy flag, so the AV fork is named in the log.
+            let streamHost = URLComponents(string: stream.url)?.host ?? "?"
+            DiagLog.log("player", "resolve.done attempt=\(attempt) ms=\(ms) route=\(token) host=\(streamHost) proxy=\(route == .proxy ? 1 : 0)")
             phase = .playing(route: route, attempt: attempt)
         case .manga(let stream):
             currentStream = stream

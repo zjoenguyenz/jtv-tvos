@@ -73,6 +73,9 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
         /// seek's own dead pause (see userPausedDuringSeek).
         private var resumeSeekSawNonPaused = false
         private var firstFrameReported = false
+        /// L-T04 probe: P11 logs the FIRST item-status callback
+        /// only — the flag flips once and never affects flow.
+        private var statusFirstLogged = false
         private var failed = false
         private var ended = false
 
@@ -110,6 +113,10 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
                                    options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
             }
 
+            // L-T04 probe breadcrumb P9: the asset exists —
+            // proxyLoader is non-nil exactly when the proxy
+            // fork built it.
+            DiagLog.log("player", "asset.built route=\(proxyLoader != nil ? "proxy" : "plain")")
             let item = AVPlayerItem(asset: asset)
             let player = AVPlayer(playerItem: item)
             self.player = player
@@ -118,6 +125,9 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
 
             observe(item: item, player: player)
             buildTransportMenu()
+            // L-T04 probe breadcrumb P10a: the transport menu
+            // was built inside start() (shortlist row 3's site).
+            DiagLog.log("player", "menu.built")
             session.registerHost(
                 attempt: attemptID,
                 positionProvider: { [weak self] in
@@ -138,6 +148,8 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
             if item.status == .readyToPlay {
                 handleReady(item: item)
             }
+            // L-T04 probe breadcrumb P10b: start() completed.
+            DiagLog.log("player", "start.done")
         }
 
         // MARK: Observers (FL-202/FL-206)
@@ -241,6 +253,17 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
         // MARK: Ready / first frame / failure
 
         private func handleItemStatus(_ item: AVPlayerItem) {
+            // L-T04 probe breadcrumb P11: first status callback.
+            if !statusFirstLogged {
+                statusFirstLogged = true
+                let token: String
+                switch item.status {
+                case .readyToPlay: token = "ready"
+                case .failed: token = "failed"
+                default: token = "unknown"
+                }
+                DiagLog.log("player", "item.status.first value=\(token)")
+            }
             guard !failed else { return }
             switch item.status {
             case .readyToPlay:
@@ -264,6 +287,8 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
         private func handleReady(item: AVPlayerItem) {
             guard !readyHandled, !failed else { return }
             readyHandled = true
+            // L-T04 probe breadcrumb P12a: ready handling began.
+            DiagLog.log("player", "ready.handled")
             guard let session, let player else { return }
             let target = session.itemReady(attempt: attemptID)
             applySubtitleDirective(item: item)
@@ -291,11 +316,15 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
                         // (FL-204) AND only when no user
                         // pause intervened during the window.
                         if finished, !userPaused {
+                            // L-T04 probe breadcrumb P12b.
+                            DiagLog.log("player", "play.called")
                             self.player?.play()
                         }
                     }
                 }
             } else {
+                // L-T04 probe breadcrumb P12b.
+                DiagLog.log("player", "play.called")
                 player.play()
             }
             handleTimeControlStatus()
@@ -624,6 +653,8 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
+        // L-T04 probe breadcrumb P8: the AV host is being made.
+        DiagLog.log("player", "host.make surface=av")
         let controller = AVPlayerViewController()
         context.coordinator.start(controller: controller, stream: stream,
                                   attemptID: attemptID, session: session, useProxy: useProxy)

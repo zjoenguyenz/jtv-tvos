@@ -24,13 +24,33 @@
 // .cx sits behind a Cloudflare check for datacenter IPs; the owner's
 // device loads it directly, and the app's WebView fallback covers a
 // challenged fetch.
+//
+// v3.2.0 (2026-11-20) — mirror gap-fill (Shape A, owner-approved).
+// .cx prunes the middle out of some titles' chapter runs (proven on
+// device: one title listing only 1, 7, 10, 19, 26, 49, … of 1–66).
+// khotruyen.win — a front-end of the same house's older Madara
+// catalogue — carries the same slugs essentially gap-free (measured:
+// 43 of 8,890 titles have any gap; the pruned title is complete
+// 1–81 there). When a detail's chapter list has interior gaps, the
+// detail goes two-stage (the app's torrenthub mechanism): stage 1
+// returns a "jtvstreams:mirror:<slug>" placeholder, the app fetches
+// the mirror's title page, and stage 2 merges in ONLY the missing
+// chapter numbers, pointing at the mirror's reader pages (tagged
+// "source":"mirror"; their URLs ride image.shtcdn.top). Source
+// chapters keep their exact entries; a gap-free title never touches
+// the mirror; a mirror page that fails, 404s or parses to nothing
+// returns the source list unchanged (an app-level fetch failure
+// instead keeps the stage-1 placeholder — the standard two-stage
+// failure mode, identical to torrenthub's). The mirror is smaller
+// and slower than .cx, so it fills gaps ONLY — never the tail past
+// .cx's latest chapter.
 // =============================================================================
 
 function getManifest() {
     return JSON.stringify({
         "id": "sayhentai",
         "name": "SayHentai",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "baseUrl": "https://sayhentai.cx",
         "iconUrl": "https://sayhentai.cx/favicon.ico",
         "isEnabled": true,
@@ -114,6 +134,47 @@ function getFilterConfig() {
 // =============================================================================
 
 var BASE = "https://sayhentai.cx";
+var MIRROR = "https://khotruyen.win";
+
+// v3.2.0: stage-1 → stage-2 hand-off for the mirror gap-fill. The
+// app keeps one JS context per plugin and serializes its calls
+// (the same property hentaihub's chain stash relies on). The stash
+// is keyed by slug (two detail loads may interleave at the app's
+// fetch awaits), each entry is single-use — a stage-2 call takes
+// and drops its own title's entry — and the key set is FIFO-
+// capped so abandoned entries cannot accumulate.
+// (The map is prototype-less: "constructor" is a legal slug, and
+// on a plain {} it would read Object.prototype members instead of
+// a missing entry.)
+var _shFill = Object.create(null);
+var _shFillOrder = [];
+
+function shStashFill(slug, chapters) {
+    var i = _shFillOrder.indexOf(slug);
+    if (i !== -1) _shFillOrder.splice(i, 1);
+    _shFillOrder.push(slug);
+    _shFill[slug] = chapters;
+    while (_shFillOrder.length > 8) {
+        delete _shFill[_shFillOrder.shift()];
+    }
+}
+
+function shTakeFill(slug) {
+    var chapters = _shFill[slug] || null;
+    if (chapters) {
+        delete _shFill[slug];
+        var i = _shFillOrder.indexOf(slug);
+        if (i !== -1) _shFillOrder.splice(i, 1);
+    }
+    return chapters;
+}
+
+// Host-anchored mirror test (a bare substring match would also
+// fire on look-alike hosts and on the string appearing in a query
+// parameter of a .cx URL).
+function shIsMirrorUrl(url) {
+    return typeof url === "string" && url.indexOf(MIRROR + "/") === 0;
+}
 
 function getUrlList(slug, filtersJson) {
     var filters = JSON.parse(filtersJson || "{}");
@@ -141,6 +202,11 @@ function getUrlSearch(keyword, filtersJson) {
 
 function getUrlDetail(slug) {
     if (!slug) return "";
+    // v3.2.0 stage 2: the app feeds the placeholder episode's id
+    // back through here to obtain the mirror's title page.
+    if (slug.indexOf("jtvstreams:mirror:") === 0) {
+        return MIRROR + "/truyen/" + slug.slice("jtvstreams:mirror:".length) + "/";
+    }
     if (slug.indexOf("http") === 0) return slug;
     return BASE + "/truyen-" + slug + ".html";
 }
@@ -246,7 +312,9 @@ function parseSearchResponse(html) {
     return parseListResponse(html);
 }
 
-function parseMovieDetail(html) {
+function parseMovieDetail(html, url) {
+    // v3.2.0 stage 2 lands here with the mirror's title page.
+    if (shIsMirrorUrl(url)) return shMirrorMerge(html, url);
     try {
         // Title
         var title = "";
@@ -294,12 +362,37 @@ function parseMovieDetail(html) {
             }
         }
         chapters.sort(function (a, b) { return a.num - b.num; });
+
+        // v3.2.0: interior-gap plan. Only whole-number chapters
+        // define the run; a missing integer strictly between the
+        // first and last whole numbers is a pruned chapter. The
+        // tail past the last chapter is NOT a gap (fresh chapters
+        // are .cx's job — the mirror trails it on most titles).
+        var fillSlug = shGapSlug(url, chapters);
+
         for (var j = 0; j < chapters.length; j++) delete chapters[j].num;
 
-        var servers = [{
-            name: "Server 1",
-            episodes: chapters
-        }];
+        var servers;
+        if (fillSlug) {
+            // Two-stage detail (the app's torrenthub mechanism):
+            // stage 1 renders this record with a placeholder
+            // episode; the app fetches the mirror title page via
+            // getUrlDetail and stage 2 swaps in the merged list.
+            shStashFill(fillSlug, chapters);
+            servers = [{
+                name: "Server 1",
+                episodes: [{
+                    id: "jtvstreams:mirror:" + fillSlug,
+                    name: "Đang tải danh sách nguồn…",
+                    slug: "mirrorfill"
+                }]
+            }];
+        } else {
+            servers = [{
+                name: "Server 1",
+                episodes: chapters
+            }];
+        }
 
         return JSON.stringify({
             id: "",
@@ -319,8 +412,150 @@ function parseMovieDetail(html) {
     }
 }
 
-function parseDetailResponse(html) {
+// =============================================================================
+// v3.2.0 — MIRROR GAP-FILL (Shape A)
+// =============================================================================
+
+// The detail page's slug, when the chapter list (entries still
+// carrying their numeric `num`) has at least one interior integer
+// gap; "" when the run is whole or the slug cannot be determined.
+// Adjacency over the distinct whole numbers actually present —
+// never a scan of the numeric range (unbounded, and above 2^53 a
+// float counter stops advancing altogether).
+function shGapSlug(url, chapters) {
+    var m = (typeof url === "string" ? url : "").match(/truyen-([a-z0-9-]+)\.html/i);
+    if (!m || chapters.length < 2) return "";
+    var seen = {}, nums = [];
+    for (var i = 0; i < chapters.length; i++) {
+        var n = chapters[i].num;
+        if (typeof n !== "number" || !Number.isSafeInteger(n)) continue;
+        if (!seen[n]) { seen[n] = true; nums.push(n); }
+    }
+    if (nums.length < 2) return "";
+    nums.sort(function (a, b) { return a - b; });
+    for (var k = 1; k < nums.length; k++) {
+        if (nums[k] > nums[k - 1] + 1) return m[1];
+    }
+    return "";
+}
+
+// Fill candidates on a mirror title page (verified live shape:
+// relative hrefs /truyen/<slug>/chuong/<n>/, whole run on one
+// page). Only CANONICAL integer tokens qualify — "02", "2.0" or
+// "10." would parseFloat-collapse onto a real chapter's number,
+// claim its slot and point at a non-canonical (dead) path, so
+// they are rejected here and can never shadow the genuine anchor.
+// Returns [{num, numStr, url}] deduped by path.
+function shParseMirrorChapters(html, slug) {
+    var out = [];
+    var seen = {};
+    var re = new RegExp('<a[^>]+href="(?:https://khotruyen\\.win)?(/truyen/' +
+        slug + '/chuong/([\\d.]+)/?)"[^>]*>', 'gi');
+    var mm;
+    while ((mm = re.exec(html)) !== null) {
+        var token = mm[2];
+        if (!/^\d+$/.test(token) || String(parseInt(token, 10)) !== token) continue;
+        var path = mm[1];
+        if (path.charAt(path.length - 1) !== "/") path += "/";
+        if (seen[path]) continue;
+        seen[path] = true;
+        out.push({ num: parseInt(token, 10), numStr: token, url: MIRROR + path });
+    }
+    return out;
+}
+
+// Stage 2 returns a stub record: the app reads only its servers.
+function shMirrorStub(servers) {
+    return JSON.stringify({
+        id: "",
+        title: "",
+        posterUrl: "",
+        backdropUrl: "",
+        description: "",
+        servers: servers,
+        category: "",
+        status: "Đang tiến hành",
+        quality: "HD",
+        lang: "Vietsub"
+    });
+}
+
+// Stage 2: merge the mirror's chapters into the stashed source
+// list. Failure discipline: whatever goes wrong, the answer is
+// the source list itself (today's behaviour); only a missing
+// stash entry (never stashed, already consumed, or evicted)
+// yields an empty server list, which makes the app keep the
+// stage-1 record untouched.
+function shMirrorMerge(html, url) {
+    var m = (url || "").match(/khotruyen\.win\/truyen\/([a-z0-9-]+)\//i);
+    var src = m ? shTakeFill(m[1]) : null;
+    if (!src) return shMirrorStub([]);
     try {
+        var have = {}, min = null, max = null;
+        for (var i = 0; i < src.length; i++) {
+            var n = parseFloat((src[i].slug || "").replace(/^chuong-/, ""));
+            if (isNaN(n)) continue;
+            have[n] = true;
+            if (Number.isSafeInteger(n)) {
+                if (min === null || n < min) min = n;
+                if (max === null || n > max) max = n;
+            }
+        }
+
+        var merged = src.slice();
+        if (min !== null) {
+            var mirror = shParseMirrorChapters(html, m[1]);
+            var added = {};
+            for (var j = 0; j < mirror.length; j++) {
+                var e = mirror[j];
+                if (Math.floor(e.num) !== e.num) continue;   // integers only
+                if (e.num <= min || e.num >= max) continue;   // interior only
+                if (have[e.num] || added[e.num]) continue;
+                added[e.num] = true;
+                merged.push({
+                    id: e.url,
+                    name: "Chapter " + e.numStr,
+                    slug: "chuong-" + e.numStr,
+                    source: "mirror"
+                });
+            }
+        }
+        merged.sort(function (a, b) {
+            return parseFloat((a.slug || "").replace(/^chuong-/, "")) -
+                   parseFloat((b.slug || "").replace(/^chuong-/, ""));
+        });
+        return shMirrorStub([{ name: "Server 1", episodes: merged }]);
+    } catch (e) {
+        return shMirrorStub([{ name: "Server 1", episodes: src }]);
+    }
+}
+
+function parseDetailResponse(html, url) {
+    try {
+        // v3.2.0: a filled chapter's reader page lives on the
+        // mirror; its images are plain <img> tags on the family
+        // CDN (verified live: full-size strips, served with or
+        // without a Referer — the mirror's own is sent anyway).
+        if (shIsMirrorUrl(url)) {
+            var mImages = [];
+            var mTagRegex = /<img[^>]*>/gi;
+            var mTag;
+            while ((mTag = mTagRegex.exec(html)) !== null) {
+                var mSrc = mTag[0].match(/src=["'](https:\/\/image\.shtcdn\.top\/[^"']+)["']/i) ||
+                    mTag[0].match(/data-src=["'](https:\/\/image\.shtcdn\.top\/[^"']+)["']/i);
+                if (mSrc) {
+                    var mUrl = mSrc[1].replace(/&amp;/g, "&");
+                    if (mImages.indexOf(mUrl) === -1) mImages.push(mUrl);
+                }
+            }
+            return JSON.stringify({
+                images: mImages,
+                headers: {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": MIRROR + "/"
+                }
+            });
+        }
         var images = [];
         // Reader images are bare <img> tags on the signed CDN host
         // (verified shape, incl. the token query — kept verbatim,

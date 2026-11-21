@@ -14,6 +14,13 @@ import SwiftUI
 struct TVPlayerView: View {
     let request: PlaybackRequest
 
+    init(request: PlaybackRequest) {
+        self.request = request
+        // L-T04 probe breadcrumb P1: the cover's content view
+        // exists — cover presentation has begun.
+        DiagLog.log("player", "cover.presenting plugin=\(request.pluginId) episode=\(request.episode.id)")
+    }
+
     @EnvironmentObject private var service: MovieService
     @EnvironmentObject private var history: WatchHistoryManager
     @EnvironmentObject private var presenter: PlaybackPresenter
@@ -61,7 +68,12 @@ private struct TVPlayerSessionView: View {
                 session.dismiss()
             }
         }
-        .onAppear { session.start() }
+        .onAppear {
+            // L-T04 probe breadcrumb P4: the cover is on
+            // screen — session start is next.
+            DiagLog.log("player", "cover.presented")
+            session.start()
+        }
         .onDisappear { session.stop() }
     }
 

@@ -6,7 +6,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "avdbapi",
         "name": "AVDB JAV",
-        "version": "1.0.5",
+        "version": "1.0.6",
         "baseUrl": "https://avdbapi.com/api.php/provide/vod",
         "iconUrl": "https://avdbapi.com/favicon.ico",
         "isEnabled": true,
@@ -251,9 +251,34 @@ function parseDetailResponse(embedHtml, pageUrl) {
             });
         }
 
-        // Nếu là HTML embed page → trả isEmbed: true để iOS dùng WebView
-        // WebView sẽ render JWPlayer bên trong, tự xử lý m3u8 + Cloudflare cookies
+        // Nếu là HTML embed page: thử bóc stream trực tiếp từ
+        // window.PLAYER_CONFIG trước (cơ chế của njav, njav_plugin.js
+        // parseEmbedResponse — cùng trang /play/index/<code> của
+        // upload18). Trang tĩnh luôn mang sẵn "m3u8" đã ký; đường
+        // WebView cũ bị văng sang trang đăng nhập Upload18 bởi JS
+        // chống bot trong trang (L-13, kiểm chứng từ mạng nhà
+        // 2026-11-20). Chỉ khi bóc không ra mới trả isEmbed: true
+        // như cũ.
         if (embedHtml.indexOf("PLAYER_CONFIG") !== -1 || embedHtml.indexOf("jwplayer") !== -1) {
+            var pcMatch = embedHtml.match(/"m3u8"\s*:\s*"([^"]+)"/);
+            if (pcMatch) {
+                var pcUrl = pcMatch[1].replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
+                if (pcUrl.indexOf("?") !== -1) {
+                    pcUrl += "&ext=.m3u8";
+                } else {
+                    pcUrl += "?ext=.m3u8";
+                }
+                return JSON.stringify({
+                    url: pcUrl,
+                    isEmbed: false,
+                    headers: {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Referer": "https://upload18.org/",
+                        "Origin": "https://upload18.org"
+                    },
+                    subtitles: []
+                });
+            }
             return JSON.stringify({
                 url: pageUrl || "",
                 isEmbed: true,

@@ -34,6 +34,8 @@ struct TVKSPlayerHost: UIViewControllerRepresentable {
     let session: TVPlayerSession
 
     func makeUIViewController(context: Context) -> TVKSPlayerHostViewController {
+        // L-T04 probe breadcrumb P8: the KS host is being made.
+        DiagLog.log("player", "host.make surface=ks")
         let host = TVKSPlayerHostViewController()
         host.start(stream: stream, attemptID: attemptID, session: session)
         return host
@@ -166,6 +168,10 @@ final class TVKSPlayerHostViewController: UIViewController, KSPlayerLayerDelegat
                 self?.applyChoiceNow(choice) ?? choice
             })
         beginPlaybackIfPossible()
+        // L-T04 probe breadcrumb (P10 twin for the KS host):
+        // start() completed — layer creation may still be
+        // deferred to first real bounds, as in JoeTV's host.
+        DiagLog.log("player", "start.done surface=ks")
     }
 
     func teardown() {

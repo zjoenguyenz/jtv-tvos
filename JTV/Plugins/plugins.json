@@ -76,7 +76,7 @@
     {
       "id": "sayhentai",
       "name": "SayHentai",
-      "version": "3.1.0",
+      "version": "3.2.0",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod09.js",
       "iconUrl": "https://sayhentai.cx/favicon.ico",
       "adult": true,

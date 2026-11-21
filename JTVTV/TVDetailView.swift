@@ -487,6 +487,9 @@ struct TVDetailView: View {
             fallbackHeaders: bundle?.detailStream.headers ?? [:],
             switchList: switchShortlist(current: episode, detail: detail)
         )
+        // L-T04 probe breadcrumb P0: the tap reached Detail's
+        // play entry — the hand-off to the presenter is next.
+        DiagLog.log("player", "tap.received plugin=\(pluginId) episode=\(episode.id)")
         presenter.request = request
     }
 
