@@ -55,6 +55,23 @@ final class TVNavPath {
     }
 }
 
+/// Builds the Detail destination for a .movie route. L-T04
+/// breadcrumb D2 lives here: the log fires when the destination
+/// closure is evaluated for the route — after the push (D1),
+/// before the destination's body is entered (D3) — exactly the
+/// split the diagnosis spec (L-T04-DETAIL-DIAGNOSIS.md §4) asks
+/// for. D2 was originally a bare statement inside the destination
+/// closure, which is not a ViewBuilder expression (CI run #10:
+/// `type '()' cannot conform to 'View'`; FL-359); the first fix
+/// shape, `.onAppear` on the destination, compiled but fired
+/// only after the first body evaluation and lost the
+/// closure-reached vs body-entry split (review gate Round 1,
+/// Lens B MAJOR), so the log call rides this factory instead.
+private func tvMovieDestination(_ r: MovieRoute) -> TVDetailView {
+    DiagLog.log("detail", "destination plugin=\(r.pluginId) movie=\(r.movie.id)")
+    return TVDetailView(pluginId: r.pluginId, movie: r.movie, autoResume: r.autoResume)
+}
+
 extension View {
     /// The three AppRoute destinations every Phase 2 stack shares
     /// (FL-235 — one shared destination set, no per-tab copies).
@@ -62,10 +79,7 @@ extension View {
         navigationDestination(for: AppRoute.self) { route in
             switch route {
             case .movie(let r):
-                // L-T04 breadcrumb D2: the Detail destination
-                // closure was reached for this route.
-                DiagLog.log("detail", "destination plugin=\(r.pluginId) movie=\(r.movie.id)")
-                TVDetailView(pluginId: r.pluginId, movie: r.movie, autoResume: r.autoResume)
+                tvMovieDestination(r)
             case .category(let r):
                 TVBrowseView(pluginId: r.pluginId, slug: r.slug, title: r.title, initialFilters: r.filters)
             case .search(let r):
