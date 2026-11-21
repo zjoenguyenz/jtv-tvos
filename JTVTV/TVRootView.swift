@@ -96,7 +96,7 @@ struct TVRootView: View {
         .environment(\.tvTheme, theme)
         .background(theme.backgroundGradient.ignoresSafeArea())
         .fullScreenCover(item: $presenter.request) { request in
-            TVPlaybackPlaceholderView(request: request)
+            TVPlayerView(request: request)
         }
         .onAppear {
             session.touch()

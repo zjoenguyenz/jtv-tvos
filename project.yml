@@ -92,6 +92,13 @@ targets:
       - JTVTV/TVSearchView.swift
       - JTVTV/TVDetailView.swift
       - JTVTV/TVLibraryView.swift
+      # tvOS-only shell (Phase 3): the player — session owner,
+      # cover view, AV surface, KS surface, subtitle panel.
+      - JTVTV/TVPlayerSession.swift
+      - JTVTV/TVPlayerView.swift
+      - JTVTV/TVAVPlayerHost.swift
+      - JTVTV/TVKSPlayerHost.swift
+      - JTVTV/TVSubtitlePanel.swift
     dependencies:
       - package: KSPlayer
       - package: FFmpegKit
@@ -107,15 +114,15 @@ targets:
         # with the old version because only one pair was bumped.
         # The delivered IPA's Info.plist is read back before
         # every delivery.
-        MARKETING_VERSION: "1.1.0"
-        CURRENT_PROJECT_VERSION: "2"
+        MARKETING_VERSION: "1.2.0"
+        CURRENT_PROJECT_VERSION: "3"
     info:
       path: Info.plist
       properties:
         CFBundleDisplayName: "Media Service"
         CFBundleName: "Media Service"
-        CFBundleShortVersionString: "1.1.0"
-        CFBundleVersion: "2"
+        CFBundleShortVersionString: "1.2.0"
+        CFBundleVersion: "3"
         CFBundleIconName: "AppIcon"
         UILaunchScreen: {}
         UIBackgroundModes:

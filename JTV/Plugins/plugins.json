@@ -13,7 +13,7 @@
     {
       "id": "123av",
       "name": "123AV",
-      "version": "1.0.4",
+      "version": "1.0.5",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod02.js",
       "iconUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/icons/mod02.ico",
       "adult": true,
@@ -22,7 +22,7 @@
     {
       "id": "avdbapi",
       "name": "AVDB JAV",
-      "version": "1.0.5",
+      "version": "1.0.6",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod03.js",
       "iconUrl": "https://avdbapi.com/favicon.ico",
       "adult": true,
@@ -49,7 +49,7 @@
     {
       "id": "javhd",
       "name": "JavHD",
-      "version": "1.0.6",
+      "version": "1.0.7",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod06.js",
       "iconUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/icons/mod06.ico",
       "adult": true,

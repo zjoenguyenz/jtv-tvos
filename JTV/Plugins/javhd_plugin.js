@@ -6,7 +6,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "javhd",
         "name": "JavHD",
-        "version": "1.0.6",
+        "version": "1.0.7",
         "baseUrl": "https://javhdz.today",
         "iconUrl": "https://javhdz.today/favicon.ico",
         "isEnabled": true,
@@ -327,10 +327,92 @@ function parseMovieDetail(html) {
 
         var servers = [];
 
+        // Base64 decode — the same primitives this plugin already uses for
+        // the singular buttons below (atob when present, else the manual
+        // decoder).
+        function decodeB64(b64) {
+            if (typeof atob === 'function') {
+                try { return atob(b64); } catch (e) { }
+            }
+            var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+            var str = String(b64).replace(/[=]+$/, '');
+            if (str.length % 4 === 1) return "";
+            var out = "";
+            for (var bc = 0, bs, buffer, idx = 0; buffer = str.charAt(idx++); ~buffer && (bs = bc % 4 ? bs * 64 + buffer : buffer, bc++ % 4) ? out += String.fromCharCode(255 & bs >> (-2 * bc & 6)) : 0) {
+                buffer = chars.indexOf(buffer);
+            }
+            return out;
+        }
+
+        var foundServer = false;
+
+        // Plural data-embeds families — Phase 3 rescue
+        // (JTV-TVOS-PHASE1-SPIKE-JAVHD.md §2/§5, spike-proven): the
+        // site-owned server families ride a plural data-embeds attribute
+        // whose value base64-decodes to a JSON array of mirror embed URLs
+        // for one family. Prefer Myserver (embed.php), then BpServer
+        // (embed_server5.php); other plural families follow in page
+        // order; the singular third-party servers parsed below remain
+        // later fallbacks.
+        var pluralFamilies = [];
+        var buttonRegex = /<button[^>]*>/gi;
+        var btnMatch;
+        while ((btnMatch = buttonRegex.exec(html)) !== null) {
+            var tag = btnMatch[0];
+            if (tag.indexOf('data-embeds') === -1) continue;
+            var embedsM = tag.match(/data-embeds=["']([^"']+)["']/);
+            if (!embedsM) continue;
+            var nameM = tag.match(/data-name=["']([^"']+)["']/);
+            var famName = nameM ? nameM[1] : "Server";
+            var famUrls = [];
+            try {
+                var arr = JSON.parse(decodeB64(embedsM[1]));
+                if (arr && arr.length) {
+                    for (var ai = 0; ai < arr.length; ai++) {
+                        if (typeof arr[ai] === 'string' && arr[ai].indexOf('http') === 0 && famUrls.indexOf(arr[ai]) === -1) {
+                            famUrls.push(arr[ai]);
+                        }
+                    }
+                }
+            } catch (e) { }
+            if (famUrls.length > 0) {
+                pluralFamilies.push({ name: famName, urls: famUrls });
+            }
+        }
+        // Preference rank from the family's embed path:
+        // embed.php (Myserver) = 0, embed_server5.php (BpServer) = 1,
+        // anything else = 2. Page order is preserved within a rank.
+        function familyRank(fam) {
+            var joined = fam.urls.join(' ');
+            if (joined.indexOf('embed_server5.php') !== -1) return 1;
+            if (joined.indexOf('embed.php') !== -1) return 0;
+            return 2;
+        }
+        var rankedFamilies = [];
+        for (var ri = 0; ri < pluralFamilies.length; ri++) {
+            rankedFamilies.push({ fam: pluralFamilies[ri], order: ri, rank: familyRank(pluralFamilies[ri]) });
+        }
+        rankedFamilies.sort(function (a, b) { return (a.rank - b.rank) || (a.order - b.order); });
+        for (var fi = 0; fi < rankedFamilies.length; fi++) {
+            var fam2 = rankedFamilies[fi].fam;
+            var famEpisodes = [];
+            for (var ei = 0; ei < fam2.urls.length; ei++) {
+                famEpisodes.push({
+                    id: fam2.urls[ei],
+                    name: ei === 0 ? "Full" : ("Mirror " + (ei + 1)),
+                    slug: ei === 0 ? "full" : ("mirror-" + (ei + 1))
+                });
+            }
+            servers.push({
+                name: fam2.name,
+                episodes: famEpisodes
+            });
+            foundServer = true;
+        }
+
         var serverRegex = /<button[^>]*class=["'][^"']*button_choice_server[^"']*["'][^>]*data-embed=["']([^"']+)["'][^>]*data-name=["']([^"']+)["']/gi;
         var b64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
         var serverMatch;
-        var foundServer = false;
 
         while ((serverMatch = serverRegex.exec(html)) !== null) {
             var b64url = serverMatch[1];
@@ -482,18 +564,73 @@ function parseDetailResponse(html, fallbackUrl) {
 }
 
 function parseEmbedResponse(html, fallbackUrl) {
-    // If the streaming link is doodstream or streamwish, the app core might handle it
-    // Or if `parseDetailResponse` marked `isEmbed = true`, App's engine intercepts it.
-    // If we need to extract raw mp4/m3u8 from the iframe body, add logic here.
-    return JSON.stringify({
-        url: fallbackUrl || "",
-        headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": "https://javhdz.today/"
-        },
-        subtitles: [],
-        isEmbed: false
-    });
+    var DESKTOP_UA_JAVHD = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+    var pageUrl = fallbackUrl || "";
+    var originM = pageUrl.match(/^(https?:\/\/[^\/]+)/i);
+    var origin = originM ? originM[1] : "";
+
+    function terminal(url) {
+        return JSON.stringify({
+            url: url,
+            headers: {
+                "User-Agent": DESKTOP_UA_JAVHD,
+                "Referer": "https://javhdz.today/"
+            },
+            subtitles: [],
+            isEmbed: false
+        });
+    }
+
+    // Resolve a possibly-relative stream src the way the page's own
+    // hls.loadSource(src) does: against the EMBED PAGE's origin. The
+    // origin rule is load-bearing — resolving against any other host
+    // returns 404 (JTV-TVOS-PHASE1-SPIKE-JAVHD.md §3.2/§4).
+    function resolveAgainstEmbedOrigin(src) {
+        if (!src) return "";
+        if (/^https?:\/\//i.test(src)) return src;
+        if (src.indexOf('//') === 0) return "https:" + src;
+        if (!origin) return src;
+        if (src.charAt(0) === '/') return origin + src;
+        return origin + "/" + src;
+    }
+
+    try {
+        var text = html || "";
+
+        // Phase 3 rescue (spike §3.2/§5): the site-owned families
+        // pre-resolve the source server-side into a static literal:
+        //   var FIRST = {"type":"streamhg","src":"/universal-stream-hls/<hash>/playlist.m3u8",...};
+        // This supersedes the shipped embedRegex (a quoted absolute URL —
+        // 0 matches on all 35 spike pages, because the real src is
+        // relative). The embedRegex field is NOT wired into Swift.
+        var firstM = text.match(/var\s+FIRST\s*=\s*(\{[\s\S]*?\})\s*;?/);
+        if (firstM) {
+            try {
+                var first = JSON.parse(firstM[1]);
+                var src = first ? (first.src || first.playlist) : null;
+                if (src) {
+                    var srcPath = String(src).split('?')[0];
+                    if (first.type === 'streamhg' || /\.m3u8$/i.test(srcPath)) {
+                        var abs = resolveAgainstEmbedOrigin(String(src));
+                        if (abs) return terminal(abs);
+                    }
+                }
+            } catch (e) { }
+        }
+
+        // Shape-drift fallback (spike §5): a quoted relative .m3u8 path
+        // anywhere in the page, resolved against the embed origin.
+        var relM = text.match(/["'](\/[^"'\s]+\.m3u8(?:\?[^"'\s]*)?)["']/);
+        if (relM && origin) {
+            return terminal(origin + relM[1]);
+        }
+    } catch (e) { }
+
+    // No static source found (the third-party singular servers build
+    // theirs in page JS): previous behaviour — hand the page URL back as
+    // the terminal; the resolver diverts webpage-shaped terminals to the
+    // sniffing webview where one exists.
+    return terminal(pageUrl);
 }
 
 function parseCategoriesResponse(html) {

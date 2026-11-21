@@ -6,7 +6,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "123av",
         "name": "123AV",
-        "version": "1.0.4",
+        "version": "1.0.5",
         "baseUrl": "https://123av.com",
         "referrer": "https://123av.com/",
         "iconUrl": "https://123av.com/assets/123av/favicon.png",
@@ -394,18 +394,119 @@ function parseMovieDetail(htmlContent) {
     }
 }
 
-function parseDetailResponse(htmlContent, pageUrl) {
-    // Return the pageUrl as is, marked as an Embed, so the app's EmbedSniffer
-    // can automatically load and intercept the m3u8 stream.
+// =============================================================================
+// RESOLVE — Phase 3 rescue (JTV-TVOS-PHASE1-SPIKE-123AV.md §5, spike-proven)
+// =============================================================================
+// The embed page is a static shell whose only job is to run one module
+// script. That script's entire resolve logic, ported here as text parsing:
+// extract the id via /e/([a-z0-9_]+), GET <embed-origin>/stream?id=<id>
+// (forwarding any query params present on the embed URL), play
+// resp.media.stream. No token, no signing, no cookies.
+// The stream CDN gates on Referer == the embed page URL, on playlist AND
+// segment requests alike (Referer https://123av.com/ or none -> 403).
+// All hosts are derived per title from the payloads, never hardcoded.
+
+var APP_UA_123AV = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+var DESKTOP_UA_123AV = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+function parse123avResolve(htmlContent, pageUrl) {
+    var url = pageUrl || "";
+    var text = htmlContent || "";
+
+    // Hop 2 — the /stream JSON payload: terminal result.
+    var trimmed = text.replace(/^\s+/, "");
+    if (trimmed.indexOf("{") === 0) {
+        try {
+            var data = JSON.parse(trimmed);
+            if (data && data.media && data.media.stream) {
+                // Referer = the embed page URL. The /stream URL was built
+                // from that page, so it carries the same origin and id:
+                // rebuild the embed page URL (<origin>/e/<id>) from it.
+                // Hop 1 forwarded the embed page's own query params onto
+                // the /stream URL after its synthetic id=<id> — which it
+                // always writes FIRST. Remove exactly that first id=
+                // segment and hand the remainder back verbatim (empty
+                // segments included), so the reconstructed Referer is
+                // the embed page URL byte-for-byte, query included —
+                // even when the embed query carries its own id= param.
+                var originM = url.match(/^(https?:\/\/[^\/]+)/i);
+                var idM = url.match(/[?&]id=([a-z0-9_]+)/i);
+                var referer = url;
+                if (originM && idM) {
+                    referer = originM[1] + "/e/" + idM[1];
+                    var qIdx2 = url.indexOf("?");
+                    if (qIdx2 !== -1) {
+                        var parts = url.substring(qIdx2 + 1).split("&");
+                        for (var pi = 0; pi < parts.length; pi++) {
+                            if (/^id=/i.test(parts[pi])) { parts.splice(pi, 1); break; }
+                        }
+                        if (parts.length) referer += "?" + parts.join("&");
+                    }
+                }
+                return JSON.stringify({
+                    url: data.media.stream,
+                    isEmbed: false,
+                    headers: {
+                        "Referer": referer,
+                        "User-Agent": APP_UA_123AV
+                    },
+                    subtitles: []
+                });
+            }
+        } catch (e) { }
+    }
+
+    // Hop 1 — the embed page: build the /stream hop, mirroring the embed
+    // module script (id from the path; query params forwarded).
+    var embedM = url.match(/\/e\/([a-z0-9_]+)/);
+    if (embedM) {
+        var originParts = url.match(/^(https?:\/\/[^\/]+)/i);
+        var origin = originParts ? originParts[1] : "";
+        var streamUrl = origin + "/stream?id=" + embedM[1];
+        var qIdx = url.indexOf("?");
+        if (qIdx !== -1) {
+            // The separator is appended even when the query
+            // string is empty, so a trailing "?" on the embed
+            // URL survives the chain and hop 2 can hand it
+            // back byte-for-byte.
+            var qs = url.substring(qIdx + 1);
+            streamUrl += "&" + qs;
+        }
+        return JSON.stringify({
+            url: streamUrl,
+            isEmbed: true,
+            headers: {
+                "User-Agent": APP_UA_123AV
+            },
+            subtitles: []
+        });
+    }
+
+    return null;
+}
+
+function parseEmbedResponse(htmlContent, pageUrl) {
+    var resolved = parse123avResolve(htmlContent, pageUrl);
+    if (resolved) return resolved;
+    // Unrecognised shape: keep the pre-rescue behaviour — return the
+    // pageUrl as is, marked as an Embed, so the app's EmbedSniffer can
+    // automatically load and intercept the m3u8 stream.
     return JSON.stringify({
         url: pageUrl,
         isEmbed: true,
         headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": DESKTOP_UA_123AV,
             "Referer": "https://123av.com/"
         },
         subtitles: []
     });
+}
+
+function parseDetailResponse(htmlContent, pageUrl) {
+    // In the resolver chain this parser runs on the same payloads as
+    // parseEmbedResponse (the embed page, then the /stream JSON), so it
+    // shares the rescue logic above, including its self-embed fallback.
+    return parseEmbedResponse(htmlContent, pageUrl);
 }
 
 function parseCategoriesResponse(html) {
