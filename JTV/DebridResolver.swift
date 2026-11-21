@@ -170,6 +170,73 @@ enum DebridResolver {
         throw lastError
     }
 
+    /// NEXT-D D5 (tvOS-only divergence, 1.3.0): PROBE-ONLY
+    /// resolve for the Detail backdrop preview. Runs the same
+    /// Phase-1 cache probes as `resolve(hash:)` (TorBox
+    /// checkcached → RD instantAvailability → Premiumize
+    /// directdl), and when a provider reports the title cached
+    /// it resolves through that provider's normal flow, exactly
+    /// like Phase 1. It NEVER reaches the Phase-2 download
+    /// chain: when no provider reports the title cached it
+    /// returns nil, so a preview can spend a probe but can
+    /// never start a server-side download. `resolve(hash:)`
+    /// itself is unchanged.
+    static func resolveCachedOnly(hash: String) async -> StreamInfo? {
+        let clean = hash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard clean.count >= 32 else {
+            DiagLog.log("debrid", "provider=all phase=probe-only outcome=invalid-hash")
+            return nil
+        }
+        let tb = DebridTokens.torbox, rd = DebridTokens.rd, pm = DebridTokens.premiumize
+        guard !tb.isEmpty || !rd.isEmpty || !pm.isEmpty else {
+            DiagLog.log("debrid", "provider=all phase=probe-only outcome=no-token")
+            return nil
+        }
+        // Review-gate fix (1.3.0): cancellation is never
+        // swallowed here — Task.isCancelled is checked between
+        // provider attempts, and a CancellationError out of a
+        // provider flow aborts promptly with nil (this
+        // function's shape) instead of being converted by a
+        // `try?` into "try the next provider".
+        if !tb.isEmpty, await torboxIsCached(hash: clean, token: tb) {
+            if Task.isCancelled { return nil }
+            do {
+                return try await resolveTorBox(hash: clean, token: tb)
+            } catch is CancellationError {
+                return nil
+            } catch {
+                // Cached flow failed — the next provider's
+                // probe still gets its turn (as in Phase 1).
+            }
+        }
+        if Task.isCancelled { return nil }
+        if !rd.isEmpty, await rdIsAvailable(hash: clean, token: rd) {
+            if Task.isCancelled { return nil }
+            do {
+                return try await resolveRD(hash: clean, token: rd)
+            } catch is CancellationError {
+                return nil
+            } catch {
+                // Same fall-through as TorBox above.
+            }
+        }
+        if Task.isCancelled { return nil }
+        if !pm.isEmpty {
+            // premiumizeDirectDL IS the probe: it returns the
+            // final links when cached and throws the not-cached
+            // message otherwise (already logged inside).
+            do {
+                return try await premiumizeDirectDL(hash: clean, token: pm)
+            } catch is CancellationError {
+                return nil
+            } catch {
+                // Not cached / probe error — logged inside.
+            }
+        }
+        DiagLog.log("debrid", "provider=all phase=probe-only outcome=not-cached")
+        return nil
+    }
+
     // MARK: - Cache probes
 
     /// TorBox cache check: does TorBox already hold this hash?

@@ -38,6 +38,13 @@ struct TVSettingsView: View {
     /// ruling 2026-11-20 — default glossy black "Đen bóng Ultra").
     @AppStorage(TVThemeStore.defaultsKey) private var themeRaw = JTVThemeID.ultraBlack.rawValue
 
+    /// NEXT-D D6 (1.3.0): backdrop-preview kill switch,
+    /// default ON. Off → the Detail dwell task returns
+    /// immediately and Detail is identical to the pre-preview
+    /// build. The same key is read by TVDetailView.
+    @AppStorage(TVPreviewSettings.defaultsKey) private var previewEnabled = true
+    @FocusState private var previewButtonFocused: Bool
+
     /// Entry focus (Diagnosis §4.1.6, JoeSettings.swift:306
     /// shape): declared on the first focusable — the first
     /// credential status row.
@@ -73,6 +80,9 @@ struct TVSettingsView: View {
                     .focusSection()
 
                 themeSection
+                    .focusSection()
+
+                previewSection
                     .focusSection()
 
                 if BundledSecrets.pinConfigured {
@@ -146,6 +156,28 @@ struct TVSettingsView: View {
                 }
             }
             Text("Theme áp dụng ngay cho toàn bộ app. Mặc định: Đen bóng Ultra.")
+                .font(.system(size: 23))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Backdrop preview (NEXT-D D6)
+
+    private var previewSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Xem trước nền")
+                .font(.system(size: 30, weight: .semibold))
+            Button {
+                previewEnabled.toggle()
+            } label: {
+                ActionRowLabel {
+                    Label(previewEnabled ? "Đang bật — chạm để tắt" : "Đang tắt — chạm để bật",
+                          systemImage: previewEnabled ? "play.rectangle.fill" : "play.rectangle")
+                }
+            }
+            .jtvCardButton()
+            .focused($previewButtonFocused)
+            Text("Khi mở chi tiết phim, nền sẽ tự chạy một đoạn video xem trước (không tiếng) sau khoảng 1,5 giây. Tắt thì màn hình chi tiết giữ nguyên ảnh nền tĩnh như trước.")
                 .font(.system(size: 23))
                 .foregroundStyle(.secondary)
         }

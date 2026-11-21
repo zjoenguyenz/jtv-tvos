@@ -17,6 +17,25 @@ private extension View {
     }
 }
 
+/// h:mm:ss / m:ss position formatting. Moved here in 1.3.0
+/// (NEXT-B B4): it was TVPlaybackPlaceholderView.formatTime,
+/// and this file was that helper's last remaining user once
+/// the placeholder itself was removed.
+enum TVTimeFormat {
+    static func string(_ seconds: Double) -> String {
+        // Review-gate fix (1.3.0): the iOS reference behaviour
+        // exactly — non-finite or negative input is "0:00", and
+        // the total TRUNCATES (Int(seconds)), never rounds.
+        guard seconds.isFinite, seconds >= 0 else { return "0:00" }
+        let total = Int(seconds)
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+        return String(format: "%d:%02d", m, s)
+    }
+}
+
 /// JTV tvOS Phase 2 — Library tab (the iOS LibraryView port,
 /// survey §1.6): segmented Đang xem tiếp / Yêu thích at a fixed,
 /// findable position (its own tab — FL-071). History shows ALL
@@ -197,7 +216,7 @@ private struct TVHistoryRow: View {
                                     .frame(width: 420 * CGFloat(record.progress))
                             }
                             .frame(width: 420, height: 6)
-                            Text("\(TVPlaybackPlaceholderView.formatTime(record.lastPosition)) / \(TVPlaybackPlaceholderView.formatTime(record.duration))")
+                            Text("\(TVTimeFormat.string(record.lastPosition)) / \(TVTimeFormat.string(record.duration))")
                                 .font(.system(size: 22))
                                 .foregroundStyle(theme.textFaint)
                         }

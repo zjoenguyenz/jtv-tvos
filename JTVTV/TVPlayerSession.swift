@@ -92,6 +92,10 @@ enum TVPlayerPhase {
 enum TVPlayerPanel: Equatable {
     case subtitles
     case sources
+    /// NEXT-B (1.3.0): the manga reader's chapter-end bar. It is
+    /// a session panel so the cover's single Menu arbiter closes
+    /// it first, exactly like the other panels (FL-048).
+    case mangaChapterEnd
 }
 
 // MARK: - Session
@@ -110,6 +114,17 @@ final class TVPlayerSession: ObservableObject {
     /// its episode in place (the iOS C-3 shape: only `episode`
     /// changes; movie/plugin/server context ride unchanged).
     @Published private(set) var currentRequest: PlaybackRequest
+
+    // NEXT-B (1.3.0) reader accessors: the manga reader is a
+    // child of this session and needs the service (chapter
+    // resolves run INSIDE the reader, never through
+    // beginAttempt/switchSource) and the history manager (it
+    // writes its own image-index records; the session's
+    // notePosition/flushHistory are seconds-shaped and must
+    // never be fed manga indices). Internal reads only — the
+    // stored properties stay private.
+    var mangaService: MovieService { service }
+    var mangaHistory: WatchHistoryManager { history }
     /// The stream the current attempt resolved to (video only).
     @Published private(set) var currentStream: StreamInfo?
     @Published private(set) var phase: TVPlayerPhase = .resolving
@@ -142,6 +157,9 @@ final class TVPlayerSession: ObservableObject {
     private(set) var recordedSeekTarget: Double = 0
     private var resolveTask: Task<Void, Never>?
     private var resolveTimeoutTask: Task<Void, Never>?
+    /// A2: the streamxx native-lane extraction task for the
+    /// current attempt (cancelled with every new attempt).
+    private var streamxxLaneTask: Task<Void, Never>?
     private var started = false
 
     // Instrumentation timestamps (§6).
@@ -157,6 +175,12 @@ final class TVPlayerSession: ObservableObject {
     // Subtitle session state (§4.4): the user's manual pick.
     // nil = the user has not chosen — the default rule applies.
     private(set) var manualChoice: TVSubtitleChoice?
+
+    /// L-T11 (3) (1.3.0): set by TVPlayerSessionView the first
+    /// time its body runs, so the cover.sessionview.body
+    /// breadcrumb is first-only instead of one line per
+    /// re-render.
+    var sessionViewBodyLogged = false
 
     // Host registrations (attempt-scoped; a stale host's
     // deregistration must not clear the live host's handlers).
@@ -186,6 +210,7 @@ final class TVPlayerSession: ObservableObject {
     /// line (the session's birth — Detail stays untouched, per
     /// the plan's preference) and starts the first attempt.
     func start() {
+        guard !isStopped else { return }
         guard !started else { return }
         started = true
         pinSession.setPlaybackActive(true)
@@ -197,13 +222,33 @@ final class TVPlayerSession: ObservableObject {
     /// Called from the cover's onDisappear: playback no longer
     /// counts as activity, the final position is flushed to
     /// history, and every in-flight task is cancelled.
+    /// Gate fix pass (Round 1 on R2, Lens 2 F1/F3): set by
+    /// stop() — a stopped session is terminal and must never
+    /// be handed out again by TVPlayerSessionReuse.
+    private(set) var isStopped = false
+
     func stop() {
         pinSession.setPlaybackActive(false)
         flushHistory()
+        // Invalidate the attempt BEFORE cancelling the tasks:
+        // bumping attemptID makes every attempt-scoped publish
+        // guard (resolveSucceeded/resolveFailed, embedSlate,
+        // streamxx lane, itemFailed, watchdogFailed, position
+        // and subtitle funnels) fail for any completion that
+        // lands after teardown, so nothing can publish
+        // .failed/.playing/slate into a dismissed cover.
+        attemptID += 1
+        isStopped = true
+        // A stopped session leaves the reuse registry at once
+        // (instance-matched clear — TVPlayerView, Lens 2 F3),
+        // so no later cover evaluation can resurrect it.
+        TVPlayerSessionReuse.clear(session: self)
         resolveTask?.cancel()
         resolveTask = nil
         resolveTimeoutTask?.cancel()
         resolveTimeoutTask = nil
+        streamxxLaneTask?.cancel()
+        streamxxLaneTask = nil
         positionProvider = nil
         subtitleApplier = nil
     }
@@ -215,6 +260,7 @@ final class TVPlayerSession: ObservableObject {
     // MARK: Attempts & resolve
 
     private func beginAttempt(resumeTarget: Double) {
+        guard !isStopped else { return }
         attemptID += 1
         let attempt = attemptID
         recordedSeekTarget = resumeTarget
@@ -248,6 +294,8 @@ final class TVPlayerSession: ObservableObject {
         resolveTask?.cancel()
         resolveTimeoutTask?.cancel()
         resolveTimeoutTask = nil
+        streamxxLaneTask?.cancel()
+        streamxxLaneTask = nil
 
         DiagLog.log("player", "resolve.begin attempt=\(attempt)")
         let request = currentRequest
@@ -260,28 +308,33 @@ final class TVPlayerSession: ObservableObject {
                 self.resolveFailed(attempt: attempt, error: error)
             }
         }
-        // Resolve deadline (FL-005/FL-152): EVERY attempt gets
-        // a session-level ceiling, so no resolve can spin
+        // Resolve deadline (FL-005/FL-152): non-torrent attempts
+        // get a session-level ceiling, so no resolve can spin
         // forever without reaching the error slate (§3.5's
-        // "no silent infinite loading"). Non-debrid attempts
-        // keep the iOS resolver's 45 s. Debrid (`jtvhash:`)
-        // attempts get a longer 120 s ceiling: the resolver's
-        // own internal budgets govern the normal debrid case,
-        // and this task is only the session's last-resort
-        // deadline behind them — never the primary budget.
-        // A timed-out attempt lands on the error slate; the
-        // late completion is dropped by the phase guard in
-        // resolveSucceeded/resolveFailed.
-        let resolveTimeoutSeconds: Double = request.episode.id.hasPrefix("jtvhash:") ? 120 : 45
-        resolveTimeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(resolveTimeoutSeconds))
-            guard let self, !Task.isCancelled else { return }
-            guard self.attemptID == attempt, case .resolving = self.phase else { return }
-            DiagLog.log("player", "fail attempt=\(attempt) stage=resolve error=player#timeout")
-            self.phase = .failed(TVPlayerFailure(
-                stage: .resolve,
-                message: "Không tải được nguồn phát. Kiểm tra mạng rồi thử lại.",
-                errorLabel: "player#timeout"))
+        // "no silent infinite loading"). Non-torrent attempts
+        // keep the iOS resolver's 45 s.
+        //
+        // NEXT-C C2 (1.3.0, iOS parity): TORRENT targets
+        // (pluginId == "torrenthub") are EXEMPT from the session
+        // deadline entirely — iOS exempts torrent episodes from
+        // its screen deadline because the debrid chain carries
+        // its own per-provider budgets (900 s) and a server-side
+        // download legitimately takes minutes. The old tvOS
+        // 120 s ceiling for `jtvhash:` attempts false-failed
+        // uncached torrents (120 s ≪ the chain's budget). The
+        // loading state carries the source-switch list (C3), so
+        // the exempt wait is never a trap.
+        if request.pluginId != "torrenthub" {
+            resolveTimeoutTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(45))
+                guard let self, !Task.isCancelled else { return }
+                guard self.attemptID == attempt, case .resolving = self.phase else { return }
+                DiagLog.log("player", "fail attempt=\(attempt) stage=resolve error=player#timeout")
+                self.phase = .failed(TVPlayerFailure(
+                    stage: .resolve,
+                    message: "Không tải được nguồn phát. Kiểm tra mạng rồi thử lại.",
+                    errorLabel: "player#timeout"))
+            }
         }
     }
 
@@ -317,15 +370,135 @@ final class TVPlayerSession: ObservableObject {
             currentStream = stream
             DiagLog.log("player", "resolve.done attempt=\(attempt) ms=\(ms) route=manga")
             phase = .manga(stream)
-        case .embed:
-            // No webview exists on tvOS (gaps G-2/G-3): the
-            // designed error state (§3.5), never a black trap.
-            DiagLog.log("player", "resolve.done attempt=\(attempt) ms=\(ms) route=embed")
-            phase = .failed(TVPlayerFailure(
-                stage: .embed,
-                message: "Nguồn này cần trình phát web, chưa hỗ trợ trên TV. Hãy đổi nguồn khác.",
-                errorLabel: nil))
+        case .embed(let url, let headers, let sniffMedia):
+            // A2 (1.3.0, NEXT-A2 study §3.2): the UNIQUE
+            // streamxx signature — sniffMedia == false AND the
+            // embed.streamxx.net/player/<id> URL — is produced
+            // only by MovieService.streamxxPlayerFallback's
+            // backup=no branch. That route gets ONE native-lane
+            // attempt (plain fetch + EMBED_CONFIG parse, its own
+            // ~10 s budget) before the slate. Every other .embed
+            // outcome keeps today's slate exactly. Prefetched
+            // embeds arrive through this same point — no bypass.
+            if !sniffMedia, url.host == "embed.streamxx.net",
+               url.path.hasPrefix("/player/") {
+                DiagLog.log("player", "resolve.done attempt=\(attempt) ms=\(ms) route=embed via=streamxx-player")
+                startStreamxxLane(attempt: attempt, url: url, headers: headers)
+            } else {
+                embedSlate(attempt: attempt, ms: ms)
+            }
         }
+    }
+
+    /// The designed .embed error slate (§3.5) — no webview
+    /// exists on tvOS (gaps G-2/G-3), never a black trap. Shared
+    /// by the plain .embed outcome and by A2 lane failures.
+    private func embedSlate(attempt: Int, ms: Int) {
+        guard attempt == attemptID, case .resolving = phase else { return }
+        DiagLog.log("player", "resolve.done attempt=\(attempt) ms=\(ms) route=embed")
+        phase = .failed(TVPlayerFailure(
+            stage: .embed,
+            message: "Nguồn này cần trình phát web, chưa hỗ trợ trên TV. Hãy đổi nguồn khác.",
+            errorLabel: nil))
+    }
+
+    // MARK: A2 — streamxx native lane (NEXT-A2 §2.3/§3.2)
+
+    /// One extraction attempt for a backup-less streamxx title:
+    /// plain-fetch the operator's player page and read the
+    /// unsigned direct MP4 URL out of its static inline
+    /// EMBED_CONFIG (`hls_url`, fallback `storage_url`). The
+    /// embed host's own /stream/<id>/main.m3u8 copy is
+    /// newline-corrupted in transit and is NEVER used. On
+    /// success the stream re-enters this session's own .video
+    /// path with useCompatEngine = true, so it routes to the
+    /// KS surface exactly like a resolved compat stream (the
+    /// B2 object is h264+aac per the study's ffprobe evidence).
+    ///
+    /// Budget: resolveSucceeded has already cancelled the
+    /// resolve deadline, so the lane carries its OWN ~10 s
+    /// budget (task-group race, the MovieService
+    /// fetchTextWithDeadline shape). Timeout / fetch failure /
+    /// parse failure / invalid URL → the designed slate plus a
+    /// distinct DiagLog line — never a crash, never a hang.
+    /// Logs carry kind + host only (house style).
+    private func startStreamxxLane(attempt: Int, url: URL, headers: [String: String]) {
+        streamxxLaneTask?.cancel()
+        streamxxLaneTask = Task { [weak self] in
+            guard let self else { return }
+            let page: String
+            do {
+                page = try await Self.fetchTextWithBudget(url.absoluteString, headers: headers, seconds: 10)
+            } catch {
+                self.streamxxLaneFailed(attempt: attempt, reason: "fetch")
+                return
+            }
+            guard let mediaURL = Self.streamxxMediaURL(from: page) else {
+                self.streamxxLaneFailed(attempt: attempt, reason: "parse")
+                return
+            }
+            DiagLog.log("player", "streamxx-lane extracted host=\(mediaURL.host ?? "?")")
+            let stream = StreamInfo(url: mediaURL.absoluteString, headers: headers,
+                                    useCompatEngine: true)
+            self.resolveSucceeded(attempt: attempt, resolution: .video(stream))
+        }
+    }
+
+    private func streamxxLaneFailed(attempt: Int, reason: String) {
+        guard attempt == attemptID, case .resolving = phase else { return }
+        DiagLog.log("player", "streamxx-lane failed reason=\(reason)")
+        embedSlate(attempt: attempt, ms: 0)
+    }
+
+    /// Task-group race giving a fetch a hard wall-clock budget;
+    /// on expiry the fetch is cancelled and the call throws.
+    private static func fetchTextWithBudget(_ url: String, headers: [String: String],
+                                            seconds: Double) async throws -> String {
+        try await withThrowingTaskGroup(of: String.self) { group in
+            group.addTask { try await Net.fetchText(url, headers: headers) }
+            group.addTask {
+                try await Task.sleep(for: .seconds(seconds))
+                throw MovieServiceError.timedOut
+            }
+            guard let value = try await group.next() else {
+                throw MovieServiceError.timedOut
+            }
+            group.cancelAll()
+            return value
+        }
+    }
+
+    /// Extracts the playable MP4 URL from the player page's
+    /// inline EMBED_CONFIG. Accepts only an https URL on a
+    /// Backblaze B2 host whose path ends in .mp4 (the study's
+    /// validation rule); anything else is a parse failure.
+    private static func streamxxMediaURL(from page: String) -> URL? {
+        for key in ["hls_url", "storage_url"] {
+            guard let raw = embedConfigValue(in: page, key: key),
+                  let url = URL(string: raw),
+                  url.scheme == "https",
+                  let host = url.host, host.contains("backblazeb2.com"),
+                  url.path.lowercased().hasSuffix(".mp4") else { continue }
+            return url
+        }
+        return nil
+    }
+
+    /// Reads one `"key": "value"` string out of the page's
+    /// EMBED_CONFIG block (plain string scan — no JS, no JSON
+    /// parse of the whole page, whose other fields are not
+    /// guaranteed JSON-clean). `\/` escapes are unescaped.
+    private static func embedConfigValue(in page: String, key: String) -> String? {
+        guard let keyRange = page.range(of: "\"\(key)\"") else { return nil }
+        let rest = page[keyRange.upperBound...]
+        guard let colon = rest.firstIndex(of: ":") else { return nil }
+        let afterColon = rest[rest.index(after: colon)...]
+        guard let open = afterColon.firstIndex(of: "\"") else { return nil }
+        let valueStart = afterColon.index(after: open)
+        guard let close = afterColon[valueStart...].firstIndex(of: "\"") else { return nil }
+        let raw = String(afterColon[valueStart..<close])
+        let value = raw.replacingOccurrences(of: "\\/", with: "/")
+        return value.isEmpty ? nil : value
     }
 
     private func resolveFailed(attempt: Int, error: Error) {
@@ -344,6 +517,7 @@ final class TVPlayerSession: ObservableObject {
     /// resume target is the live position when a host still has
     /// one, else the current attempt's recorded target.
     func retry() {
+        guard !isStopped else { return }
         let captured = captureLivePosition()
         beginAttempt(resumeTarget: captured > 0 ? captured : recordedSeekTarget)
     }
@@ -379,6 +553,7 @@ final class TVPlayerSession: ObservableObject {
     }
 
     private func performSwitch(to episode: Episode, captured: Double) {
+        guard !isStopped else { return }
         guard episode.id != currentRequest.episode.id else { return }
         let from = currentRequest.episode.name
         // The switch line names the NEW attempt (beginAttempt
@@ -513,7 +688,17 @@ final class TVPlayerSession: ObservableObject {
         if case .resolving = phase { return }
         if position.isFinite, position >= 0 {
             livePosition = position
-            currentPosition = position
+            // L-T11 (3) (1.3.0): hosts tick at 250 ms, but the
+            // PUBLISHED position only changes when the displayed
+            // second changes (≤1 Hz). Publishing every tick
+            // re-rendered the whole session view (and re-ran its
+            // body breadcrumb) four times a second for the whole
+            // playback; livePosition above still updates at full
+            // cadence for switch-capture and history, so nothing
+            // that reads the live playhead loses precision.
+            if Int(position) != Int(currentPosition) {
+                currentPosition = position
+            }
         }
         if duration.isFinite, duration > 0 { liveDuration = duration }
         guard livePosition > 10, liveDuration > 0 else { return }
@@ -581,6 +766,7 @@ final class TVPlayerSession: ObservableObject {
     /// once (FL-049), applies to the live host immediately, and
     /// closes the panel (the iOS sheet / JoeTV picker shape).
     func selectSubtitle(_ choice: TVSubtitleChoice) {
+        guard !isStopped else { return }
         manualChoice = choice
         // The host resolves the pick against ITS surface and
         // returns what actually took effect (a cross-surface

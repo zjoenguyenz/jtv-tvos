@@ -18,6 +18,38 @@ enum MovieServiceError: Error, LocalizedError {
     }
 }
 
+/// Resume-once box for the cancellation-responsive pre-resolve
+/// join (gate fix pass, Round 1 on R2, Lens 2 F5a): whichever
+/// arrives first — the warm task's completion or the joining
+/// caller's cancellation — resumes the waiting continuation
+/// exactly once; the loser is dropped.
+private final class PrefetchJoinBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<PlaybackResolution?, Never>?
+    private var resumed = false
+
+    func setContinuation(_ continuation: CheckedContinuation<PlaybackResolution?, Never>) {
+        lock.lock()
+        if resumed {
+            lock.unlock()
+            continuation.resume(returning: nil)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func resume(with value: PlaybackResolution?) {
+        lock.lock()
+        guard !resumed else { lock.unlock(); return }
+        resumed = true
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: value)
+    }
+}
+
 /// Loads catalog data through the plugin contract and resolves episode
 /// play targets into native streams, manga chapters or embed pages.
 /// MainActor-isolated (Swift 6): it is a UI-facing store; its caches
@@ -294,12 +326,65 @@ final class MovieService: ObservableObject {
     private var prefetchedEmbeds: [String: (resolution: PlaybackResolution, at: Date)] = [:]
     private let prefetchLock = NSLock()
 
+    /// L-T11 (2) in-flight dedupe (tvOS-only divergence, 1.3.0):
+    /// the Detail embed warm and a Play tap for the SAME
+    /// plugin+episode used to run two full resolve chains
+    /// concurrently and produce two different playlists. The
+    /// warm's task is registered here while it runs; a tap's
+    /// resolveEpisode JOINS that task instead of starting a
+    /// second chain (see the join step in resolveEpisode). The
+    /// embed-chain fetch mechanics are unchanged — only the
+    /// duplicate concurrent run is removed.
+    private var inFlightPrefetch: [String: (token: UUID, task: Task<PlaybackResolution, Error>)] = [:]
+
     func prefetchEmbedResolution(_ request: PlaybackRequest) {
         let key = request.pluginId + "|" + request.episode.id
+        let token = UUID()
+        let task = Task<PlaybackResolution, Error> {
+            try await self.resolveEpisode(request, joiningPrefetch: false)
+        }
+        // Gate fix pass (Round 1 on R2, Lens 2 F5b): a
+        // superseded warm task is CANCELLED when its registry
+        // entry is overwritten — never orphaned to run to
+        // completion (and possibly race the newer chain). The
+        // token-keyed watcher below already refuses to let the
+        // old task evict the newer entry on its way out.
+        if let superseded = inFlightPrefetch[key], superseded.token != token {
+            superseded.task.cancel()
+        }
+        inFlightPrefetch[key] = (token, task)
         Task {
-            guard let resolution = try? await self.resolveEpisode(request),
+            defer {
+                if inFlightPrefetch[key]?.token == token { inFlightPrefetch[key] = nil }
+            }
+            guard let resolution = try? await task.value,
                   case .embed = resolution else { return }
             prefetchLock.withLock { prefetchedEmbeds[key] = (resolution, Date()) }
+        }
+    }
+
+    /// Cancellation-responsive join of an in-flight pre-resolve
+    /// (Lens 2 F5a): races the warm task's completion against
+    /// THIS caller's cancellation via withTaskCancellationHandler
+    /// — on cancel, the box resumes with nil at once and the
+    /// caller stops waiting (its caller-side Task.isCancelled
+    /// check then throws CancellationError). The warm task is
+    /// deliberately NOT cancelled: it is registry-owned and its
+    /// watcher may still cache the outcome for a later tap.
+    private static func joinInFlightPrefetch(
+        _ task: Task<PlaybackResolution, Error>
+    ) async -> PlaybackResolution? {
+        let box = PrefetchJoinBox()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<PlaybackResolution?, Never>) in
+                box.setContinuation(continuation)
+                Task {
+                    let result = try? await task.value
+                    box.resume(with: result)
+                }
+            }
+        } onCancel: {
+            box.resume(with: nil)
         }
     }
 
@@ -318,6 +403,10 @@ final class MovieService: ObservableObject {
     /// direct media -> native player; manga chapter API -> images;
     /// embed page -> plugin embed/detail parser, else webview sniffer.
     func resolveEpisode(_ request: PlaybackRequest) async throws -> PlaybackResolution {
+        try await resolveEpisode(request, joiningPrefetch: true)
+    }
+
+    private func resolveEpisode(_ request: PlaybackRequest, joiningPrefetch: Bool) async throws -> PlaybackResolution {
         // v1.22.15 (B-4): register the MediaFusion credential host
         // with the logger BEFORE any line below can carry an MF
         // stream URL through urlForLog. A persisted MF episode can
@@ -347,6 +436,36 @@ final class MovieService: ObservableObject {
         if let prefetched = consumePrefetchedEmbed(pluginId: pluginId, target: target) {
             DiagLog.log("resolve", "route=embed via=prefetched")
             return prefetched
+        }
+
+        // L-T11 (2) in-flight dedupe (tvOS-only divergence,
+        // 1.3.0): a Play tap that lands while Detail's embed
+        // warm for the same plugin+episode is still running
+        // awaits THAT chain instead of starting a second one.
+        // The shared outcome is the chain's own fresh result
+        // (embed outcomes are additionally cached by the warm's
+        // watcher, exactly as before). A failed warm falls
+        // through to this call's own chain, unchanged.
+        if joiningPrefetch,
+           let inFlight = inFlightPrefetch[pluginId + "|" + target] {
+            DiagLog.log("resolve", "join in-flight pre-resolve plugin=\(pluginId)")
+            // Gate fix pass (Round 1 on R2, Lens 2 F5a): the
+            // join is CANCELLATION-RESPONSIVE — a plain
+            // `try? await inFlight.task.value` kept a cancelled
+            // caller (attempt superseded, cover dismissed)
+            // suspended until the warm chain finished on its
+            // own schedule. joinInFlightPrefetch races the
+            // warm's completion against this caller's
+            // cancellation; a cancelled caller stops waiting at
+            // once and throws CancellationError instead of
+            // falling through to a second chain. The warm task
+            // itself is NOT cancelled — it belongs to the
+            // registry, and its watcher may still cache an
+            // embed outcome.
+            if let shared = await Self.joinInFlightPrefetch(inFlight.task) {
+                return shared
+            }
+            if Task.isCancelled { throw CancellationError() }
         }
 
         // Fast resume: a previously resolved direct stream.
@@ -399,6 +518,46 @@ final class MovieService: ObservableObject {
             }
             DiagLog.log("resolve", "error plugin=\(pluginId) manga chapter had no images")
             throw MovieServiceError.unresolvedEpisode
+        }
+
+        // NEXT-C C1 (tvOS-only divergence, 1.3.0): torrenthub
+        // non-hash http(s) targets that are media by container —
+        // or that live on the registered MediaFusion credential
+        // host — route DIRECTLY to .video here, immediately
+        // before the embed chain. On iOS these shapes are
+        // covered by the WKWebView sniffer; tvOS has no webview,
+        // and torrenthub's playback parsers return empty by
+        // design, so the embed chain could only end at the
+        // last-resort .embed error slate. The MediaFusion URL is
+        // a bearer credential: this route logs kind + host ONLY,
+        // never the raw episode id or URL.
+        if pluginId == "torrenthub",
+           target.hasPrefix("http://") || target.hasPrefix("https://"),
+           let targetURL = URL(string: target) {
+            let ext = targetURL.pathExtension.lowercased()
+            let videoContainers: Set<String> = ["mkv", "avi", "wmv", "flv", "webm", "m2ts",
+                                                "mp4", "m4v", "mov", "m3u8", "mpd", "ts"]
+            let mfHost = MediaFusion.baseURL.flatMap { URL(string: $0)?.host }
+            let isMFHost = mfHost != nil && targetURL.host == mfHost
+            if videoContainers.contains(ext) || isMFHost {
+                var headers = request.fallbackHeaders
+                if headers.isEmpty { headers = await defaultHeaders(for: pluginId) }
+                // useCompatEngine by DebridResolver's extension
+                // rule (friendly = mp4/m4v/mov); HLS/DASH
+                // playlists are AVPlayer-native, so the two
+                // playlist extensions are exempted from the
+                // rule's non-friendly verdict. The rule receives
+                // the URL's PATH (no query string — review-gate
+                // fix, 1.3.0), consistent with the container
+                // classification above: a signed friendly file
+                // must not be misflagged compat by its query.
+                let compat = DebridResolver.needsCompatEngine(filename: targetURL.path)
+                    && ext != "m3u8" && ext != "mpd"
+                let raw = StreamInfo(url: target, headers: headers, useCompatEngine: compat)
+                let stream = await markProxyIfNeeded(raw, pluginId: pluginId)
+                DiagLog.log("resolve", "route=video via=torrent-direct kind=\(isMFHost ? "mediafusion" : "container") host=\(targetURL.host ?? "?") engine=\(stream.useCompatEngine ? "ksplayer" : "avplayer")")
+                return .video(stream)
+            }
         }
 
         // Embed chain: plugins resolve in hops — a parser returns

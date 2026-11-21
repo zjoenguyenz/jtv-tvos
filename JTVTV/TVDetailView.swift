@@ -24,8 +24,8 @@ private extension View {
 /// mockup 05. Load is the iOS two-stage progressive load with
 /// title-recovery healing; identity is navId for every store
 /// write. Play actions build the exact iOS PlaybackRequest and
-/// hand it to the PlaybackPresenter — the Phase 3 entry point;
-/// in Phase 2 the presenter surfaces TVPlaybackPlaceholderView.
+/// hand it to the PlaybackPresenter — the player cover's entry
+/// point (video surfaces / the manga reader inside TVPlayerView).
 /// Detail writes NO history (the player owns history writes,
 /// and no playback has happened yet).
 struct TVDetailView: View {
@@ -42,9 +42,25 @@ struct TVDetailView: View {
     @Environment(\.tvTheme) private var theme
 
     @State private var bundle: MovieService.DetailBundle?
+    /// NEXT-D (1.3.0): the backdrop preview's resolved stream
+    /// and its generation guard. Set ONLY by the dwell task in
+    /// the loaded branch; cleared on retire, on Play, and on
+    /// disappear (the host's teardown runs on dismantle).
+    @State private var previewStream: StreamInfo?
+    @State private var previewGeneration = 0
+    @State private var previewResolvedForLoad = -1
+    @AppStorage(TVPreviewSettings.defaultsKey) private var previewEnabled = true
     @State private var isLoading = false
     @State private var loadError: String?
     @State private var loadGeneration = 0
+    /// Gate fix pass (Round 1 on R2, Lens 2 F2): the manga
+    /// reader's fix-9 discipline, ported — `detailAlive` is
+    /// true while the screen is on, cleared in .onDisappear
+    /// (which also bumps loadGeneration), and every post-await
+    /// publish in load()/recoverByTitle — above all the
+    /// auto-resume presentation — re-checks it together with
+    /// Task.isCancelled and the generation.
+    @State private var detailAlive = true
     @State private var recoveredId: String?
     @State private var didAutoResume = false
     @State private var selectedServer = 0
@@ -93,8 +109,40 @@ struct TVDetailView: View {
         DiagLog.log("detail", "body plugin=\(pluginId) movie=\(movie.id) backdrop=\(DiagLog.urlForLog(backdropURL))")
         return ZStack {
             if let detail {
-                TVBackdropView(urlString: backdropURL, fallbackTitle: movie.title)
+                TVBackdropView(urlString: backdropURL, fallbackTitle: movie.title,
+                               previewStream: previewStream,
+                               previewGeneration: previewGeneration,
+                               onPreviewRetired: { _ in
+                                   // Gate fix pass (Round 1 on R2,
+                                   // Lens 3 F1): DEFER the clear
+                                   // until the 0.6 s fade-out
+                                   // (TVComponents) has played —
+                                   // clearing synchronously here
+                                   // dismantled the host in the
+                                   // same view update that started
+                                   // the fade, so the fade never
+                                   // rendered. The delayed clear
+                                   // is generation-guarded: a new
+                                   // preview (generation bumped),
+                                   // a Play tap or disappear (both
+                                   // clear immediately themselves,
+                                   // unchanged) supersedes it.
+                                   let retiredGeneration = previewGeneration
+                                   Task { @MainActor in
+                                       try? await Task.sleep(for: .milliseconds(700))
+                                       guard previewGeneration == retiredGeneration else { return }
+                                       previewStream = nil
+                                   }
+                               })
                     .ignoresSafeArea()
+                    // NEXT-D D3: the dwell task lives ONLY in
+                    // this loaded branch (FL-357/FL-364: nothing
+                    // item-data-driven runs pre-detail). Keyed
+                    // pluginId|navId|detail-arrival; ≤1 preview
+                    // resolve per Detail open.
+                    .task(id: "\(pluginId)|\(navId)|\(loadGeneration)") {
+                        await runBackdropPreview(detail: detail)
+                    }
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 36) {
                         headerBand(detail)
@@ -128,7 +176,22 @@ struct TVDetailView: View {
             }
         }
         .tvThemedBackground()
-        .onAppear { session.touch() }
+        .onAppear {
+            detailAlive = true
+            session.touch()
+        }
+        .onDisappear {
+            // Gate fix pass (Lens 2 F2): leaving the screen
+            // invalidates every in-flight load — bump the
+            // generation and close the alive gate so a late
+            // completion (or the auto-resume block) publishes
+            // nothing, above all no player presentation.
+            detailAlive = false
+            loadGeneration += 1
+            // NEXT-D teardown: the preview player dies with the
+            // screen (its host dismantles → pause + empty).
+            previewStream = nil
+        }
         .task(id: movie.id) { await load() }
     }
 
@@ -396,7 +459,7 @@ struct TVDetailView: View {
         loadError = nil
         do {
             let first = try await service.detailMeta(pluginId: pluginId, movieId: movie.id)
-            guard gen == loadGeneration else { return }
+            guard gen == loadGeneration, detailAlive, !Task.isCancelled else { return }
             bundle = first
             selectFirstPlayableServerIfNeeded(servers: first.detail.servers)
             isLoading = false
@@ -404,17 +467,22 @@ struct TVDetailView: View {
             if first.detail.servers.first?.episodes.first?.id.hasPrefix("jtvstreams:") == true {
                 let full = await service.detailStreams(pluginId: pluginId, movieId: movie.id,
                                                        detail: first.detail)
-                guard gen == loadGeneration else { return }
+                guard gen == loadGeneration, detailAlive, !Task.isCancelled else { return }
                 if full.servers != first.detail.servers {
                     bundle = MovieService.DetailBundle(detail: full, detailStream: first.detailStream)
                     selectFirstPlayableServerIfNeeded(servers: full.servers)
                 }
             }
         } catch {
-            guard gen == loadGeneration else { return }
+            guard gen == loadGeneration, detailAlive, !Task.isCancelled else { return }
             await recoverByTitle(generation: gen)
         }
-        guard gen == loadGeneration else { return }
+        // Above all the auto-resume publish below: the user may
+        // have backed out while the load was in flight — the
+        // generation bump in .onDisappear, the alive flag and
+        // cancellation must ALL still pass before the player
+        // may be presented.
+        guard gen == loadGeneration, detailAlive, !Task.isCancelled else { return }
         if autoResume, !didAutoResume, let detail, let record = historyRecord {
             didAutoResume = true
             resume(record, detail: detail)
@@ -424,29 +492,29 @@ struct TVDetailView: View {
     private func recoverByTitle(generation gen: Int) async {
         do {
             let page = try await service.search(pluginId: pluginId, keyword: movie.title, page: 1)
-            guard gen == loadGeneration else { return }
+            guard gen == loadGeneration, detailAlive, !Task.isCancelled else { return }
             let target = TVSearchText.normalise(movie.title)
             let found = page.items.first { TVSearchText.normalise($0.title) == target }
                 ?? (movie.id.isEmpty ? page.items.first : nil)
             guard let found else {
-                guard gen == loadGeneration else { return }
+                guard gen == loadGeneration, detailAlive, !Task.isCancelled else { return }
                 loadError = "Không tải được thông tin phim"
                 isLoading = false
                 return
             }
             let healed = try await service.detail(pluginId: pluginId, movieId: found.id)
-            guard gen == loadGeneration else { return }
+            guard gen == loadGeneration, detailAlive, !Task.isCancelled else { return }
             recoveredId = found.id
             bundle = healed
             selectFirstPlayableServerIfNeeded(servers: healed.detail.servers)
             favorites.repairMovieId(pluginId: pluginId, from: movie.id, title: movie.title, to: found.id)
             warmEmbedPrefetch(detail: healed.detail)
         } catch {
-            guard gen == loadGeneration else { return }
+            guard gen == loadGeneration, detailAlive, !Task.isCancelled else { return }
             loadError = "Không tải được thông tin phim"
             DiagLog.log("detail", "recover failed plugin=\(pluginId) kind=\((error as NSError).domain)#\((error as NSError).code)")
         }
-        guard gen == loadGeneration else { return }
+        guard gen == loadGeneration, detailAlive, !Task.isCancelled else { return }
         isLoading = false
     }
 
@@ -463,6 +531,125 @@ struct TVDetailView: View {
             allEpisodes: server.episodes
         )
         service.prefetchEmbedResolution(request)
+    }
+
+    // MARK: Backdrop preview (NEXT-D D3/D4/D7, 1.3.0)
+
+    /// The dwell task: sleeps 1.5 s (JoeTV's dwell), checks
+    /// cancellation, and resolves AT MOST ONE preview per
+    /// Detail open (generation-guarded). The kill switch (D6)
+    /// returns immediately — Detail is then identical to the
+    /// pre-preview build. A preview writes NO history and
+    /// consumes NO embed prefetch.
+    private func runBackdropPreview(detail: MovieDetail) async {
+        guard previewEnabled else { return }
+        guard previewResolvedForLoad != loadGeneration else { return }
+        previewResolvedForLoad = loadGeneration
+        DiagLog.log("preview", "armed plugin=\(pluginId)")
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        guard !Task.isCancelled else { return }
+        previewGeneration += 1
+        let generation = previewGeneration
+        guard let stream = await resolvePreviewStream(detail: detail) else {
+            DiagLog.log("preview", "retired reason=no-playable")
+            return
+        }
+        guard !Task.isCancelled, generation == previewGeneration else { return }
+        previewStream = stream
+    }
+
+    /// The cost ladder, cheapest first (NEXT-D §2.2/§3.2):
+    /// bundle.detailStream direct-media → first-episode
+    /// direct-media id → MediaFusion direct episode (via the
+    /// C1 classification route, zero network) → torrent rules
+    /// (D4: trailer first — see the note in the torrent branch;
+    /// fallback = cached-clip via the probe-only debrid entry)
+    /// → full resolveEpisode ONLY for plugin classes knowable
+    /// as direct in advance (manifest playerType native /
+    /// exoplayer). EMBED-CLASS PLUGINS ARE NEVER
+    /// preview-resolved: their outcome is .embed (unpreviewable)
+    /// and a resolve would burn the Play tap's single-consumer
+    /// embed prefetch. Streams flagged useCompatEngine or
+    /// requiresProxy keep the still (D3).
+    private func resolvePreviewStream(detail: MovieDetail) async -> StreamInfo? {
+        func playable(_ stream: StreamInfo) -> StreamInfo? {
+            guard !stream.url.isEmpty, !stream.useCompatEngine, !stream.requiresProxy
+            else { return nil }
+            return stream
+        }
+        // Rung 1: the detail response's own parsed stream.
+        if let detailStream = bundle?.detailStream,
+           MediaURL.isDirectMedia(detailStream.url),
+           let ok = playable(detailStream) {
+            return ok
+        }
+        // The preview target is playFirstEpisode's target: the
+        // first non-empty server's first episode.
+        guard let server = detail.servers.first(where: { !$0.episodes.isEmpty }),
+              let episode = server.episodes.first else { return nil }
+        // Rung 2: the episode id IS a direct-media URL.
+        if MediaURL.isDirectMedia(episode.id) {
+            let stream = StreamInfo(url: episode.id,
+                                    headers: bundle?.detailStream.headers ?? [:])
+            if let ok = playable(stream) { return ok }
+        }
+        let request = PlaybackRequest(
+            movie: snapshotMovie(for: detail),
+            pluginId: pluginId,
+            pluginName: plugins.installedPlugin(id: pluginId)?.manifest.name ?? "",
+            isManga: isManga,
+            serverName: server.name,
+            episode: episode,
+            allEpisodes: server.episodes
+        )
+        if pluginId == "torrenthub" {
+            // D4 — trailer FIRST, per the owner's ruling. The
+            // investigation (BUILD-1.3.0-IMPL-REPORT) found the
+            // torrenthub detail payload carries NO playable
+            // trailer: parseMovieDetail surfaces no trailer
+            // field, MovieDetail has no trailer field, and the
+            // upstream meta's trailer data (Cinemeta/TPDB) is a
+            // YouTube id with no tvOS-playable route in JTV.
+            // So the torrent preview falls back to the
+            // cached-clip ladder below.
+            if episode.id.hasPrefix("http") {
+                // MediaFusion / direct-URL episode: the C1
+                // route classifies it to .video with no network
+                // fetch (container suffix or MF credential host).
+                if let resolution = try? await service.resolveEpisode(request),
+                   case .video(let stream) = resolution,
+                   let ok = playable(stream) {
+                    return ok
+                }
+                return nil
+            }
+            if episode.id.hasPrefix("jtvhash:") {
+                // Cached-clip fallback (D5): probe-only — a
+                // preview may spend a probe, never a download.
+                let hash = String(episode.id.dropFirst("jtvhash:".count))
+                if let stream = await DebridResolver.resolveCachedOnly(hash: hash),
+                   let ok = playable(stream) {
+                    return ok
+                }
+            }
+            return nil
+        }
+        // Embed-class plugins are never preview-resolved.
+        let manifest = plugins.installedPlugin(id: pluginId)?.manifest
+        let playerType = manifest?.playerType.lowercased() ?? ""
+        if ["123av", "javhd", "avdbapi"].contains(pluginId)
+            || (manifest?.isEmbedPlayer ?? false)
+            || playerType.contains("embed") {
+            return nil
+        }
+        // Full resolve only when the class is knowable-direct
+        // in advance.
+        guard playerType == "native" || playerType == "exoplayer" else { return nil }
+        if let resolution = try? await service.resolveEpisode(request),
+           case .video(let stream) = resolution {
+            return playable(stream)
+        }
+        return nil
     }
 
     // MARK: Play intents (iOS §1.5, exact)
@@ -502,6 +689,18 @@ struct TVDetailView: View {
             fallbackHeaders: bundle?.detailStream.headers ?? [:],
             switchList: switchShortlist(current: episode, detail: detail)
         )
+        // NEXT-D teardown: the preview must be fully dead
+        // before the real player presents (two live players is
+        // the audio-leak / decoder-contention class). Clearing
+        // the stream dismantles the host synchronously with
+        // this view update, ahead of the cover.
+        // Review-gate fix (1.3.0): invalidate any IN-FLIGHT
+        // preview resolve FIRST — bump the generation and mark
+        // this load's preview superseded, so a late completion's
+        // guard fails and nothing publishes behind the cover.
+        previewGeneration += 1
+        previewResolvedForLoad = loadGeneration
+        previewStream = nil
         // L-T04 probe breadcrumb P0: the tap reached Detail's
         // play entry — the hand-off to the presenter is next.
         DiagLog.log("player", "tap.received plugin=\(pluginId) episode=\(episode.id)")
@@ -561,80 +760,5 @@ private struct TVEpisodeChip: View {
             .strokeBorder(isFocused ? theme.focusRing : (watched ? theme.accent.opacity(0.6) : theme.cardStroke),
                           lineWidth: isFocused ? theme.ringWidth : 1))
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-}
-
-// MARK: - Phase 3 entry-point placeholder
-
-/// Phase 2's honest stand-in for the player: the PlaybackRequest
-/// was built exactly as iOS builds it and handed to the
-/// PlaybackPresenter; this surface shows what was requested and
-/// closes back to Detail. The real player lands in Phase 3
-/// (video) / the reader in Phase 4 (manga).
-struct TVPlaybackPlaceholderView: View {
-    let request: PlaybackRequest
-    /// Close action, passed as a VALUE by the caller (L-T06):
-    /// this view is mounted inside the player cover for the
-    /// manga phase, and the cover's subtree reads no
-    /// @EnvironmentObject — the caller routes the close
-    /// through the session's dismiss, which is the same
-    /// presenter.request = nil this view used to write itself.
-    let onClose: () -> Void
-
-    @Environment(\.tvTheme) private var theme
-    @FocusState private var closeFocused: Bool
-
-    var body: some View {
-        VStack(spacing: 26) {
-            TVRemoteImage(urlString: request.movie.posterUrl, bucket: 960)
-                .frame(width: 184, height: 276)
-                .clipShape(RoundedRectangle(cornerRadius: theme.posterRadius, style: .continuous))
-            Text(request.movie.title)
-                .font(.system(size: 40, weight: .bold))
-                .foregroundStyle(theme.textPrimary)
-                .lineLimit(2)
-                .multilineTextAlignment(.center)
-            Text("\(request.serverName) • \(request.episode.name)")
-                .font(.system(size: 27))
-                .foregroundStyle(theme.textDim)
-            if request.startPosition > 0 {
-                Text("Bắt đầu tại \(Self.formatTime(request.startPosition))")
-                    .font(.system(size: 25))
-                    .foregroundStyle(theme.textDim)
-            }
-            Text(request.isManga
-                 ? "Trình đọc truyện sẽ có ở giai đoạn tiếp theo (Phase 4)."
-                 : "Trình phát sẽ có ở giai đoạn tiếp theo (Phase 3).")
-                .font(.system(size: 27, weight: .medium))
-                .foregroundStyle(theme.heroMeta)
-            Button {
-                onClose()
-            } label: {
-                Text("Đóng")
-                    .font(.system(size: 28, weight: .bold))
-                    .foregroundStyle(theme.onAccent)
-                    .padding(.horizontal, 46)
-                    .padding(.vertical, 17)
-                    .background(Capsule().fill(theme.accent))
-                    .overlay(Capsule().strokeBorder(closeFocused ? theme.focusRing : .clear,
-                                                    lineWidth: closeFocused ? theme.ringWidth : 0))
-            }
-            .tvCardButton()
-            .focused($closeFocused)
-            .padding(.top, 10)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(60)
-        .tvThemedBackground()
-        .defaultFocus($closeFocused, true)
-    }
-
-    static func formatTime(_ seconds: Double) -> String {
-        let total = Int(seconds.rounded())
-        let h = total / 3600
-        let m = (total % 3600) / 60
-        let s = total % 60
-        if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
-        return String(format: "%d:%02d", m, s)
     }
 }

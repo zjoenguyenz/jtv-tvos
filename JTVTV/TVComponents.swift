@@ -512,13 +512,32 @@ struct TVChip: View {
 struct TVBackdropView: View {
     let urlString: String
     let fallbackTitle: String
+    /// NEXT-D D2 (1.3.0, study §3.1 option (a)): the preview
+    /// layer slot — a resolved preview stream fades in BETWEEN
+    /// the still image and the scrims. Call sites that pass no
+    /// preview keep today's exact rendering.
+    var previewStream: StreamInfo? = nil
+    var previewGeneration: Int = 0
+    var onPreviewRetired: ((String) -> Void)? = nil
 
     @Environment(\.tvTheme) private var theme
     @State private var imageFailed = false
+    @State private var previewVisible = false
 
-    init(urlString: String, fallbackTitle: String) {
+    /// ONE explicit init covering every stored property
+    /// (review-gate fix, 1.3.0): declaring this init suppresses
+    /// the memberwise init, so the preview properties must be
+    /// parameters here — with defaults, so call sites that pass
+    /// no preview stay terse.
+    init(urlString: String, fallbackTitle: String,
+         previewStream: StreamInfo? = nil,
+         previewGeneration: Int = 0,
+         onPreviewRetired: ((String) -> Void)? = nil) {
         self.urlString = urlString
         self.fallbackTitle = fallbackTitle
+        self.previewStream = previewStream
+        self.previewGeneration = previewGeneration
+        self.onPreviewRetired = onPreviewRetired
     }
 
     /// Designed stand-in for the no-backdrop case — also used
@@ -548,6 +567,29 @@ struct TVBackdropView: View {
                         standIn
                     }
                 }
+                // NEXT-D preview layer: still → video → scrims.
+                // Opacity 0 until the host reports the first
+                // frame (ready AND playing); retirement fades
+                // it back out and the owner clears the stream.
+                if let previewStream {
+                    TVBackdropPreviewHost(
+                        stream: previewStream,
+                        onFirstFrame: {
+                            withAnimation(.easeInOut(duration: 0.6)) {
+                                previewVisible = true
+                            }
+                        },
+                        onRetire: { reason in
+                            withAnimation(.easeInOut(duration: 0.6)) {
+                                previewVisible = false
+                            }
+                            onPreviewRetired?(reason)
+                        })
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipped()
+                        .opacity(previewVisible ? 1 : 0)
+                        .id(previewGeneration)
+                }
                 // Horizontal scrim (text zone, leading → trailing).
                 LinearGradient(
                     stops: theme.isUltra
@@ -565,6 +607,7 @@ struct TVBackdropView: View {
             .frame(width: geo.size.width, height: geo.size.height)
         }
         .onChange(of: urlString) { imageFailed = false }
+        .onChange(of: previewGeneration) { previewVisible = false }
     }
 }
 

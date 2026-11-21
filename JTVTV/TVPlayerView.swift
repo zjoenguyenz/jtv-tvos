@@ -34,25 +34,55 @@ struct TVPlayerView: View {
     init(request: PlaybackRequest, service: MovieService, history: WatchHistoryManager,
          pinSession: PinSession, onDismiss: @escaping () -> Void) {
         self.request = request
-        // L-T04 probe breadcrumb P1: the cover's content view
-        // exists — cover presentation has begun.
-        DiagLog.log("player", "cover.presenting plugin=\(request.pluginId) episode=\(request.episode.id)")
-        // L-T06 split breadcrumbs: bracket the eager session
-        // construction (session.init.begin/done print between
-        // these two) — a plain assignment, evaluated NOW, in
-        // init. A session built for a view value SwiftUI never
-        // installs does no work: its init is assignments plus
-        // its two breadcrumb lines, and only start() (from the
-        // cover's onAppear) begins work. A repeated
-        // cover.presenting / cover.session.creating pair in one
-        // presentation's log means this view value was
-        // re-created — read it as that signal, not as a second
-        // presentation.
-        DiagLog.log("player", "cover.session.creating plugin=\(request.pluginId)")
-        builtSession = TVPlayerSession(
-            request: request, service: service, history: history,
-            pinSession: pinSession, onDismiss: onDismiss)
-        DiagLog.log("player", "cover.session.created")
+        // L-T11 (1) (1.3.0) single-flight: SwiftUI evaluates the
+        // fullScreenCover content closure MORE THAN ONCE for one
+        // presentation (measured in jtv-log_7: the whole
+        // cover.presenting → session.init chain ran twice, 16 ms
+        // apart, for one tap). The eager build stays (L-T06),
+        // but a second evaluation for the SAME request id now
+        // reuses the first evaluation's session instead of
+        // constructing — and logging — a second one. The entry
+        // is cleared by the wrapped dismiss, so a later, separate
+        // presentation of an equal request builds fresh.
+        // Gate fix pass (Round 1 on R2, Lens 2 F3): the
+        // claim-or-store is ATOMIC — lookup and store happen
+        // under ONE lock scope inside claimOrStore, so two
+        // racing cover evaluations can no longer both miss,
+        // both construct, and have the second store silently
+        // overwrite (orphan) the first session. The create
+        // closure runs only on a genuine miss, so the
+        // breadcrumb chain below still prints exactly once
+        // per constructed session.
+        builtSession = TVPlayerSessionReuse.claimOrStore(for: request.id) {
+            // L-T04 probe breadcrumb P1: the cover's content view
+            // exists — cover presentation has begun.
+            DiagLog.log("player", "cover.presenting plugin=\(request.pluginId) episode=\(request.episode.id)")
+            // L-T06 split breadcrumbs: bracket the eager session
+            // construction (session.init.begin/done print between
+            // these two) — a plain assignment, evaluated NOW, in
+            // init. A session built for a view value SwiftUI never
+            // installs does no work: its init is assignments plus
+            // its two breadcrumb lines, and only start() (from the
+            // cover's onAppear) begins work.
+            DiagLog.log("player", "cover.session.creating plugin=\(request.pluginId)")
+            var created: TVPlayerSession!
+            let session = TVPlayerSession(
+                request: request, service: service, history: history,
+                pinSession: pinSession, onDismiss: {
+                    // Instance-matched clear (Lens 2 F3): the
+                    // dismiss clears the registry ONLY when the
+                    // stored entry IS this session — a stale
+                    // dismiss can never evict a newer session
+                    // stored under the same request id.
+                    if let created {
+                        TVPlayerSessionReuse.clear(session: created)
+                    }
+                    onDismiss()
+                })
+            created = session
+            DiagLog.log("player", "cover.session.created")
+            return session
+        }
     }
 
     var body: some View {
@@ -60,6 +90,62 @@ struct TVPlayerView: View {
         // reached — init and session construction survived.
         DiagLog.log("player", "cover.view.body")
         return TVPlayerSessionView(session: builtSession)
+    }
+}
+
+// MARK: - Single-flight session reuse (L-T11 (1))
+
+/// Holds the ONE eagerly built session for the presentation
+/// currently on screen, keyed by the PlaybackRequest's id.
+/// TVPlayerView.init consults it before constructing; the
+/// session's wrapped dismiss clears it. Lock-guarded (the
+/// house NSLock idiom) for the atomic claim-or-store, and
+/// @MainActor (gate fix pass, Round 1 on R3): the registry
+/// reads the session's `isStopped`, a MainActor-isolated
+/// property, so its entry points are MainActor-isolated too
+/// and never cross the isolation boundary. Every call site
+/// is a MainActor context — TVPlayerView.init (SwiftUI View
+/// construction), TVPlayerSession.stop() (a @MainActor
+/// class), and the session's wrapped onDismiss (invoked
+/// from the session's MainActor dismiss()).
+enum TVPlayerSessionReuse {
+    private static let lock = NSLock()
+    // Lock-guarded by `lock` on every access (Swift 6:
+    // nonisolated(unsafe) is the honest spelling of that).
+    private nonisolated(unsafe) static var entry: (id: UUID, session: TVPlayerSession)?
+
+    /// Atomic claim-or-store (Lens 2 F3): lookup AND store in
+    /// ONE lock scope. A stored session is handed back only
+    /// when its id matches AND it has not been stopped — a
+    /// stopped session (see TVPlayerSession.stop(), which also
+    /// clears its entry) can never be reused; a stopped or
+    /// mismatched entry is replaced by a fresh construction.
+    /// `create` runs under the lock and only on a miss: the
+    /// session's init is assignments + breadcrumbs and never
+    /// calls back into this registry, so holding the lock
+    /// across it cannot deadlock.
+    @MainActor
+    static func claimOrStore(for id: UUID, create: () -> TVPlayerSession) -> TVPlayerSession {
+        lock.withLock {
+            if let entry, entry.id == id, !entry.session.isStopped {
+                return entry.session
+            }
+            let session = create()
+            entry = (id, session)
+            return session
+        }
+    }
+
+    /// Instance-matched clear (Lens 2 F3): removes the entry
+    /// ONLY when the stored session IS `session` (identity,
+    /// not merely the same request id) — a stop/dismiss of an
+    /// old session never evicts a newer one. Called by
+    /// TVPlayerSession.stop() (every teardown path funnels
+    /// through the cover's onDisappear → stop()) and by the
+    /// session's wrapped onDismiss.
+    @MainActor
+    static func clear(session: TVPlayerSession) {
+        lock.withLock { if entry?.session === session { entry = nil } }
     }
 }
 
@@ -82,7 +168,16 @@ private struct TVPlayerSessionView: View {
     var body: some View {
         // L-T06 split breadcrumb: the session view's body was
         // reached with the pre-built session in hand.
-        DiagLog.log("player", "cover.sessionview.body")
+        // L-T11 (3) (1.3.0): FIRST-ONLY — this body re-runs on
+        // every session publish (progress ticks included), and
+        // logging every run produced 386 lines in one ~30 min
+        // session in jtv-log_7. The breadcrumb's job (proving
+        // the body was reached once per presentation) is done
+        // by the first run.
+        if !session.sessionViewBodyLogged {
+            session.sessionViewBodyLogged = true
+            DiagLog.log("player", "cover.sessionview.body")
+        }
         return ZStack {
             Color.black.ignoresSafeArea()
             content
@@ -119,12 +214,13 @@ private struct TVPlayerSessionView: View {
             loadingView
         case .playing(let route, let attempt):
             surfaceView(route: route, attempt: attempt)
-        case .manga:
-            // Phase 4 placeholder state, unchanged behaviour —
-            // named so it is not mistaken for a dead end.
-            TVPlaybackPlaceholderView(request: session.currentRequest) {
-                session.dismiss()
-            }
+        case .manga(let stream):
+            // NEXT-B (1.3.0): the focus-stepped manga reader
+            // replaces the Phase 4 placeholder. It is a child of
+            // the session (dependencies as values — no
+            // @EnvironmentObject in this subtree, L-T06 rule);
+            // chapter switches resolve inside the reader.
+            TVMangaReaderView(session: session, initialStream: stream)
         case .failed(let failure):
             TVPlayerErrorView(session: session, failure: failure)
         }
@@ -173,6 +269,20 @@ private struct TVPlayerSessionView: View {
             Text("Đang tải…")
                 .font(.system(size: 26, weight: .medium))
                 .foregroundStyle(theme.textDim)
+            // NEXT-C C3 (1.3.0): the source-switch list on the
+            // LOADING state (iOS parity — PlayerView's sourceList
+            // under the resolving spinner). A switch during
+            // resolving works through the existing
+            // performSwitch/beginAttempt cancellation: the
+            // in-flight resolve and its deadline are cancelled
+            // and stale completions are dropped by the attempt
+            // guard. Semantics mirror TVSourcePanelView: current
+            // source checked + disabled, default focus on the
+            // first switchable row.
+            if session.hasSwitchTargets {
+                TVLoadingSourceListView(session: session)
+                    .padding(.top, 6)
+            }
             Text("Nhấn Menu để đóng")
                 .font(.system(size: 22))
                 .foregroundStyle(theme.textFaint)
@@ -347,6 +457,90 @@ private struct TVSourcePanelView: View {
         .tvCardButton()
         .focused($focusedID, equals: id)
         .disabled(disabled)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(isFocused ? Color.white.opacity(0.14) : theme.cardFill))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .strokeBorder(isFocused ? theme.focusRing : .clear,
+                          lineWidth: isFocused ? theme.ringWidth : 0))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+}
+
+// MARK: - Loading-state source list (NEXT-C C3)
+
+/// The switch list rendered on the resolving/loading state —
+/// the tvOS port of iOS's `sourceList` under the spinner
+/// (PlayerView.swift:2413-2452). Same session semantics as
+/// TVSourcePanelView (current source checked + disabled,
+/// default focus on the first switchable row), minus the
+/// panel chrome: it lives inline under the spinner so a long
+/// or doomed resolve — notably an exempt-from-deadline torrent
+/// resolve (C2) — can be abandoned without leaving the player.
+/// Picking a row calls session.switchSource(to:), which runs
+/// performSwitch → beginAttempt: the in-flight resolve is
+/// cancelled and its stale completion dropped by the attempt
+/// guard. No Back handler of its own (FL-048).
+private struct TVLoadingSourceListView: View {
+    @ObservedObject var session: TVPlayerSession
+
+    @Environment(\.tvTheme) private var theme
+    @FocusState private var focusedID: String?
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Text("Nguồn khác — chọn để đổi ngay")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(theme.textDim)
+            // Review-gate fix (1.3.0): the row list is BOUNDED
+            // like TVSourcePanelView — a ScrollView with a fixed
+            // max height, so a long switch list cannot push the
+            // loading state off screen; focus movement scrolls
+            // rows into view.
+            ScrollView {
+                VStack(spacing: 10) {
+                    ForEach(session.switchTargets) { episode in
+                        let isCurrent = episode.id == session.currentRequest.episode.id
+                        row(episode: episode, isCurrent: isCurrent)
+                    }
+                }
+                .padding(.vertical, 6)
+            }
+            .frame(width: 860)
+            .frame(maxHeight: 430)
+        }
+        .defaultFocus($focusedID, defaultTargetID)
+    }
+
+    private var defaultTargetID: String {
+        session.switchTargets.first(where: {
+            $0.id != session.currentRequest.episode.id
+        })?.id ?? session.currentRequest.episode.id
+    }
+
+    private func row(episode: Episode, isCurrent: Bool) -> some View {
+        let isFocused = focusedID == episode.id
+        return Button {
+            session.switchSource(to: episode)
+        } label: {
+            HStack(spacing: 16) {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(theme.accent)
+                    .opacity(isCurrent ? 1 : 0)
+                    .frame(width: 30)
+                Text(episode.name)
+                    .font(.system(size: 26, weight: .semibold))
+                    .foregroundStyle(theme.textPrimary)
+                    .lineLimit(1)
+                Spacer()
+            }
+            .padding(.horizontal, 26)
+            .padding(.vertical, 14)
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .tvCardButton()
+        .focused($focusedID, equals: episode.id)
+        .disabled(isCurrent)
         .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
             .fill(isFocused ? Color.white.opacity(0.14) : theme.cardFill))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
