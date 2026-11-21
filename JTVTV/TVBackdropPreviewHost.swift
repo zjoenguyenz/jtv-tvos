@@ -105,7 +105,12 @@ struct TVBackdropPreviewHost: UIViewRepresentable {
             DiagLog.log("preview", "resolved kind=video host=\(url.host ?? "?")")
             var options: [String: Any] = [:]
             if !stream.headers.isEmpty {
-                options[AVURLAssetHTTPHeaderFieldsKey] = stream.headers
+                // String literal, exactly as the shipped
+                // TVAVPlayerHost: there is NO public Swift
+                // constant for this key in AVFoundation's
+                // headers (FL-340/FL-381) — the bare name
+                // does not resolve (CI run #14, exit 65).
+                options["AVURLAssetHTTPHeaderFieldsKey"] = stream.headers
             }
             let asset = AVURLAsset(url: url, options: options)
             let item = AVPlayerItem(asset: asset)
