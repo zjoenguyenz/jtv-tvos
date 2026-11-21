@@ -41,7 +41,18 @@ final class TVNavPath {
         didSet { NavSanitizer.sanitize(&path) }
     }
 
-    func push(_ route: AppRoute) { path.append(route) }
+    func push(_ route: AppRoute) {
+        path.append(route)
+        // L-T04 breadcrumb D1: the push landed in the path.
+        switch route {
+        case .movie(let r):
+            DiagLog.log("detail", "push.movie plugin=\(r.pluginId) movie=\(r.movie.id)")
+        case .category(let r):
+            DiagLog.log("detail", "push.category plugin=\(r.pluginId) slug=\(r.slug)")
+        case .search(let r):
+            DiagLog.log("detail", "push.search plugin=\(r.pluginId)")
+        }
+    }
 }
 
 extension View {
@@ -51,6 +62,9 @@ extension View {
         navigationDestination(for: AppRoute.self) { route in
             switch route {
             case .movie(let r):
+                // L-T04 breadcrumb D2: the Detail destination
+                // closure was reached for this route.
+                DiagLog.log("detail", "destination plugin=\(r.pluginId) movie=\(r.movie.id)")
                 TVDetailView(pluginId: r.pluginId, movie: r.movie, autoResume: r.autoResume)
             case .category(let r):
                 TVBrowseView(pluginId: r.pluginId, slug: r.slug, title: r.title, initialFilters: r.filters)
@@ -100,6 +114,9 @@ struct TVPosterGrid: View {
                         width: cellWidth,
                         isFavorite: favorites.isFavorite(pluginId: pluginId, movieId: movie.id),
                         onSelect: {
+                            // L-T04 breadcrumb D0 (grid form):
+                            // the tap is leaving the grid.
+                            DiagLog.log("detail", "tap.grid plugin=\(pluginId) movie=\(movie.id)")
                             onSelect?(movie)
                             nav.push(.movie(MovieRoute(pluginId: pluginId, movie: movie)))
                         },

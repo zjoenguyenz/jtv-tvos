@@ -79,10 +79,22 @@ struct TVDetailView: View {
     }
 
     var body: some View {
-        ZStack {
-            TVBackdropView(urlString: backdropURL, fallbackTitle: movie.title)
-                .ignoresSafeArea()
+        // L-T04: the pre-fetch body follows the iOS-proven shape
+        // — while the detail has not loaded, NO backdrop is
+        // built (iOS MovieDetailView renders background +
+        // spinner only until its detail arrives,
+        // DetailView.swift:41–52, and mounts its backdrop
+        // inside the loaded-content branch, :187). The
+        // pre-fetch backdrop load at bucket 1920 was the one
+        // item-data-driven subsystem inside the convicted
+        // Detail-open crash window; it now enters only with
+        // the loaded detail, exactly as on iOS.
+        // Breadcrumb D3: this body was reached.
+        DiagLog.log("detail", "body plugin=\(pluginId) movie=\(movie.id) backdrop=\(DiagLog.urlForLog(backdropURL))")
+        return ZStack {
             if let detail {
+                TVBackdropView(urlString: backdropURL, fallbackTitle: movie.title)
+                    .ignoresSafeArea()
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 36) {
                         headerBand(detail)
@@ -115,6 +127,7 @@ struct TVDetailView: View {
                 TVLoadingState(onRetry: { Task { await load() } })
             }
         }
+        .tvThemedBackground()
         .onAppear { session.touch() }
         .task(id: movie.id) { await load() }
     }
@@ -375,6 +388,8 @@ struct TVDetailView: View {
     }
 
     private func load() async {
+        // L-T04 breadcrumb D5: Detail's load task started.
+        DiagLog.log("detail", "load.begin plugin=\(pluginId) movie=\(movie.id)")
         loadGeneration += 1
         let gen = loadGeneration
         isLoading = true

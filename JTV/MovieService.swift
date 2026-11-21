@@ -62,12 +62,47 @@ final class MovieService: ObservableObject {
         if let hit, Date().timeIntervalSince(hit.at) < pageCacheTTL {
             return hit.text
         }
-        let text = try await Net.fetchText(url)
+        let text = try await Self.fetchTextWithDeadline(url)
         pageCacheLock.withLock {
             pageCache[url] = CachedPage(text: text, at: Date())
             if pageCache.count > 200 { pageCache.removeAll() }
         }
         return text
+    }
+
+    /// L-T05 guard (tvOS-only divergence from the iOS core):
+    /// one page fetch gets a hard 20 s wall-clock budget.
+    /// Net.fetchText's own retry policy can hold a walled or
+    /// stalled host for 37 s (idle) to ~181 s (slow-drip) —
+    /// tvOS has no WebView Cloudflare lane to escape into —
+    /// while every healthy source in the device log lands in
+    /// ~1–2 s, so the budget never fires for a working source;
+    /// its retry chance inside the budget is preserved (one
+    /// full 12 s attempt + backoff + a partial second attempt).
+    /// On expiry the fetch task is cancelled (fetchText
+    /// rethrows .cancelled immediately) and the existing
+    /// MovieServiceError.timedOut surfaces to the caller's
+    /// error state (Home per-section row / Browse TVErrorState).
+    private static func fetchTextWithDeadline(_ url: String) async throws -> String {
+        do {
+            return try await withThrowingTaskGroup(of: String.self) { group in
+                group.addTask { try await Net.fetchText(url) }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 20_000_000_000)
+                    throw MovieServiceError.timedOut
+                }
+                guard let value = try await group.next() else {
+                    throw MovieServiceError.timedOut
+                }
+                group.cancelAll()
+                return value
+            }
+        } catch {
+            if let mse = error as? MovieServiceError, case .timedOut = mse {
+                DiagLog.log("net", "fetch timeout host=\(URL(string: url)?.host ?? "?") budget_ms=20000")
+            }
+            throw error
+        }
     }
 
     /// Embed-page shapes a parser may hand back as its final answer.
@@ -162,10 +197,14 @@ final class MovieService: ObservableObject {
     /// (v1.22 progressive detail — torrenthub's stage 2 measured
     /// +713 ms serial before anything could render).
     func detailMeta(pluginId: String, movieId: String) async throws -> DetailBundle {
+        // L-T04 breadcrumb D6: bracket the first plugin call of
+        // the Detail-open path (urlForDetail → fn=getUrlDetail).
+        DiagLog.log("detail", "meta.begin plugin=\(pluginId) movie=\(movieId)")
         let engine = try await engine(for: pluginId)
         guard let url = await engine.urlForDetail(slug: movieId) else {
             throw MovieServiceError.noURL
         }
+        DiagLog.log("detail", "meta.url plugin=\(pluginId) host=\(URL(string: url)?.host ?? "?")")
         let text = try await fetchPage(url)
         async let parsedDetail = engine.parseMovieDetail(text: text, url: url)
         async let parsedStream = engine.parseStream(text: text, url: url)

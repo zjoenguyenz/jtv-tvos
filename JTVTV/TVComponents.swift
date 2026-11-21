@@ -100,7 +100,19 @@ struct TVRemoteImage: View {
                 failed?.wrappedValue = false
                 return
             }
+            // L-T04 breadcrumb D4: bracket the 1920-rung
+            // (backdrop) load — begin/end, host only. Other
+            // buckets stay unlogged (every poster would flood
+            // the log); the memory-cached early return above
+            // serves an already-decoded image and is not the
+            // first-decode path D4 exists to bracket.
+            if bucket == 1920 {
+                DiagLog.log("detail", "backdrop.load.begin host=\(URL(string: urlString)?.host ?? "?")")
+            }
             let loaded = await ImageCacheManager.shared.loadImage(urlString: urlString, headers: headers, bucket: bucket)
+            if bucket == 1920 {
+                DiagLog.log("detail", "backdrop.load.end host=\(URL(string: urlString)?.host ?? "?") ok=\(loaded != nil)")
+            }
             // The task id already guarantees this result belongs
             // to the current identity; the key check is the
             // explicit form of the same guarantee.
@@ -178,6 +190,10 @@ struct TVPosterCard: View {
             if imageFailed {
                 retryToken += 1
             } else {
+                // L-T04 breadcrumb D0 (card form): the tap is
+                // leaving the poster card. The card carries no
+                // plugin id; D1 in TVNavPath.push logs it.
+                DiagLog.log("detail", "tap.card movie=\(movie.id)")
                 onSelect()
             }
         } label: {
