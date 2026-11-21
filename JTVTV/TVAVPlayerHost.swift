@@ -107,7 +107,7 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
                     headers["User-Agent"] = Net.desktopUA
                 }
                 asset = AVURLAsset(url: url,
-                                   options: [AVURLAssetHTTPHeaderFieldsKey: headers])
+                                   options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
             }
 
             let item = AVPlayerItem(asset: asset)
