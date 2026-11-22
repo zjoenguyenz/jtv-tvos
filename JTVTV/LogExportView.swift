@@ -447,6 +447,14 @@ struct LogExportView: View {
         .onDisappear {
             server.stop()
         }
+        // L-T31 (1.3.4): this cover owns its Menu press —
+        // Menu is the Đóng button (dismiss; onDisappear stops
+        // the server); an unhandled press would fall to the
+        // system and exit the app, the L-T31 mechanism.
+        .onExitCommand {
+            DiagLog.log("menu", "dismiss surface=logexport")
+            dismiss()
+        }
     }
 
     /// QR code for the serving URL (CoreImage's

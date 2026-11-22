@@ -49,6 +49,16 @@ import SwiftUI
 //                           log_10: fetchText -1001.
 //   upload18.org            njav player host — the /jm/ hop
 //                           redirects there (mod08.js:630).
+//   njav.tv                 123av official mirror (1.3.4,
+//   123av.me                DIAG-123AV-MIRRORS): the mirror
+//                           domains serve an SPA shell the
+//                           plugin cannot parse, so no swap
+//                           is possible — the open question
+//                           these two answer is whether ANY
+//                           other zone of the same operator
+//                           passes the TV's connection at
+//                           all (transport only, observe-only
+//                           like every other target).
 //   missav.ws               CONTROL — proven good on this TV.
 //   raw.githubusercontent.com CONTROL — plugin sync works
 //                           from the TV (log_10 passim).
@@ -60,7 +70,7 @@ import SwiftUI
 // (hosts, IPs, statuses, error codes, timings — the same
 // redacted-by-construction material DiagLog already holds).
 // Runtime is bounded per host (system DNS raced against a
-// 6 s budget, DoH 6 s, GET 8 s, serial over 6 hosts) and the
+// 6 s budget, DoH 6 s, GET 8 s, serial over 8 hosts) and the
 // run is cancellable from the screen, so Settings can never
 // wedge on it.
 
@@ -77,6 +87,8 @@ enum TVNetProbe {
         Target(host: "sadie-shop.site", role: "123av-embed"),
         Target(host: "www.njav.com", role: "njav-main"),
         Target(host: "upload18.org", role: "njav-player"),
+        Target(host: "njav.tv", role: "mirror-123av-njavtv"),
+        Target(host: "123av.me", role: "mirror-123av-me"),
         Target(host: "missav.ws", role: "control-missav"),
         Target(host: "raw.githubusercontent.com", role: "control-github"),
     ]
@@ -636,6 +648,15 @@ struct TVNetProbeView: View {
         }
         .onDisappear {
             model.cancel()
+        }
+        // L-T31 (1.3.4): this cover owns its Menu press —
+        // Menu is the Đóng button (cancel + dismiss); an
+        // unhandled press would fall to the system and exit
+        // the app, the L-T31 mechanism.
+        .onExitCommand {
+            DiagLog.log("menu", "dismiss surface=netprobe")
+            model.cancel()
+            dismiss()
         }
     }
 }

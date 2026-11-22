@@ -439,6 +439,20 @@ struct PinChangeView: View {
         }
         .navigationTitle("Đổi mã khóa app")
         .onAppear { session.touch() }
+        // L-T31 (1.3.4): this cover owns its Menu press —
+        // Menu abandons the flow and dismisses (mid-flow
+        // nothing is written: the only store happens at the
+        // confirm match, which lands on .done, where Menu is
+        // the Xong button's act). An unhandled press would
+        // fall to the system and exit the app, the L-T31
+        // mechanism. The PIN GATE itself (PinGateView, the
+        // root branch) is deliberately NOT given an arbiter:
+        // it is not a pushed/presented surface, and Menu
+        // there keeps the system's root behaviour.
+        .onExitCommand {
+            DiagLog.log("menu", "dismiss surface=pin-change")
+            dismiss()
+        }
     }
 
     private var title: String {

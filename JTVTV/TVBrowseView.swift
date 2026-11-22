@@ -76,6 +76,23 @@ enum NavPathMutation {
 final class TVNavPath {
     private(set) var path: [AppRoute] = []
 
+    /// L-T31 (1.3.4): pop the whole stack back to its root —
+    /// the target of every pushed surface's Menu arbiter
+    /// (owner ruling 2026-11-22: "Back là về đầu menu", the
+    /// torrent pages' behaviour, applied to every film page).
+    /// Goes through the same assign door as every other path
+    /// write, so a pop-to-root is sanitised and assigned
+    /// exactly once; already at root it is a no-op. The
+    /// arbiter lives on each destination view (Detail /
+    /// Browse / Search results), NOT in this model, so a
+    /// future surface that must special-case its Back (e.g.
+    /// a Detail pushed from a Phase 2 actor screen returning
+    /// there first) can override at its own seam without
+    /// touching the shared path machinery.
+    func popToRoot() {
+        assign([])
+    }
+
     func push(_ route: AppRoute) {
         assign(NavPathMutation.pushing(route, onto: path))
         // L-T04 breadcrumb D1: the append + sanitise + assign
@@ -266,6 +283,7 @@ struct TVBrowseView: View {
     @EnvironmentObject private var service: MovieService
     @EnvironmentObject private var session: PinSession
     @Environment(\.tvTheme) private var theme
+    @Environment(TVNavPath.self) private var nav
 
     @State private var items: [Movie] = []
     @State private var page = 0
@@ -304,6 +322,14 @@ struct TVBrowseView: View {
         .onChange(of: filters) { _, _ in Task { await reload() } }
         .fullScreenCover(isPresented: $showFilters) {
             TVFilterSheet(pluginId: pluginId, filters: $filters)
+        }
+        // L-T31 (1.3.4): this surface's Menu arbiter — Back
+        // pops the owning stack straight to its root, exactly
+        // like Detail's (see TVDetailView). While the filter
+        // sheet is up, the sheet's own arbiter owns the press.
+        .onExitCommand {
+            DiagLog.log("menu", "back-to-root surface=browse plugin=\(pluginId)")
+            nav.popToRoot()
         }
     }
 
@@ -462,6 +488,15 @@ struct TVFilterSheet: View {
         }
         .tvThemedBackground()
         .defaultFocus($applyFocused, true)
+        // L-T31 (1.3.4): the sheet owns its Menu press —
+        // Menu closes the sheet and discards the draft (the
+        // filters binding is only ever written by Áp dụng);
+        // an unhandled press here would fall to the system
+        // and exit the app, the L-T31 mechanism.
+        .onExitCommand {
+            DiagLog.log("menu", "dismiss surface=filter-sheet plugin=\(pluginId)")
+            dismiss()
+        }
         .task {
             if !didLoad {
                 didLoad = true

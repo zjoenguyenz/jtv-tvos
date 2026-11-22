@@ -237,6 +237,28 @@ struct TVDetailView: View {
             previewStream = nil
         }
         .task(id: movie.id) { await load() }
+        // L-T31 (1.3.4) — THE Menu arbiter for this surface
+        // (FL-048 family): a pushed Detail owns its Menu
+        // press explicitly and pops the owning stack straight
+        // to its root ("Back là về đầu menu" — owner ruling
+        // 2026-11-22). Before this, NO pushed surface had any
+        // Menu handler: the press fell through to the
+        // system's implicit NavigationStack pop, which the
+        // 1.3.3 device log shows intermittently failing —
+        // the app left the foreground instead of popping
+        // (log_11: foreground losses at 15:39:34 on a javhd
+        // detail, 15:40:21 on the sayhentai detail, 15:41:23
+        // on a torrenthub detail — one shared mechanism, not
+        // a per-plugin fault). Surfaces WITH an explicit
+        // arbiter (the player cover, the manga reader inside
+        // it) dismissed cleanly all session; now every pushed
+        // surface has one. The arbiter is per-surface (not in
+        // TVNavPath) so a future route that must special-case
+        // Back can override at its own seam.
+        .onExitCommand {
+            DiagLog.log("menu", "back-to-root surface=detail plugin=\(pluginId)")
+            nav.popToRoot()
+        }
     }
 
     // MARK: Bands
@@ -980,9 +1002,14 @@ struct TVDetailView: View {
         presenter.request = request
     }
 
-    /// torrenthub only (iOS §1.5): all servers ranked ⭐-named
-    /// first → "MediaFusion" → rest, episodes flattened, deduped
-    /// by episode id, [current] + the next four.
+    /// The request's switchList, by plugin shape: javhd —
+    /// L-T23 auto-selection candidates (rich mirror list);
+    /// every other multi-server plugin — L-T30 (1.3.4)
+    /// auto-selection candidates (cross-server correspondents
+    /// of the started episode); torrenthub — the in-player
+    /// panel's shortlist (iOS §1.5). Single-server non-javhd
+    /// titles: empty (no auto-selection, panel falls back to
+    /// allEpisodes — unchanged).
     private func switchShortlist(current: Episode, detail: MovieDetail) -> [Episode] {
         if pluginId == "javhd" {
             // L-T23 (1.3.3): AUTO-SELECTION candidates for the
@@ -1018,7 +1045,64 @@ struct TVDetailView: View {
             }
             return Array(list.prefix(12))
         }
-        guard pluginId == "torrenthub" else { return [] }
+        if pluginId != "torrenthub" {
+            // L-T30 (1.3.4): AUTO-SELECTION candidates for
+            // every OTHER multi-server plugin (owner ruling
+            // 2026-11-22: "Khi mở bất kỳ phim nào nó chạy bản
+            // nguồn trước mới chạy phim. Chỉ chọn ngầm thôi,
+            // ưu tiên nguồn khoẻ theo tính toán của app trước
+            // đây"). The candidate on each OTHER server is the
+            // correspondent of the started episode — the SAME
+            // episode on another source — matched by NAME
+            // ONLY: the episode's identity on that server must
+            // be verified, never assumed. There is no
+            // positional guess and no first-episode fallback
+            // (gate 1.3.4 Round 1, Lens B B-1: either can pick
+            // a DIFFERENT episode — a misaligned or shorter
+            // server list makes the same index, or the first
+            // slot, another episode entirely — and a
+            // measured-best wrong candidate would be silently
+            // played). A server with no name-matching episode
+            // contributes NO candidate. The current
+            // server's other episodes are NEVER candidates in
+            // this branch: within one server, episodes are
+            // indistinguishable from series episodes (Tập 2,
+            // 3…) at this seam, and silently starting a
+            // different episode is the one failure this feature
+            // must never produce. (javhd above keeps its
+            // richer list: its servers carry the same film's
+            // mirror files, proven in 1.3.3.) Single-server
+            // titles get no candidates and are unchanged. The
+            // in-player panel is NOT fed from this list (see
+            // TVPlayerSession.switchTargets). torrenthub is
+            // excluded: its switchList is the panel shortlist
+            // below and its source choice is the provider
+            // machinery — resolving its hash episodes here
+            // could start debrid downloads, which a silent
+            // background measurement must never do. Manga is
+            // excluded: chapters are not sources.
+            guard !isManga, detail.servers.count > 1,
+                  let currentServer = detail.servers.first(where: { server in
+                      server.episodes.contains { $0.id == current.id }
+                  })
+            else { return [] }
+            var seen: Set<String> = [current.id]
+            var list: [Episode] = []
+            for server in detail.servers where server.id != currentServer.id {
+                // Identity-verified correspondent ONLY (see
+                // the branch comment above): an exact name
+                // match, or no candidate from this server.
+                let correspondent = server.episodes.first { $0.name == current.name }
+                if let correspondent, seen.insert(correspondent.id).inserted {
+                    list.append(correspondent)
+                }
+            }
+            return Array(list.prefix(12))
+        }
+        // torrenthub (unchanged): all servers ranked ⭐-named
+        // first → "MediaFusion" → rest, episodes flattened,
+        // deduped by episode id, [current] + the next four —
+        // the in-player panel's shortlist (iOS §1.5).
         let rankedServers = detail.servers.sorted { a, b in
             func rank(_ s: EpisodeServer) -> Int {
                 if s.name.contains("⭐") { return 0 }

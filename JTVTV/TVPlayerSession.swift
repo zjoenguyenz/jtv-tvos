@@ -138,7 +138,7 @@ final class TVPlayerSession: ObservableObject {
     private(set) var forcedProvider: DebridResolver.Provider?
     private var providerProbeTask: Task<Void, Never>?
 
-    // MARK: Auto source selection (L-T23, 1.3.3) — javhd
+    // MARK: Auto source selection (L-T23, 1.3.3; L-T30, 1.3.4 — multi-server titles, verified episode correspondence)
 
     /// Measured scores from attempt 1's selection pass
     /// (episode id → resolve + first-byte milliseconds). An
@@ -146,7 +146,7 @@ final class TVPlayerSession: ObservableObject {
     /// here: the owner's rule is "switch to a MEASURED-better
     /// source", never to an unmeasured guess.
     private var measuredSourceScores: [String: Int] = [:]
-    /// Auto selection is live for this session: a javhd title
+    /// Auto selection is live for this session: a title
     /// started on the default pick, measured at attempt 1.
     private var autoSourceMode = false
     /// Any manual source/provider pick by the viewer disables
@@ -311,17 +311,28 @@ final class TVPlayerSession: ObservableObject {
         // L-T13 §5.0 breadcrumb: the counts the next device log
         // needs to convict the switch surfaces' inputs.
         DiagLog.log("player", "switch.targets count=\(switchTargets.count) plugin=\(currentRequest.pluginId) episodes=\(currentRequest.allEpisodes.count) switchList=\(currentRequest.switchList.count) torrentHash=\(isTorrentHashTitle ? 1 : 0)")
-        // L-T23 (1.3.3): measured auto-selection arms for a
-        // javhd session started on the detail's DEFAULT pick
-        // (autoMeasureArmed — Detail arms only the Play
-        // button's target, the first non-empty server's first
-        // episode) when alternative sources exist. A session
+        // L-T23 (1.3.3) + L-T30 (1.3.4): measured
+        // auto-selection arms for a session started on the
+        // detail's DEFAULT pick (autoMeasureArmed — Detail
+        // arms only the Play button's target, the first
+        // non-empty server's first episode) when alternative
+        // sources exist. 1.3.3 armed javhd only; the owner's
+        // L-T30 ruling ("Khi mở bất kỳ phim nào nó chạy bản
+        // nguồn trước mới chạy phim. Chỉ chọn ngầm thôi") arms
+        // EVERY plugin whose Detail built candidates (the
+        // cross-server correspondents in switchList).
+        // torrenthub stays out: its switchList is the panel
+        // shortlist, its source choice is the provider
+        // machinery, and measuring its hash episodes through
+        // resolveEpisode could start debrid downloads. Manga
+        // stays out: chapters are not sources. A session
         // started on any other episode — a chip tap on another
         // server, a history resume on another server — is the
         // viewer's deliberate pick: never measured, never
         // overridden (gate Round 1, Lens C C-1).
         autoMeasurePending = autoMeasureArmed
-            && currentRequest.pluginId == "javhd"
+            && currentRequest.pluginId != "torrenthub"
+            && !currentRequest.isManga
             && !autoSourceCandidates().isEmpty
         autoSourceMode = autoMeasurePending
         triedSourceIDs.insert(currentRequest.episode.id)
@@ -451,6 +462,22 @@ final class TVPlayerSession: ObservableObject {
         let pinned = forcedProvider
         let pinnedHash: String? = (pinned != nil && request.episode.id.hasPrefix("jtvhash:"))
             ? String(request.episode.id.dropFirst("jtvhash:".count)) : nil
+        // L-T30 torrent extension (owner ruling 2026-11-22
+        // 16:10 CST): an UNPINNED hash attempt is the silent
+        // auto-pick — DebridResolver.resolve(hash:) probes the
+        // providers in priority order (TorBox → Real-Debrid →
+        // Premiumize) and the first CACHED provider serves;
+        // a probe error counts as unavailable (RD's
+        // disabled_endpoint 403 → probe-error), ranking that
+        // provider out of the cached phase; nobody cached →
+        // the download flows run in the same priority order.
+        // No provider surface precedes playback (the loading
+        // state carries no source list for hash titles —
+        // TVPlayerView), and a manual in-player provider pick
+        // (the pinned path above) remains the only override.
+        if pinned == nil, isTorrentHashTitle {
+            DiagLog.log("player", "providers auto-pick attempt=\(attempt) mode=silent order=torbox>rd>premiumize rule=cached-first probe-error-excluded")
+        }
         // L-T23 (1.3.3): attempt 1 of an auto-selection
         // session resolves through the measurement pass
         // instead (its winner's resolution is reused — no
@@ -516,9 +543,11 @@ final class TVPlayerSession: ObservableObject {
 
     /// The alternative sources for auto selection, in
     /// measurement-priority order: the request's switchList
-    /// as built by Detail for javhd (other servers' first
+    /// as built by Detail (javhd: other servers' first
     /// episodes — the family representatives — then the
-    /// current server's other mirrors, then the rest),
+    /// current server's other mirrors, then the rest; every
+    /// other multi-server plugin, L-T30: the started
+    /// episode's correspondent on each other server),
     /// deduped, the started episode excluded.
     private func autoSourceCandidates() -> [Episode] {
         var seen: Set<String> = [currentRequest.episode.id]
@@ -915,10 +944,11 @@ final class TVPlayerSession: ObservableObject {
     /// Switch targets: the torrenthub shortlist when present
     /// (its episodes ARE the cross-server sources), else the
     /// current server's episode list (the iOS rule).
-    /// L-T23 (1.3.3): javhd's switchList carries AUTO-SELECTION
-    /// candidates (see autoSourceCandidates), not panel rows —
-    /// the panel keeps showing the current server's episodes
-    /// for every non-torrent plugin, exactly as before.
+    /// L-T23 (1.3.3) + L-T30 (1.3.4): for every non-torrent
+    /// plugin the switchList carries AUTO-SELECTION candidates
+    /// (see autoSourceCandidates), not panel rows — the panel
+    /// keeps showing the current server's episodes for every
+    /// non-torrent plugin, exactly as before.
     var switchTargets: [Episode] {
         if currentRequest.pluginId == "torrenthub",
            !currentRequest.switchList.isEmpty {

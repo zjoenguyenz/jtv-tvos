@@ -303,25 +303,27 @@ private struct TVPlayerSessionView: View {
             Text("Đang tải…")
                 .font(.system(size: 26, weight: .medium))
                 .foregroundStyle(theme.textDim)
-            // NEXT-C C3 (1.3.0): the source-switch list on the
-            // LOADING state (iOS parity — PlayerView's sourceList
-            // under the resolving spinner). A switch during
-            // resolving works through the existing
-            // performSwitch/beginAttempt cancellation: the
-            // in-flight resolve and its deadline are cancelled
-            // and stale completions are dropped by the attempt
-            // guard. Semantics mirror TVSourcePanelView: current
-            // source checked + disabled, default focus on the
-            // first switchable row.
-            // L-T13 (1.3.1): for a TORRENT (hash) title the list
-            // is NOT gated on the episode count — the provider
-            // rows are the switchable sources there, and an
-            // uncached torrent's exempt-from-deadline wait is
-            // exactly when the list must exist.
-            if session.hasSwitchTargets || session.isTorrentHashTitle {
-                TVLoadingSourceListView(session: session)
-                    .padding(.top, 6)
-            }
+            // NO source list on the loading state — for ANY
+            // title. The NEXT-C C3 (1.3.0) loading-state switch
+            // list (extended to torrent hash titles by L-T13,
+            // 1.3.1) was removed in full by the owner's rulings
+            // (L-T30, 2026-11-22 15:42 CST: "Khi mở bất kỳ phim
+            // nào nó chạy bản nguồn trước mới chạy phim. Chỉ
+            // chọn ngầm thôi"; extended to torrent and stated
+            // for every title 2026-11-22 16:10–16:11 CST: "bấm
+            // phim chạy nó hiện ra bảng nguồn … A chỉ cần bấm
+            // chạy là coi liền. Nguồn a muốn đổi thì a tự đổi
+            // sau"). Pressing play goes straight to playback on
+            // the app's silent pick; NO source board may appear
+            // before the first frame. The loading state is
+            // therefore always this plain spinner — title,
+            // episode, "Đang tải…" — and the wait is left via
+            // the cover's Menu arbiter ("Nhấn Menu để đóng"
+            // below). Source/provider switching lives where he
+            // asked for it: inside the player, after playback
+            // starts (TVSourcePanelView via the KS bar / AV
+            // transport menu / error slate, all
+            // user-initiated).
             Text("Nhấn Menu để đóng")
                 .font(.system(size: 22))
                 .foregroundStyle(theme.textFaint)
@@ -529,187 +531,6 @@ private struct TVSourcePanelView: View {
         .tvCardButton()
         .focused($focusedID, equals: id)
         .disabled(disabled)
-        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .fill(isFocused ? Color.white.opacity(0.14) : theme.cardFill))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .strokeBorder(isFocused ? theme.focusRing : .clear,
-                          lineWidth: isFocused ? theme.ringWidth : 0))
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-}
-
-// MARK: - Loading-state source list (NEXT-C C3)
-
-/// The switch list rendered on the resolving/loading state —
-/// the tvOS port of iOS's `sourceList` under the spinner
-/// (PlayerView.swift:2413-2452). Same session semantics as
-/// TVSourcePanelView (current source checked + disabled,
-/// default focus on the first switchable row), minus the
-/// panel chrome: it lives inline under the spinner so a long
-/// or doomed resolve — notably an exempt-from-deadline torrent
-/// resolve (C2) — can be abandoned without leaving the player.
-/// Picking a row calls session.switchSource(to:), which runs
-/// performSwitch → beginAttempt: the in-flight resolve is
-/// cancelled and its stale completion dropped by the attempt
-/// guard. No Back handler of its own (FL-048).
-private struct TVLoadingSourceListView: View {
-    @ObservedObject var session: TVPlayerSession
-
-    @Environment(\.tvTheme) private var theme
-    @FocusState private var focusedID: String?
-
-    var body: some View {
-        VStack(spacing: 14) {
-            Text("Nguồn khác — chọn để đổi ngay")
-                .font(.system(size: 24, weight: .semibold))
-                .foregroundStyle(theme.textDim)
-            // Review-gate fix (1.3.0): the row list is BOUNDED
-            // like TVSourcePanelView — a ScrollView with a fixed
-            // max height, so a long switch list cannot push the
-            // loading state off screen; focus movement scrolls
-            // rows into view.
-            ScrollView {
-                VStack(spacing: 10) {
-                    ForEach(session.switchTargets) { episode in
-                        let isCurrent = episode.id == session.currentRequest.episode.id
-                        row(episode: episode, isCurrent: isCurrent)
-                    }
-                    // L-T13: provider rows on the loading list
-                    // too — for a torrent title these are the
-                    // rows that make the list exist at all.
-                    if !session.providerRows.isEmpty {
-                        Text("Nguồn debrid cho file này")
-                            .font(.system(size: 23, weight: .semibold))
-                            .foregroundStyle(theme.textDim)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.top, 8)
-                        ForEach(session.providerRows) { providerRow in
-                            providerRowView(providerRow)
-                        }
-                    }
-                    // Gate fix pass (C-F5): the guaranteed
-                    // focusable fallback row — always present,
-                    // always enabled, so the loading list can
-                    // never be focus-less even when every other
-                    // row is disabled (current episode, pinned
-                    // or .checking providers, probe filtering
-                    // every provider out).
-                    closeRow
-                }
-                .padding(.vertical, 6)
-            }
-            .frame(width: 860)
-            .frame(maxHeight: 430)
-        }
-        .defaultFocus($focusedID, defaultTargetID)
-    }
-
-    /// Gate fix pass (C-F5): the loading list's fallback row
-    /// id — the close affordance below, always enabled.
-    private var closeID: String { "__close" }
-
-    private var defaultTargetID: String {
-        // Gate fix pass (C-F4/C-F5): default focus = the first
-        // ENABLED row — non-current episodes are enabled;
-        // provider rows only when unpinned AND not .checking.
-        if let episode = session.switchTargets.first(where: {
-            $0.id != session.currentRequest.episode.id
-        }) { return episode.id }
-        if let providerRow = session.providerRows.first(where: {
-            session.forcedProvider != $0.provider && $0.state != .checking
-        }) { return providerRow.id }
-        // No row is enabled: the guaranteed focusable close
-        // row takes default focus — never the disabled current
-        // episode's row.
-        return closeID
-    }
-
-    private var closeRow: some View {
-        let isFocused = focusedID == closeID
-        return Button {
-            session.dismiss()
-        } label: {
-            HStack(spacing: 16) {
-                Spacer().frame(width: 30)
-                Text("Đóng")
-                    .font(.system(size: 26, weight: .semibold))
-                    .foregroundStyle(theme.textPrimary)
-                    .lineLimit(1)
-                Spacer()
-            }
-            .padding(.horizontal, 26)
-            .padding(.vertical, 14)
-            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        }
-        .tvCardButton()
-        .focused($focusedID, equals: closeID)
-        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .fill(isFocused ? Color.white.opacity(0.14) : theme.cardFill))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .strokeBorder(isFocused ? theme.focusRing : .clear,
-                          lineWidth: isFocused ? theme.ringWidth : 0))
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-
-    private func providerRowView(_ providerRow: TVPlayerSession.ProviderRow) -> some View {
-        let isPinned = session.forcedProvider == providerRow.provider
-        let isFocused = focusedID == providerRow.id
-        return Button {
-            session.switchProvider(to: providerRow.provider)
-        } label: {
-            HStack(spacing: 16) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 24, weight: .bold))
-                    .foregroundStyle(theme.accent)
-                    .opacity(isPinned ? 1 : 0)
-                    .frame(width: 30)
-                Text(providerRow.title)
-                    .font(.system(size: 26, weight: .semibold))
-                    .foregroundStyle(theme.textPrimary)
-                    .lineLimit(1)
-                Spacer()
-            }
-            .padding(.horizontal, 26)
-            .padding(.vertical, 14)
-            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        }
-        .tvCardButton()
-        .focused($focusedID, equals: providerRow.id)
-        // Gate fix pass (C-F4): a .checking provider row is not
-        // actionable on the loading list either.
-        .disabled(isPinned || providerRow.state == .checking)
-        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .fill(isFocused ? Color.white.opacity(0.14) : theme.cardFill))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .strokeBorder(isFocused ? theme.focusRing : .clear,
-                          lineWidth: isFocused ? theme.ringWidth : 0))
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-
-    private func row(episode: Episode, isCurrent: Bool) -> some View {
-        let isFocused = focusedID == episode.id
-        return Button {
-            session.switchSource(to: episode)
-        } label: {
-            HStack(spacing: 16) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 24, weight: .bold))
-                    .foregroundStyle(theme.accent)
-                    .opacity(isCurrent ? 1 : 0)
-                    .frame(width: 30)
-                Text(episode.name)
-                    .font(.system(size: 26, weight: .semibold))
-                    .foregroundStyle(theme.textPrimary)
-                    .lineLimit(1)
-                Spacer()
-            }
-            .padding(.horizontal, 26)
-            .padding(.vertical, 14)
-            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        }
-        .tvCardButton()
-        .focused($focusedID, equals: episode.id)
-        .disabled(isCurrent)
         .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
             .fill(isFocused ? Color.white.opacity(0.14) : theme.cardFill))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)

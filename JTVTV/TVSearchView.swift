@@ -518,6 +518,7 @@ struct TVSearchResultsView: View {
     @EnvironmentObject private var service: MovieService
     @EnvironmentObject private var session: PinSession
     @Environment(\.tvTheme) private var theme
+    @Environment(TVNavPath.self) private var nav
 
     @State private var items: [Movie] = []
     @State private var page = 0
@@ -542,6 +543,13 @@ struct TVSearchResultsView: View {
         }
         .tvThemedBackground()
         .onAppear { session.touch() }
+        // L-T31 (1.3.4): this surface's Menu arbiter — Back
+        // pops the owning stack straight to its root, exactly
+        // like Detail's (see TVDetailView).
+        .onExitCommand {
+            DiagLog.log("menu", "back-to-root surface=search plugin=\(pluginId)")
+            nav.popToRoot()
+        }
         .task(id: query + pluginId) {
             items = []
             didLoad = false

@@ -48,12 +48,32 @@ struct TVMangaPageRect: Equatable {
 /// ≥ 6 strict rows, a weak band ≥ 4 weak rows. Segments
 /// shorter than 48 px (lettering gaps inside a panel, research
 /// §2.3) NEVER stand alone as a page: a post-pass merges any
-/// sub-48 px page into its neighbour (the previous page, or
+/// sub-floor page into its neighbour (the previous page, or
 /// the next one when it is the first) — unconditionally, per
 /// §6 ("không bao giờ đứng một mình — luôn gộp với đoạn kề");
-/// the merged crop may exceed one screen height by less than
-/// 48 px and simply renders aspect-fit, whole, like a
-/// discrete image.
+/// the merged crop may exceed one screen height and simply
+/// renders aspect-fit, whole, like a discrete image.
+///
+/// 1.3.4 (L-T29 / FL-443, DIAG-SAYHENTAI-133 §3): the 1.3.3
+/// plan still produced SLIVER pages — the remainder of a
+/// panel just over one screen tall (panel ≈ segH + 70…140 px)
+/// stood alone at 0.2–0.3 × segH, because the sub-cut's fixed
+/// fallback left that remainder unsized and the post-pass
+/// floor was a flat 48 px. Two rules close the class:
+/// R1 — when an over-tall segment's LAST piece (the
+/// remainder) is under half a screen, the segment's last two
+/// pieces are re-split at their pair midpoint (snapped to
+/// the weakest weak gutter within ±segH/8 when one qualifies),
+/// so every resulting piece lies in [3·segH/8, segH]; a pair
+/// with no legal split merges into one piece instead (or,
+/// when its span exceeds one screen, is left unsplit for
+/// R2's page-level merge — never an over-screen piece).
+/// R2 — the post-pass page floor is proportional:
+/// max(48, ⌈segH/2⌉). No page under half a screen ever
+/// stands alone (a strip's single page excepted). The 48 px
+/// constant keeps its original job at the SEGMENT layer
+/// (lettering-gap noise, research §2.3) and as the sub-cut's
+/// minimum first piece; R2 changes only the PAGE floor.
 ///
 /// Cost: one pass over a ≤200-px-wide grayscale copy —
 /// measured ≈0.1 s per strip on the shared VM for the
@@ -96,7 +116,8 @@ enum TVMangaPagePlanner {
         let (strictBands, weakBands) = gutterBands(of: cg)
         guard !strictBands.isEmpty else {
             // Detection failure degrades to the 1.3.2 geometry.
-            return mergeMicroPages(fixedPlan(height: height, segmentHeight: segH))
+            return mergeMicroPages(fixedPlan(height: height, segmentHeight: segH),
+                                   segmentHeight: segH)
         }
         // Content segments: the runs between strict bands.
         var segments: [(start: Int, end: Int)] = []
@@ -107,7 +128,8 @@ enum TVMangaPagePlanner {
         }
         if cursor < height { segments.append((cursor, height)) }
         guard segments.count > 1 else {
-            return mergeMicroPages(fixedPlan(height: height, segmentHeight: segH))
+            return mergeMicroPages(fixedPlan(height: height, segmentHeight: segH),
+                                   segmentHeight: segH)
         }
         // Split over-tall segments first (weakest local gutter
         // inside the screen window, else a fixed cut), so the
@@ -119,6 +141,7 @@ enum TVMangaPagePlanner {
                 pieces.append(segment)
                 continue
             }
+            var segPieces: [(start: Int, end: Int)] = []
             var y = segment.start
             while segment.end - y > segH {
                 let limit = y + segH
@@ -146,14 +169,20 @@ enum TVMangaPagePlanner {
                     }
                 }
                 if let cutEnd {
-                    pieces.append((y, cutEnd))
+                    segPieces.append((y, cutEnd))
                     y = resumeY
                 } else {
-                    pieces.append((y, limit))
+                    segPieces.append((y, limit))
                     y = limit
                 }
             }
-            if segment.end > y { pieces.append((y, segment.end)) }
+            if segment.end > y { segPieces.append((y, segment.end)) }
+            // R1 (L-T29): a sub-half-screen remainder never
+            // leaves the sub-cut — the segment's last two
+            // pieces are rebalanced before packing.
+            pieces.append(contentsOf: rebalanced(segPieces,
+                                                 weakBands: weakBands,
+                                                 segH: segH))
         }
         // Greedy packing: accumulate whole pieces while the
         // crop (first piece's start → last piece's end, the
@@ -170,26 +199,146 @@ enum TVMangaPagePlanner {
             i = j + 1
         }
         return rects.isEmpty
-            ? mergeMicroPages(fixedPlan(height: height, segmentHeight: segH))
-            : mergeMicroPages(rects)
+            ? mergeMicroPages(fixedPlan(height: height, segmentHeight: segH),
+                              segmentHeight: segH)
+            : mergeMicroPages(rects, segmentHeight: segH)
+    }
+
+    /// R1 (1.3.4, L-T29 / FL-443; DIAG-SAYHENTAI-133 §3): the
+    /// remainder rebalance. When an over-tall segment's LAST
+    /// piece is shorter than half a screen (`lastHeight * 2 <
+    /// segH`), the segment's last two pieces are re-split at
+    /// their pair midpoint: the cut snaps to the WEAKEST weak
+    /// gutter within ±segH/8 of the midpoint when a band
+    /// qualifies (band start past the 48 px floor, and BOTH
+    /// resulting pieces ≥ 3·segH/8 — the snap follows the
+    /// sub-cut's own convention: the piece ends at the band's
+    /// start and reading resumes at its end, the band rows
+    /// shown on no page); with no qualifying band the cut is
+    /// fixed at the midpoint.
+    ///
+    /// Gate 1.3.4 Round 1 (Lens A) hardening: every split is
+    /// validated on the heights it ACTUALLY emits, never on
+    /// the pair's raw span. The span (pairEnd − pairStart)
+    /// includes any weak band the sub-cut ate between the two
+    /// pieces; with a band ≳ segH/2 the span passes 2·segH
+    /// and an unguarded span-midpoint split emitted pieces
+    /// TALLER than one screen (lens reproduction: span 1505
+    /// at segH 405 → 752/753 px pieces), breaking §4.3's
+    /// interval [3·segH/8, segH]. So now: a snap candidate
+    /// must satisfy BOTH bounds on both emitted heights (the
+    /// first piece ends at the band's start, the second
+    /// resumes at its end — the eaten band is in neither);
+    /// the fixed cut is taken only at a point whose two
+    /// emitted heights both lie in [3·segH/8, segH] (the
+    /// legal cut points form a contiguous interval that
+    /// contains the midpoint whenever it is non-empty, so
+    /// clamping the midpoint into it is exact); and when NO
+    /// legal split exists the pair is not split at all —
+    /// it merges into one piece when the span fits a screen
+    /// (the too-small pair), and when the span itself
+    /// exceeds a screen (a giant eaten band) the two pieces
+    /// are left exactly as the sub-cut made them — each
+    /// already ≤ segH — for R2 to merge at page level,
+    /// which yields the same aspect-fit page a piece-level
+    /// merge would, without manufacturing an over-screen
+    /// piece. Every other piece, every gutter cut and the
+    /// packing pass are untouched: R1 fires only on the
+    /// convicted remainder shape.
+    private static func rebalanced(
+        _ segPieces: [(start: Int, end: Int)],
+        weakBands: [(start: Int, end: Int, strength: Double)],
+        segH: Int
+    ) -> [(start: Int, end: Int)] {
+        guard segPieces.count >= 2, segH > 0 else { return segPieces }
+        let last = segPieces[segPieces.count - 1]
+        let prev = segPieces[segPieces.count - 2]
+        guard (last.end - last.start) * 2 < segH else { return segPieces }
+        let pairStart = prev.start
+        let pairEnd = last.end
+        let span = pairEnd - pairStart
+        // The R1 floor as a height: a piece of height h is a
+        // legal split product iff h * 8 >= 3 * segH
+        // (integer-exact, the same test the snap used before).
+        let minPiece = (3 * segH + 7) / 8
+        var result = Array(segPieces.dropLast(2))
+        // Snap split: the weakest weak gutter within ±segH/8
+        // of the pair midpoint whose two EMITTED pieces both
+        // lie in [minPiece, segH].
+        let mid = pairStart + span / 2
+        let window = segH / 8
+        var chosen: (start: Int, end: Int)?
+        var weakestStrength = -1.0
+        for band in weakBands
+        where band.start >= mid - window && band.start <= mid + window
+            && band.start - pairStart > microSegmentFloor
+            && band.start - pairStart >= minPiece
+            && band.start - pairStart <= segH
+            && pairEnd - band.end >= minPiece
+            && pairEnd - band.end <= segH {
+            if band.strength > weakestStrength
+                || (band.strength == weakestStrength
+                    && (chosen == nil || band.start > chosen!.start)) {
+                weakestStrength = band.strength
+                chosen = (band.start, band.end)
+            }
+        }
+        if let chosen {
+            result.append((pairStart, chosen.start))
+            result.append((chosen.end, pairEnd))
+            return result
+        }
+        // Fixed split: taken only where both emitted heights
+        // are legal (see the doc comment for why clamping
+        // the midpoint into the legal interval is exact).
+        let cutLo = max(pairStart + minPiece, pairEnd - segH)
+        let cutHi = min(pairEnd - minPiece, pairStart + segH)
+        if cutLo <= cutHi {
+            let cut = min(max(mid, cutLo), cutHi)
+            result.append((pairStart, cut))
+            result.append((cut, pairEnd))
+            return result
+        }
+        // No legal split exists: merge the pair into one
+        // piece when the merged span fits a screen; with an
+        // over-screen span, leave the pair unsplit for R2's
+        // page-level merge.
+        if span <= segH {
+            result.append((pairStart, pairEnd))
+        } else {
+            result.append(prev)
+            result.append(last)
+        }
+        return result
     }
 
     /// §6's micro-segment rule, applied as a post-pass over
     /// every strip plan (gutter-packed and fixed alike): a
-    /// page shorter than the 48 px floor NEVER stands alone —
-    /// it merges into the previous page (or the next one when
+    /// page shorter than the floor NEVER stands alone — it
+    /// merges into the previous page (or the next one when
     /// it is the first page), the merged crop spanning from
     /// the keeper's start to the micro page's end, gutter rows
     /// between them included. Unconditional: the merged crop
-    /// may exceed one screen height by less than the floor
-    /// and renders aspect-fit, whole. Repeats until no micro
-    /// page remains (a merge can itself follow a micro page).
-    static func mergeMicroPages(_ rects: [TVMangaPageRect]) -> [TVMangaPageRect] {
+    /// may exceed one screen height and renders aspect-fit,
+    /// whole. Repeats until no micro page remains (a merge
+    /// can itself follow a micro page).
+    ///
+    /// 1.3.4 (R2, L-T29 / FL-443): the floor is no longer the
+    /// flat 48 px — that constant was born for SEGMENT noise
+    /// (lettering gaps, research §2.3) and let 70–140 px
+    /// sliver pages (0.2–0.3 × segH) through untouched. The
+    /// PAGE floor is now max(48, ⌈segH/2⌉): no page under
+    /// half a screen stands alone, on the gutter-packed path
+    /// and on the fixed fallback alike. A strip reduced to a
+    /// single page keeps it (the loop's count > 1 guard).
+    static func mergeMicroPages(_ rects: [TVMangaPageRect],
+                                segmentHeight segH: Int) -> [TVMangaPageRect] {
+        let floor = max(microSegmentFloor, (segH + 1) / 2)
         var rects = rects
         var changed = true
         while changed, rects.count > 1 {
             changed = false
-            for i in rects.indices where rects[i].height < microSegmentFloor {
+            for i in rects.indices where rects[i].height < floor {
                 if i > 0 {
                     let prev = rects[i - 1]
                     let cur = rects[i]
