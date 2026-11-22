@@ -36,7 +36,7 @@ enum TVSourceProbe {
         let result: Int? = await withCheckedContinuation { continuation in
             delegate.arm(continuation: continuation)
             let task = session.dataTask(with: request)
-            delegate.attach(task: task)
+            delegate.attach(task: task, queue: queue)
             task.resume()
             // The budget enforcer: whichever of first-byte,
             // completion, or this deadline lands first wins;
@@ -76,9 +76,14 @@ enum TVSourceProbe {
             self.started = Date()
         }
 
-        func attach(task: URLSessionDataTask) {
+        func attach(task: URLSessionDataTask, queue: OperationQueue) {
             self.task = task
-            self.callbackQueue = (task.session?.delegateQueue)
+            // The queue is the session's own delegate queue,
+            // handed in by the caller that created both: a
+            // URLSessionTask exposes no `session` back-pointer
+            // in the tvOS SDK (CI run #19 convicted the assumed
+            // API), so the queue travels explicitly.
+            self.callbackQueue = queue
         }
 
         func expire() {
