@@ -1,5 +1,6 @@
 import AVFoundation
 import AVKit
+import Combine
 import Foundation
 import SwiftUI
 
@@ -44,6 +45,71 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
 
         private var watchdogTask: Task<Void, Never>?
         private var waitingSince: Date?
+
+        // Gate fix pass (F-B3/C-F2): the transport menu is a
+        // snapshot of session.providerRows, so the coordinator
+        // observes that ONE published property (the same
+        // stored-token discipline as the KVO observers above:
+        // the cancellable is stored and cancelled in
+        // invalidate()). The snapshot of the rows the menu was
+        // last built from gates the rebuild — the menu rebuilds
+        // ONLY when the provider rows actually change, never on
+        // unrelated session publishes, and never in a loop (a
+        // rebuild publishes nothing itself).
+        private var providerRowsCancellable: AnyCancellable?
+        private var lastMenuProviderRows: [TVPlayerSession.ProviderRow]?
+        // Gate fix pass 2 (C3): a provider-rows rebuild must
+        // not reassign transportBarCustomMenuItems WHILE the
+        // transport menu is presented (it would reset the menu
+        // mid-browse). When a real rows change lands during a
+        // presentation, the rebuild is deferred into this flag
+        // and applied by the periodic observer the moment the
+        // presentation is gone (see observeProviderRows /
+        // applyPendingMenuRebuild). AVKit exposes NO public
+        // "transport menu presented" signal; the strongest
+        // available proxy in this host's structure is the
+        // controller's presentedViewController (AVKit presents
+        // its transport-menu UI through the view-controller
+        // hierarchy). Stated limit: if a tvOS version presents
+        // that menu without surfacing a presented view
+        // controller on this controller, the deferral does not
+        // engage and the rebuild lands immediately — the R3
+        // behaviour, which Lens C bounded as a non-destructive
+        // presentation hiccup (value-captured actions, fresh
+        // check state on reopen). The deferral can only ever
+        // DELAY a rebuild, never lose one: the flag is drained
+        // by the 0.25 s periodic observer while time advances
+        // and, since gate fix pass 3 (C-R4-2), by a 0.5 s
+        // wall-clock timer while it is set (the observer does
+        // not fire while paused); it is cleared only by
+        // applying it or by invalidate().
+        private var pendingMenuRebuild = false
+        // Gate fix pass 3 (C-R4-2): the periodic time
+        // observer does NOT fire while playback is paused
+        // (it is driven by the player's time progressing),
+        // so a rebuild deferred while paused could sit
+        // undrained until playback resumed — the re-opened
+        // menu would still show the stale snapshot. While
+        // pendingMenuRebuild is set, this wall-clock timer
+        // (0.5 s, main run loop — the coordinator is
+        // MainActor-isolated, the same context the periodic
+        // observer's .main queue lands on) re-checks the
+        // SAME dismissal condition and drains via the SAME
+        // applyPendingMenuRebuild(). It is armed when a
+        // deferral is recorded, stops the moment the flag
+        // drains (whichever driver drains it), and is
+        // invalidated in invalidate() with the other
+        // teardown. The defer condition, the snapshot guard
+        // and buildTransportMenu are unchanged.
+        private var menuRebuildTimer: Timer?
+        // Gate fix pass 2 (F-B3-R3-1): validity flag for the
+        // sink's MainActor hop — invalidate() clears it FIRST,
+        // so a delivery that was already enqueued when the
+        // cancellable was cancelled no-ops instead of
+        // rebuilding the menu on the dismantled host.
+        // invalidate() also nils the session/controller
+        // references the rebuild reads, as a second layer.
+        private var hostValid = true
 
         private var readyHandled = false
         /// A resume seek was attempted at ready and is still
@@ -125,6 +191,7 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
 
             observe(item: item, player: player)
             buildTransportMenu()
+            observeProviderRows()
             // L-T04 probe breadcrumb P10a: the transport menu
             // was built inside start() (shortlist row 3's site).
             DiagLog.log("player", "menu.built")
@@ -175,6 +242,10 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
                 // PlayerView).
                 MainActor.assumeIsolated {
                     guard let self else { return }
+                    // Gate fix pass 2 (C3): drain a deferred
+                    // transport-menu rebuild as soon as the
+                    // menu presentation is gone.
+                    self.applyPendingMenuRebuild()
                     let position = time.seconds.isFinite ? time.seconds : 0
                     let duration = self.player?.currentItem?.duration.seconds ?? 0
                     self.session?.notePosition(attempt: self.attemptID,
@@ -232,6 +303,20 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
         /// one of its two cancellation paths — the session's
         /// own stop is the other, via the attempt guards).
         func invalidate() {
+            // Gate fix pass 2 (F-B3-R3-1): validity cleared
+            // FIRST — a sink delivery already enqueued on the
+            // MainActor before the cancel below must find the
+            // host invalid and no-op (see observeProviderRows).
+            hostValid = false
+            providerRowsCancellable?.cancel()
+            providerRowsCancellable = nil
+            // Gate fix pass 3 (C-R4-2): the menu-rebuild
+            // drain timer is torn down with the other
+            // registrations. hostValid was cleared FIRST
+            // above, so even a firing already queued on the
+            // main run loop no-ops — no drain after
+            // invalidate.
+            stopMenuRebuildTimer()
             watchdogTask?.cancel()
             watchdogTask = nil
             statusObservation?.invalidate()
@@ -248,6 +333,14 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
             notificationTokens.removeAll()
             player?.pause()
             session?.deregisterHost(attempt: attemptID)
+            // Gate fix pass 2 (F-B3-R3-1): nil the references
+            // the menu rebuild uses, so an already-enqueued
+            // sink delivery that somehow passes the validity
+            // flag still finds nothing to rebuild with. Done
+            // LAST: every step above still needs the session.
+            pendingMenuRebuild = false
+            session = nil
+            controller = nil
         }
 
         // MARK: Ready / first frame / failure
@@ -301,6 +394,11 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
                             toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                     Task { @MainActor [weak self] in
                         guard let self else { return }
+                        // Gate fix (R4 Lens B, F-B-R4-1): a seek
+                        // completing after invalidate() must not
+                        // note the session or call play() on the
+                        // dismantled, display-less player.
+                        guard self.hostValid else { return }
                         self.session?.noteResumeSeek(attempt: self.attemptID,
                                                      target: target, finished: finished)
                         // The window ends HERE, whatever the
@@ -416,6 +514,109 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
             }
         }
 
+        /// Gate fix pass (F-B3/C-F2): rebuild the transport
+        /// menu when — and only when — the session's provider
+        /// rows change (the probe publishing its filtered,
+        /// corrected rows is the case that matters: seeded
+        /// .checking rows, including not-configured providers,
+        /// must not linger as the menu's permanent state).
+        private func observeProviderRows() {
+            guard let session else { return }
+            providerRowsCancellable = session.$providerRows.sink { [weak self] rows in
+                Task { @MainActor [weak self] in
+                    // Gate fix pass 2 (F-B3-R3-1): a delivery
+                    // enqueued before invalidate() cancelled
+                    // the cancellable must not rebuild the menu
+                    // on the dismantled host.
+                    guard let self, self.hostValid else { return }
+                    guard rows != self.lastMenuProviderRows else { return }
+                    // Gate fix pass 2 (C3): never reassign the
+                    // menu items under a presented transport
+                    // menu — defer and let the periodic
+                    // observer apply the rebuild once the
+                    // presentation is gone.
+                    if self.transportMenuPresented {
+                        self.pendingMenuRebuild = true
+                        DiagLog.log("player", "menu.rebuild deferred reason=presented")
+                        // Gate fix pass 3 (C-R4-2): arm the
+                        // wall-clock drain — the periodic
+                        // observer alone starves while paused.
+                        self.startMenuRebuildTimerIfNeeded()
+                        return
+                    }
+                    self.buildTransportMenu()
+                }
+            }
+        }
+
+        /// Gate fix pass 2 (C3): the strongest presentation
+        /// signal available for AVKit's transport menu — see
+        /// the pendingMenuRebuild declaration for the stated
+        /// limit of this proxy.
+        private var transportMenuPresented: Bool {
+            controller?.presentedViewController != nil
+        }
+
+        /// Gate fix pass 2 (C3): apply a deferred menu rebuild
+        /// once the transport menu is no longer presented.
+        /// Driven by the periodic observer (0.25 s, main
+        /// queue, host-lifetime), so a deferred rebuild lands
+        /// within a quarter second of dismissal WHILE TIME
+        /// ADVANCES; gate fix pass 3 (C-R4-2) adds the
+        /// wall-clock timer drain below for the paused state,
+        /// where the time observer does not fire. It is never
+        /// applied early and never dropped while the host
+        /// lives.
+        private func applyPendingMenuRebuild() {
+            guard hostValid, pendingMenuRebuild, !transportMenuPresented else { return }
+            pendingMenuRebuild = false
+            // Gate fix pass 3 (C-R4-2): the flag has drained,
+            // whichever driver drained it — the wall-clock
+            // timer's work is done.
+            stopMenuRebuildTimer()
+            // buildTransportMenu re-reads the LIVE rows, so a
+            // deferral window that saw several publishes still
+            // builds exactly one, current menu.
+            buildTransportMenu()
+            DiagLog.log("player", "menu.rebuild applied after dismissal")
+        }
+
+        /// Gate fix pass 3 (C-R4-2): arm the bounded
+        /// wall-clock drain for a deferred menu rebuild. The
+        /// timer is scheduled from the coordinator's MainActor
+        /// context onto the main run loop, so its firings land
+        /// on the main actor exactly as the periodic
+        /// observer's .main-queue callbacks do (the house
+        /// MainActor.assumeIsolated pattern at that site). It
+        /// is NOT an unstructured task: it is a stored token
+        /// torn down in invalidate() alongside every other
+        /// registration, and hostValid (cleared FIRST there)
+        /// makes any already-queued firing a no-op — no drain
+        /// can land after invalidate.
+        private func startMenuRebuildTimerIfNeeded() {
+            guard menuRebuildTimer == nil else { return }
+            DiagLog.log("player", "menu.rebuild timer armed interval=0.5")
+            menuRebuildTimer = Timer.scheduledTimer(
+                withTimeInterval: 0.5, repeats: true
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, self.hostValid else { return }
+                    // The flag drained through the periodic
+                    // observer (or never re-armed): stop.
+                    guard self.pendingMenuRebuild else {
+                        self.stopMenuRebuildTimer()
+                        return
+                    }
+                    self.applyPendingMenuRebuild()
+                }
+            }
+        }
+
+        private func stopMenuRebuildTimer() {
+            menuRebuildTimer?.invalidate()
+            menuRebuildTimer = nil
+        }
+
         // MARK: Transport menu (§3.3)
 
         /// Đổi nguồn (submenu of the session's switch targets,
@@ -428,23 +629,59 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
             guard let controller, let session else { return }
             var children: [UIMenuElement] = []
             let targets = session.switchTargets
-            if targets.count > 1 {
+            // L-T13 (1.3.1): the Đổi nguồn submenu now also
+            // carries the PROVIDER rows (same hash, chosen
+            // debrid provider + live cache state) next to the
+            // episode-variant rows — it appears when EITHER
+            // kind has a switchable row, so a single-variant
+            // torrent title is no longer starved of the menu.
+            let providerRows = session.providerRows
+            if targets.count > 1 || providerRows.count > 1 {
                 let currentID = session.currentRequest.episode.id
-                let switchMenu = UIMenu(
-                    title: "Đổi nguồn",
-                    image: UIImage(systemName: "arrow.triangle.2.circlepath"),
-                    children: targets.map { episode in
-                        UIAction(title: episode.name,
-                                 state: episode.id == currentID ? .on : .off) { [weak self] _ in
+                var switchChildren: [UIMenuElement] = []
+                if targets.count > 1 {
+                    for episode in targets {
+                        switchChildren.append(UIAction(
+                            title: episode.name,
+                            state: episode.id == currentID ? .on : .off) { [weak self] _ in
                             guard let self else { return }
                             let now = self.player?.currentTime().seconds ?? 0
                             self.session?.switchSource(
                                 to: episode,
                                 capturedPosition: (now.isFinite && now > 0) ? now : nil)
-                        }
+                        })
+                    }
+                }
+                for providerRow in providerRows {
+                    switchChildren.append(UIAction(
+                        title: providerRow.title,
+                        // Gate fix pass (C-F4): a .checking row
+                        // is information, not a command — it is
+                        // disabled until its probe verdict lands
+                        // (the rebuild above then re-enables it).
+                        attributes: providerRow.state == .checking ? [.disabled] : [],
+                        state: session.forcedProvider == providerRow.provider ? .on : .off) { [weak self] _ in
+                        guard let self else { return }
+                        let now = self.player?.currentTime().seconds ?? 0
+                        self.session?.switchProvider(
+                            to: providerRow.provider,
+                            capturedPosition: (now.isFinite && now > 0) ? now : nil)
                     })
+                }
+                let switchMenu = UIMenu(
+                    title: "Đổi nguồn",
+                    image: UIImage(systemName: "arrow.triangle.2.circlepath"),
+                    children: switchChildren)
                 children.append(switchMenu)
             }
+            // L-T13 §5.0 breadcrumb: menu contents are now
+            // countable from the log.
+            DiagLog.log("player", "menu.built children=\(children.count + 1) switchTargets=\(targets.count) providers=\(providerRows.count)")
+            // Gate fix pass (F-B3/C-F2): remember exactly which
+            // provider rows this menu was built from — the
+            // observation above rebuilds only on a real change
+            // against this snapshot.
+            lastMenuProviderRows = providerRows
             children.append(UIAction(
                 title: "Phụ đề",
                 image: UIImage(systemName: "captions.bubble")

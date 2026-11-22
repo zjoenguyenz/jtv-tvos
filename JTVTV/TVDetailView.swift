@@ -48,7 +48,41 @@ struct TVDetailView: View {
     /// disappear (the host's teardown runs on dismantle).
     @State private var previewStream: StreamInfo?
     @State private var previewGeneration = 0
-    @State private var previewResolvedForLoad = -1
+    /// L-T12 (1.3.1): the preview attempt is keyed to the FINAL
+    /// (stage-2) detail identity — plugin|navId|loadGeneration
+    /// plus a fingerprint of the server list — not to the load
+    /// generation alone, so a stage-2 server swap re-arms the
+    /// probe against real episodes and a stage-1 placeholder
+    /// never consumes the one attempt.
+    @State private var previewResolvedKey = ""
+    /// Gate fix pass (F-B1): bumping this epoch is part of the
+    /// preview dwell task's `.task(id:)` identity, so a bump
+    /// CANCELS the in-flight dwell/probe task itself (SwiftUI
+    /// cancels the superseded .task) — the task that is running
+    /// the probe chain (façade group, resolveCachedOnly, or the
+    /// direct torrent-http resolve, all awaited inline in
+    /// runBackdropPreview) is the task that gets cancelled, so
+    /// its cooperative Task.isCancelled checks fire and no
+    /// probe work runs concurrently with Play's own resolve.
+    /// play() and onDisappear both bump it. A task restarted by
+    /// the bump re-checks previewResolvedKey, which play() marks
+    /// resolved first, so it returns without re-probing.
+    @State private var previewTaskEpoch = 0
+    /// Gate fix pass 2 (F-B1-R3-2): the PLAY LATCH. Once
+    /// play() has been tapped for THIS Detail instance, the
+    /// backdrop preview never re-arms — regardless of later
+    /// task-key changes. The epoch/resolved-key disarm alone
+    /// had a hole: a stage-2 or healed detail swap landing
+    /// AFTER the tap changes the fingerprint in the dwell
+    /// task's identity, the restarted task computes a key ≠
+    /// previewResolvedKey (which was marked for the detail as
+    /// of the tap), and it re-probes behind the player cover.
+    /// The latch is a plain @State on the view: it is set once
+    /// in play(), never cleared by any detail-content update,
+    /// and resets only when the Detail instance itself is
+    /// recreated (a new navigation makes a new view with
+    /// fresh @State).
+    @State private var playLatched = false
     @AppStorage(TVPreviewSettings.defaultsKey) private var previewEnabled = true
     @State private var isLoading = false
     @State private var loadError: String?
@@ -137,10 +171,14 @@ struct TVDetailView: View {
                     .ignoresSafeArea()
                     // NEXT-D D3: the dwell task lives ONLY in
                     // this loaded branch (FL-357/FL-364: nothing
-                    // item-data-driven runs pre-detail). Keyed
-                    // pluginId|navId|detail-arrival; ≤1 preview
-                    // resolve per Detail open.
-                    .task(id: "\(pluginId)|\(navId)|\(loadGeneration)") {
+                    // item-data-driven runs pre-detail).
+                    // L-T12 (1.3.1): the key now includes the
+                    // server-list fingerprint, so the stage-2
+                    // swap (which changes no other key part)
+                    // RESTARTS the task against the final
+                    // detail; ≤1 preview resolve per final
+                    // detail per Detail open.
+                    .task(id: "\(pluginId)|\(navId)|\(loadGeneration)|\(Self.previewFingerprint(detail))|\(previewTaskEpoch)") {
                         await runBackdropPreview(detail: detail)
                     }
                 ScrollView {
@@ -188,6 +226,10 @@ struct TVDetailView: View {
             // nothing, above all no player presentation.
             detailAlive = false
             loadGeneration += 1
+            // Gate fix pass (F-B1): cancel the preview dwell /
+            // probe task itself as the Detail disappears (the
+            // epoch is part of its .task identity).
+            previewTaskEpoch += 1
             // NEXT-D teardown: the preview player dies with the
             // screen (its host dismantles → pause + empty).
             previewStream = nil
@@ -450,6 +492,36 @@ struct TVDetailView: View {
         selectedServer = firstPlayable
     }
 
+    /// L-T12: identity of a detail's server list for the
+    /// preview task key. Gate fix pass (F-B5): WIDENED to the
+    /// FULL episode/server identity — every server's name plus
+    /// EVERY episode's id, name and slug (the count is implied
+    /// by the joined list) — not just the first episode id +
+    /// count, under which a replacement that changed only
+    /// later episodes (or URLs behind the same first id) never
+    /// re-keyed and never re-probed. A stage-2 swap changes it;
+    /// a re-render with the same servers does not.
+    private static func previewFingerprint(_ detail: MovieDetail) -> String {
+        detail.servers.map { server in
+            server.name + "::" + server.episodes.map { "\($0.id)|\($0.name)|\($0.slug)" }
+                .joined(separator: ";")
+        }
+        .joined(separator: ",")
+    }
+
+    private var previewKey: String {
+        guard let detail else { return "" }
+        return "\(pluginId)|\(navId)|\(loadGeneration)|\(Self.previewFingerprint(detail))"
+    }
+
+    /// L-T13 §5.0: Detail-load count breadcrumb (servers /
+    /// episodes) so the next device log can convict the Lane B
+    /// counts at the Detail surface too.
+    private func logDetailCounts(_ detail: MovieDetail, stage: String) {
+        let episodes = detail.servers.reduce(0) { $0 + $1.episodes.count }
+        DiagLog.log("detail", "counts stage=\(stage) plugin=\(pluginId) servers=\(detail.servers.count) episodes=\(episodes)")
+    }
+
     private func load() async {
         // L-T04 breadcrumb D5: Detail's load task started.
         DiagLog.log("detail", "load.begin plugin=\(pluginId) movie=\(movie.id)")
@@ -461,6 +533,7 @@ struct TVDetailView: View {
             let first = try await service.detailMeta(pluginId: pluginId, movieId: movie.id)
             guard gen == loadGeneration, detailAlive, !Task.isCancelled else { return }
             bundle = first
+            logDetailCounts(first.detail, stage: "stage1")
             selectFirstPlayableServerIfNeeded(servers: first.detail.servers)
             isLoading = false
             warmEmbedPrefetch(detail: first.detail)
@@ -470,6 +543,7 @@ struct TVDetailView: View {
                 guard gen == loadGeneration, detailAlive, !Task.isCancelled else { return }
                 if full.servers != first.detail.servers {
                     bundle = MovieService.DetailBundle(detail: full, detailStream: first.detailStream)
+                    logDetailCounts(full, stage: "stage2")
                     selectFirstPlayableServerIfNeeded(servers: full.servers)
                 }
             }
@@ -506,6 +580,7 @@ struct TVDetailView: View {
             guard gen == loadGeneration, detailAlive, !Task.isCancelled else { return }
             recoveredId = found.id
             bundle = healed
+            logDetailCounts(healed.detail, stage: "healed")
             selectFirstPlayableServerIfNeeded(servers: healed.detail.servers)
             favorites.repairMovieId(pluginId: pluginId, from: movie.id, title: movie.title, to: found.id)
             warmEmbedPrefetch(detail: healed.detail)
@@ -543,55 +618,145 @@ struct TVDetailView: View {
     /// consumes NO embed prefetch.
     private func runBackdropPreview(detail: MovieDetail) async {
         guard previewEnabled else { return }
-        guard previewResolvedForLoad != loadGeneration else { return }
-        previewResolvedForLoad = loadGeneration
+        // Gate fix pass 2 (F-B1-R3-2): the play latch is
+        // checked FIRST among the arming gates — after a Play
+        // tap this instance never arms again, whatever key a
+        // later detail swap computes.
+        guard !playLatched else {
+            DiagLog.log("preview", "not armed outcome=play-latched")
+            return
+        }
+        // L-T12 RC-3: a manga plugin has no video to preview —
+        // never arm at all (no armed line, no dwell, no retire).
+        guard !isManga else { return }
+        // L-T12 RC-2: never arm on the stage-1 placeholder
+        // detail (its only episode is a `jtvstreams:` stub).
+        // The stage-2 swap changes the task key, which re-runs
+        // this against the final detail — and this early return
+        // does NOT consume the one attempt.
+        if detail.servers.first?.episodes.first?.id.hasPrefix("jtvstreams:") == true {
+            DiagLog.log("preview", "probe begin plugin=\(pluginId) shape=placeholder outcome=awaiting-stage2")
+            return
+        }
+        let key = "\(pluginId)|\(navId)|\(loadGeneration)|\(Self.previewFingerprint(detail))"
+        guard previewResolvedKey != key else { return }
+        previewResolvedKey = key
         DiagLog.log("preview", "armed plugin=\(pluginId)")
         try? await Task.sleep(nanoseconds: 1_500_000_000)
         guard !Task.isCancelled else { return }
         previewGeneration += 1
         let generation = previewGeneration
         guard let stream = await resolvePreviewStream(detail: detail) else {
+            // A superseded probe (Play tapped / screen left —
+            // both bump the generation) publishes and logs
+            // nothing behind the cover.
+            guard !Task.isCancelled, generation == previewGeneration else { return }
+            // Gate fix pass (F-B5): a re-keyed probe that comes
+            // back nil must CLEAR any stream published under the
+            // previous key — the old stream must not keep
+            // replaying under the new generation while the new
+            // detail has no playable preview.
+            if previewStream != nil {
+                previewStream = nil
+                DiagLog.log("preview", "cleared stale stream after re-keyed probe outcome=nil")
+            }
             DiagLog.log("preview", "retired reason=no-playable")
             return
         }
-        guard !Task.isCancelled, generation == previewGeneration else { return }
+        // Gate fix pass 2 (F-B1-R3-2): the latch is also
+        // re-checked at the publish point — a probe that was
+        // already in flight when Play was tapped publishes
+        // nothing behind the cover, even if its cancellation
+        // somehow did not land.
+        guard !Task.isCancelled, generation == previewGeneration, !playLatched else { return }
         previewStream = stream
     }
 
-    /// The cost ladder, cheapest first (NEXT-D §2.2/§3.2):
-    /// bundle.detailStream direct-media → first-episode
-    /// direct-media id → MediaFusion direct episode (via the
-    /// C1 classification route, zero network) → torrent rules
-    /// (D4: trailer first — see the note in the torrent branch;
-    /// fallback = cached-clip via the probe-only debrid entry)
-    /// → full resolveEpisode ONLY for plugin classes knowable
-    /// as direct in advance (manifest playerType native /
-    /// exoplayer). EMBED-CLASS PLUGINS ARE NEVER
-    /// preview-resolved: their outcome is .embed (unpreviewable)
-    /// and a resolve would burn the Play tap's single-consumer
-    /// embed prefetch. Streams flagged useCompatEngine or
-    /// requiresProxy keep the still (D3).
+    /// Declared quality rank on the MediaFusion scale already
+    /// used in the tree (MovieService.parseStreams): 2160/4K=4,
+    /// 1440/1080/FHD=3, 720=2, 480/SD/CAM=1, unknown=0.
+    private static func declaredQualityRank(_ text: String) -> Int {
+        let haystack = text.lowercased()
+        if haystack.contains("2160") || haystack.contains("4k") || haystack.contains("uhd") { return 4 }
+        if haystack.contains("1440") || haystack.contains("1080") || haystack.contains("fhd") { return 3 }
+        if haystack.contains("720") { return 2 }
+        if haystack.contains("480") || haystack.contains("camrip") || haystack.contains("hdcam")
+            || haystack.contains(" sd ") || haystack.hasSuffix(" sd") { return 1 }
+        return 0
+    }
+
+    /// L-T12 (1.3.1, DIAG-131-PREVIEW §6.2): the probe is
+    /// SHAPE-BASED — it mirrors resolveEpisode's own routing on
+    /// the episode id's actual shape instead of trusting the
+    /// manifest `playerType` (empty in the installed record —
+    /// RC-1). Cheapest rungs first (detailStream / episode-id
+    /// direct media, zero cost); `jtvhash:` episodes go through
+    /// `DebridResolver.resolveCachedOnly` EXACTLY as before
+    /// (cached-only — never Phase 2, never a server-side
+    /// download); every other non-manga plugin goes through the
+    /// probe-only façade `resolveEpisodeForPreview`, which runs
+    /// the real resolve machinery without consuming the Play
+    /// tap's single-consumer embed prefetch. Every rung logs a
+    /// [preview] breadcrumb (RC-5) — no silent nil paths.
+    /// Streams flagged useCompatEngine or requiresProxy keep
+    /// the still (D3), with their own named reason.
     private func resolvePreviewStream(detail: MovieDetail) async -> StreamInfo? {
-        func playable(_ stream: StreamInfo) -> StreamInfo? {
-            guard !stream.url.isEmpty, !stream.useCompatEngine, !stream.requiresProxy
-            else { return nil }
+        func playable(_ stream: StreamInfo, rung: String) -> StreamInfo? {
+            if stream.url.isEmpty {
+                DiagLog.log("preview", "probe rung=\(rung) outcome=empty-url")
+                return nil
+            }
+            if stream.useCompatEngine {
+                DiagLog.log("preview", "probe rung=\(rung) outcome=compat-engine")
+                return nil
+            }
+            if stream.requiresProxy {
+                DiagLog.log("preview", "probe rung=\(rung) outcome=requires-proxy")
+                return nil
+            }
             return stream
+        }
+        // Quality gate, stage A (owner rule 2026-11-21 17:52):
+        // a stream KNOWN from declared data (detail.quality /
+        // the episode label) to be below the floor is rejected
+        // here, before any player is built. The floor is 720p,
+        // adopted from the owner's same-evening JoeTV rule.
+        // Unknown-declared streams are decided by the measured
+        // gate in TVBackdropPreviewHost (stage B).
+        let declaredRank = max(Self.declaredQualityRank(detail.quality),
+                               Self.declaredQualityRank(detail.servers.first(where: { !$0.episodes.isEmpty })?.episodes.first?.name ?? ""))
+        if declaredRank == 1 {
+            DiagLog.log("preview", "probe rung=declared-quality outcome=low-quality rank=1")
+            return nil
         }
         // Rung 1: the detail response's own parsed stream.
         if let detailStream = bundle?.detailStream,
-           MediaURL.isDirectMedia(detailStream.url),
-           let ok = playable(detailStream) {
-            return ok
+           MediaURL.isDirectMedia(detailStream.url) {
+            DiagLog.log("preview", "probe rung=detail-stream outcome=direct-media")
+            if let ok = playable(detailStream, rung: "detail-stream") { return ok }
+        } else {
+            DiagLog.log("preview", "probe rung=detail-stream outcome=miss")
         }
         // The preview target is playFirstEpisode's target: the
         // first non-empty server's first episode.
         guard let server = detail.servers.first(where: { !$0.episodes.isEmpty }),
-              let episode = server.episodes.first else { return nil }
+              let episode = server.episodes.first else {
+            DiagLog.log("preview", "probe rung=target outcome=no-episode")
+            return nil
+        }
+        let shape = episode.id.hasPrefix("jtvhash:") ? "hash"
+            : episode.id.hasPrefix("jtvstreams:") ? "placeholder"
+            : MediaURL.isDirectMedia(episode.id) ? "direct-media"
+            : episode.id.hasPrefix("http") ? "http-page"
+            : "other"
+        DiagLog.log("preview", "probe begin plugin=\(pluginId) shape=\(shape)")
         // Rung 2: the episode id IS a direct-media URL.
         if MediaURL.isDirectMedia(episode.id) {
             let stream = StreamInfo(url: episode.id,
                                     headers: bundle?.detailStream.headers ?? [:])
-            if let ok = playable(stream) { return ok }
+            DiagLog.log("preview", "probe rung=episode-direct outcome=direct-media")
+            if let ok = playable(stream, rung: "episode-direct") { return ok }
+            return nil
         }
         let request = PlaybackRequest(
             movie: snapshotMovie(for: detail),
@@ -617,39 +782,54 @@ struct TVDetailView: View {
                 // route classifies it to .video with no network
                 // fetch (container suffix or MF credential host).
                 if let resolution = try? await service.resolveEpisode(request),
-                   case .video(let stream) = resolution,
-                   let ok = playable(stream) {
-                    return ok
+                   case .video(let stream) = resolution {
+                    DiagLog.log("preview", "probe rung=torrent-http outcome=video host=\(URL(string: stream.url)?.host ?? "?")")
+                    return playable(stream, rung: "torrent-http")
                 }
+                DiagLog.log("preview", "probe rung=torrent-http outcome=no-video")
                 return nil
             }
             if episode.id.hasPrefix("jtvhash:") {
                 // Cached-clip fallback (D5): probe-only — a
                 // preview may spend a probe, never a download.
+                // resolveCachedOnly EXACTLY as-is (L-T12).
+                // Gate fix pass (F-B1): this await runs INLINE
+                // in the dwell task, so the epoch-bump
+                // cancellation in play()/onDisappear cancels
+                // THIS task — resolveCachedOnly's
+                // between-provider Task.isCancelled checks then
+                // stop it before Play's own resolve for the
+                // same hash starts (no concurrent duplicate).
                 let hash = String(episode.id.dropFirst("jtvhash:".count))
-                if let stream = await DebridResolver.resolveCachedOnly(hash: hash),
-                   let ok = playable(stream) {
-                    return ok
+                if let stream = await DebridResolver.resolveCachedOnly(hash: hash) {
+                    DiagLog.log("preview", "probe rung=cached-only outcome=video host=\(URL(string: stream.url)?.host ?? "?")")
+                    return playable(stream, rung: "cached-only")
                 }
+                DiagLog.log("preview", "probe rung=cached-only outcome=not-cached")
+                return nil
             }
+            DiagLog.log("preview", "probe rung=torrent-shape outcome=unsupported-shape")
             return nil
         }
-        // Embed-class plugins are never preview-resolved.
-        let manifest = plugins.installedPlugin(id: pluginId)?.manifest
-        let playerType = manifest?.playerType.lowercased() ?? ""
-        if ["123av", "javhd", "avdbapi"].contains(pluginId)
-            || (manifest?.isEmbedPlayer ?? false)
-            || playerType.contains("embed") {
+        // All other non-manga plugins: the probe-only façade
+        // over the real resolve machinery (embed chain / direct
+        // / torrenthub-C1 shapes), never consuming the Play
+        // tap's prefetched embed.
+        guard let resolution = await service.resolveEpisodeForPreview(request) else {
+            DiagLog.log("preview", "probe rung=facade outcome=nil")
             return nil
         }
-        // Full resolve only when the class is knowable-direct
-        // in advance.
-        guard playerType == "native" || playerType == "exoplayer" else { return nil }
-        if let resolution = try? await service.resolveEpisode(request),
-           case .video(let stream) = resolution {
-            return playable(stream)
+        switch resolution {
+        case .video(let stream):
+            DiagLog.log("preview", "probe rung=facade outcome=video host=\(URL(string: stream.url)?.host ?? "?")")
+            return playable(stream, rung: "facade")
+        case .manga:
+            DiagLog.log("preview", "probe rung=facade outcome=manga")
+            return nil
+        case .embed:
+            DiagLog.log("preview", "probe rung=facade outcome=embed-unpreviewable")
+            return nil
         }
-        return nil
     }
 
     // MARK: Play intents (iOS §1.5, exact)
@@ -699,8 +879,25 @@ struct TVDetailView: View {
         // this load's preview superseded, so a late completion's
         // guard fails and nothing publishes behind the cover.
         previewGeneration += 1
-        previewResolvedForLoad = loadGeneration
+        previewResolvedKey = previewKey
+        // Gate fix pass 2 (F-B1-R3-2): latch the preview off
+        // for the rest of this Detail instance's life (see
+        // the playLatched declaration) — set in the same update
+        // as the generation/resolved-key disarm above, so no
+        // restarted dwell task can slip between them.
+        playLatched = true
         previewStream = nil
+        // Gate fix pass (F-B1): cancel the preview dwell/probe
+        // TASK itself on Play — the epoch bump changes its
+        // .task(id:) identity, SwiftUI cancels the superseded
+        // task, and the task cancelled is the one running the
+        // probe chain (so resolveCachedOnly's between-provider
+        // Task.isCancelled checks and the façade group's
+        // cancellation fire, and the probe cannot run
+        // concurrently with Play's own resolve for the same
+        // hash). The restarted task sees previewResolvedKey
+        // already set above and returns without re-probing.
+        previewTaskEpoch += 1
         // L-T04 probe breadcrumb P0: the tap reached Detail's
         // play entry — the hand-off to the presenter is next.
         DiagLog.log("player", "tap.received plugin=\(pluginId) episode=\(episode.id)")

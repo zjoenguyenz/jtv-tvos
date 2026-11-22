@@ -115,6 +115,43 @@ final class TVPlayerSession: ObservableObject {
     /// changes; movie/plugin/server context ride unchanged).
     @Published private(set) var currentRequest: PlaybackRequest
 
+    // MARK: Provider switch (L-T13, 1.3.1)
+
+    /// One provider switch row for a torrent (hash) title:
+    /// session-computed data ONLY (DIAG-131-SWITCH §5.2(6)) —
+    /// Models.swift stays byte-identical.
+    struct ProviderRow: Identifiable, Equatable {
+        let provider: DebridResolver.Provider
+        var state: DebridResolver.CacheState
+        var id: String { "provider-" + provider.rawValue }
+        var title: String { "\(provider.displayName) · \(state.rowLabel)" }
+    }
+
+    /// Live provider rows for the current hash title (empty for
+    /// non-torrent titles). Seeded as `.checking` at start and
+    /// published when `DebridResolver.probeAll` lands;
+    /// not-configured providers are filtered out.
+    @Published private(set) var providerRows: [ProviderRow] = []
+    /// The provider the user pinned via a provider switch, if
+    /// any. nil = the resolver's automatic pick (the default
+    /// `DebridResolver.resolve(hash:)` path, unchanged).
+    private(set) var forcedProvider: DebridResolver.Provider?
+    private var providerProbeTask: Task<Void, Never>?
+
+    /// The current title is a torrent hash title (the only
+    /// shape a provider switch can steer).
+    var isTorrentHashTitle: Bool {
+        currentRequest.pluginId == "torrenthub"
+            && currentRequest.episode.id.hasPrefix("jtvhash:")
+    }
+
+    /// Any switch surface has something to show: episode
+    /// variants beyond the current one, OR at least two
+    /// configured provider rows for a hash title.
+    var hasSwitchRows: Bool {
+        switchTargets.count > 1 || providerRows.count > 1
+    }
+
     // NEXT-B (1.3.0) reader accessors: the manga reader is a
     // child of this session and needs the service (chapter
     // resolves run INSIDE the reader, never through
@@ -216,7 +253,43 @@ final class TVPlayerSession: ObservableObject {
         pinSession.setPlaybackActive(true)
         tapDate = Date()
         DiagLog.log("player", "tap attempt=1 plugin=\(currentRequest.pluginId) server=\(currentRequest.serverName)")
+        // L-T13 §5.0 breadcrumb: the counts the next device log
+        // needs to convict the switch surfaces' inputs.
+        DiagLog.log("player", "switch.targets count=\(switchTargets.count) plugin=\(currentRequest.pluginId) episodes=\(currentRequest.allEpisodes.count) switchList=\(currentRequest.switchList.count) torrentHash=\(isTorrentHashTitle ? 1 : 0)")
+        startProviderProbeIfNeeded()
         beginAttempt(resumeTarget: currentRequest.startPosition)
+    }
+
+    /// L-T13: for a hash title, seed the provider rows as
+    /// `.checking` and probe every provider's cache state OFF
+    /// the resolve critical path (the Phase-1 probe shape —
+    /// probe-only, never a download). Rows publish when ready.
+    private func startProviderProbeIfNeeded() {
+        guard isTorrentHashTitle, providerRows.isEmpty else { return }
+        providerRows = DebridResolver.Provider.allCases.map {
+            ProviderRow(provider: $0, state: .checking)
+        }
+        // Gate fix pass (F-B2): the probe's IDENTITY — the exact
+        // episode id (hash) it was started for — is captured
+        // here and re-checked at publish time, so a completion
+        // that outlived its episode can never publish the old
+        // episode's rows onto the new one.
+        let probedEpisodeID = currentRequest.episode.id
+        let hash = String(probedEpisodeID.dropFirst("jtvhash:".count))
+        providerProbeTask?.cancel()
+        providerProbeTask = Task { [weak self] in
+            let probes = await DebridResolver.probeAll(hash: hash)
+            guard let self, !Task.isCancelled, !self.isStopped else { return }
+            guard self.currentRequest.episode.id == probedEpisodeID else {
+                DiagLog.log("player", "switch.providers dropped stale probe for superseded episode")
+                return
+            }
+            self.providerRows = probes
+                .filter { $0.state != .notConfigured }
+                .map { ProviderRow(provider: $0.provider, state: $0.state) }
+            let summary = self.providerRows.map { "\($0.provider.logToken)=\($0.state.logToken)" }.joined(separator: " ")
+            DiagLog.log("player", "switch.providers \(summary)")
+        }
     }
 
     /// Called from the cover's onDisappear: playback no longer
@@ -249,6 +322,8 @@ final class TVPlayerSession: ObservableObject {
         resolveTimeoutTask = nil
         streamxxLaneTask?.cancel()
         streamxxLaneTask = nil
+        providerProbeTask?.cancel()
+        providerProbeTask = nil
         positionProvider = nil
         subtitleApplier = nil
     }
@@ -299,10 +374,24 @@ final class TVPlayerSession: ObservableObject {
 
         DiagLog.log("player", "resolve.begin attempt=\(attempt)")
         let request = currentRequest
+        // L-T13: a user-pinned provider steers a hash title's
+        // resolve through DebridResolver.resolve(hash:provider:)
+        // ONLY; every other attempt (including the unpinned
+        // first attempt) uses the existing service path,
+        // byte-for-byte in effect.
+        let pinned = forcedProvider
+        let pinnedHash: String? = (pinned != nil && request.episode.id.hasPrefix("jtvhash:"))
+            ? String(request.episode.id.dropFirst("jtvhash:".count)) : nil
         resolveTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let resolution = try await self.service.resolveEpisode(request)
+                let resolution: PlaybackResolution
+                if let pinned, let pinnedHash {
+                    DiagLog.log("player", "resolve.provider attempt=\(attempt) provider=\(pinned.logToken)")
+                    resolution = .video(try await DebridResolver.resolve(hash: pinnedHash, provider: pinned))
+                } else {
+                    resolution = try await self.service.resolveEpisode(request)
+                }
                 self.resolveSucceeded(attempt: attempt, resolution: resolution)
             } catch {
                 self.resolveFailed(attempt: attempt, error: error)
@@ -560,6 +649,66 @@ final class TVPlayerSession: ObservableObject {
         // increments to exactly this number).
         DiagLog.log("player", "switch attempt=\(attemptID + 1) from=\(from) to=\(episode.name) captured=\(Self.seconds(captured))s")
         currentRequest.episode = episode
+        // Gate fix pass (F-B2): cancel the provider probe on
+        // EVERY episode switch — including a switch to a
+        // NON-hash episode, where startProviderProbeIfNeeded
+        // no-ops and previously never cancelled the old probe,
+        // whose completion then bled the old hash's rows into
+        // the new episode. The identity guard in the probe's
+        // completion is the second layer of the same rule.
+        providerProbeTask?.cancel()
+        providerProbeTask = nil
+        // A different EPISODE is a different hash: any provider
+        // pin belonged to the old hash's rows, so it clears and
+        // the new hash's providers are re-probed.
+        if forcedProvider != nil || !providerRows.isEmpty {
+            forcedProvider = nil
+            providerRows = []
+        }
+        startProviderProbeIfNeeded()
+        beginAttempt(resumeTarget: captured)
+    }
+
+    // MARK: Provider switching (L-T13)
+
+    /// Provider switch entry for surfaces that capture the
+    /// playhead themselves at the tap (the AV transport menu).
+    func switchProvider(to provider: DebridResolver.Provider, capturedPosition: Double?) {
+        performProviderSwitch(to: provider, captured: capturedPosition ?? captureLivePosition())
+    }
+
+    /// Provider switch entry for surfaces whose live clock the
+    /// session reads through the registered position provider
+    /// (the KS host / the SwiftUI panels).
+    func switchProvider(to provider: DebridResolver.Provider) {
+        performProviderSwitch(to: provider, captured: captureLivePosition())
+    }
+
+    /// A user-initiated provider switch: position-preserving
+    /// via the same beginAttempt machinery as an episode
+    /// switch (the shared resume rule then applies on the new
+    /// surface). The episode does NOT change — only the
+    /// provider that must serve its hash. A not-cached provider
+    /// resolves through its normal (download-capable) flow:
+    /// that is user intent, and the cached-only rule binds the
+    /// preview probe only. Failure lands on the existing
+    /// designed error slate (resolveFailed / itemFailed).
+    private func performProviderSwitch(to provider: DebridResolver.Provider, captured: Double) {
+        guard !isStopped else { return }
+        guard isTorrentHashTitle else { return }
+        guard forcedProvider != provider else { return }
+        // Gate fix pass (C-F4): a row still in .checking state
+        // is information, not a command — its probe verdict has
+        // not arrived, so pinning it would start the full
+        // (download-capable) resolve blind. No-op with a
+        // breadcrumb; every surface also disables such rows.
+        if let row = providerRows.first(where: { $0.provider == provider }),
+           row.state == .checking {
+            DiagLog.log("player", "switch.provider ignored provider=\(provider.logToken) reason=still-checking")
+            return
+        }
+        DiagLog.log("player", "switch.provider attempt=\(attemptID + 1) provider=\(provider.logToken) captured=\(Self.seconds(captured))s")
+        forcedProvider = provider
         beginAttempt(resumeTarget: captured)
     }
 

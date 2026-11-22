@@ -10,6 +10,15 @@ import SwiftUI
 /// id, exact matches hoisted. No facet/filter panel anywhere.
 /// The recent-searches contract is the iOS one exactly
 /// (survey §1.4): key `jtv_recent_searches`, max 10.
+/// L-T14 / FL-384 (1.3.1): the input surface is the app's own
+/// letter strip (TVLetterStrip below, mechanics learned from
+/// JoeTV's JoeLetterStrip) under a DISPLAY-ONLY query row —
+/// there is no native TextField on this screen, because on
+/// tvOS focusing one summons Apple's full-screen keyboard and
+/// hides the results the rounds paint until "done". Typing IS
+/// the search: every strip edit mutates `query`, and the
+/// existing .onChange → scheduleSearch() machinery runs the
+/// round exactly as before.
 
 private let recentSearchesKey = "jtv_recent_searches"
 
@@ -28,6 +37,17 @@ private extension View {
     func focusSection(if enabled: Bool) -> some View {
         modifier(TVConditionalFocusSection(enabled: enabled))
     }
+}
+
+/// Focus identity for the letter strip (L-T14): a key, whose
+/// id IS its label ("a"…"z", "1"…"0", "space", "del", "mode"),
+/// or the query row's clear affordance ("clear"). JoeTV's
+/// twin enum also carries a `.back` case for its search
+/// *layer's* Quay lại button; JTV search is a tab root with
+/// no layer to go back from, so that case is dropped
+/// (DIAG-131-SEARCH §6.2.2).
+private enum TVSearchKeyFocus: Hashable {
+    case key(String)
 }
 
 enum TVSearchText {
@@ -74,7 +94,15 @@ struct TVSearchView: View {
     @State private var isLoadingMore = false
     @State private var generation = 0
     @State private var debounceTask: Task<Void, Never>?
-    @FocusState private var fieldFocused: Bool
+    // Gate fix pass 3 (C-R4-1): the strip's mode, hoisted
+    // from TVLetterStrip's own @State so the entry
+    // .defaultFocus below can be mode-aware. The strip
+    // instance (and this state) survives Detail pushes and
+    // tab excursions, so a re-entry with nil focus can find
+    // the strip still in symbols mode — the destination must
+    // be chosen against THIS mode, not the fresh-entry one.
+    @State private var stripSymbols = false
+    @FocusState private var keyFocus: TVSearchKeyFocus?
     @FocusState private var clearHistoryFocused: Bool
 
     private var activeId: String { plugins.activePlugin?.id ?? "" }
@@ -84,10 +112,24 @@ struct TVSearchView: View {
         VStack(spacing: 0) {
             sourceBand
             fieldBand
+            letterStrip
             content
         }
         .tvThemedBackground()
-        .defaultFocus($fieldFocused, true)
+        // Gate fix pass 3 (C-R4-1): the entry default focus
+        // is mode-aware. In letters mode it stays "a" (the
+        // sensible typing start on a fresh entry). In symbols
+        // mode "a" has NO matching rendered view (the symbols
+        // set is digits + `- ' . & :`), so a surviving strip
+        // re-entered with nil focus would consult a
+        // mode-absent destination — the C1 mechanism confined
+        // to the re-entry path. "mode" is rendered outside
+        // the mode-swapped letter row and exists in BOTH
+        // modes (the same mode-persistent destination the
+        // clear action uses), so the declared destination
+        // always has a matching view for the strip's current
+        // mode.
+        .defaultFocus($keyFocus, stripSymbols ? .key("mode") : .key("a"))
         .onAppear {
             session.touch()
             recents = TVSearchText.loadRecents()
@@ -133,30 +175,83 @@ struct TVSearchView: View {
         .focusSection(if: !plugins.visiblePlugins.isEmpty)
     }
 
+    /// The query row (L-T14): DISPLAY-ONLY. It shows the query
+    /// the strip is building — never a TextField, never itself
+    /// focused as a field — in the screen's existing fieldBar
+    /// chrome. The one focusable in the row is the clear
+    /// affordance at its trailing edge (shown only while the
+    /// query is non-empty); it clears the query, and the empty
+    /// term re-arms the round machinery back to suggestions.
+    /// Recent-term recording is NOT here any more: there is no
+    /// submit in the strip model, so recording stays on the
+    /// existing result-tap hook in `content` (TVPosterGrid's
+    /// onSelect), which records a term exactly once when a
+    /// search ends in a tap — a typed-but-never-tapped term is
+    /// not recorded (DIAG-131-SEARCH §6.2.4).
     private var fieldBand: some View {
         HStack(spacing: 16) {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 26, weight: .semibold))
                 .foregroundStyle(theme.textFaint)
-            TextField("Tìm phim, truyện…", text: $query)
+            Text(query.isEmpty ? "Tìm phim, truyện…" : query)
                 .font(.system(size: 30))
-                .foregroundStyle(theme.textPrimary)
-                .focused($fieldFocused)
-                .onSubmit {
-                    TVSearchText.recordRecent(trimmedQuery)
-                    recents = TVSearchText.loadRecents()
+                .foregroundStyle(query.isEmpty ? theme.textFaint : theme.textPrimary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if !query.isEmpty {
+                Button {
+                    // Gate fix pass (C-F1): the clear button
+                    // removes ITSELF from the hierarchy in the
+                    // same update that empties the query, so the
+                    // focus destination is declared HERE, in the
+                    // same state update: focus relocates
+                    // deterministically to a strip key instead
+                    // of wherever the focus engine happens to
+                    // land.
+                    // Gate fix pass 2 (C1): the destination must
+                    // exist in the strip's CURRENT mode — "a"
+                    // does not exist in symbols mode (its set is
+                    // digits + `- ' . & :`), which left the
+                    // relocation indeterminate there. "mode" is
+                    // rendered outside the mode-swapped letter
+                    // row and is present in BOTH modes, so this
+                    // one destination is always a real view at
+                    // the moment of the clear.
+                    keyFocus = .key("mode")
+                    query = ""
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 20, weight: .semibold))
+                        Text("Xoá")
+                            .font(.system(size: 24, weight: .semibold))
+                    }
+                    .foregroundStyle(keyFocus == .key("clear") ? .black : theme.textPrimary)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 8)
+                    .background(Capsule().fill(keyFocus == .key("clear") ? theme.focusRing : .clear))
                 }
+                .tvCardButton()
+                .focused($keyFocus, equals: .key("clear"))
+            }
         }
         .padding(.horizontal, 28)
         .padding(.vertical, 20)
         .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
             .fill(theme.fieldBar))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .strokeBorder(fieldFocused ? theme.focusRing : .clear,
-                          lineWidth: fieldFocused ? theme.ringWidth : 0))
         .padding(.horizontal, 80)
         .padding(.top, 22)
         .focusSection()
+    }
+
+    /// The letter strip, directly under the query row: typing
+    /// lives here, always visible, so the grid below repaints
+    /// while the owner types (the Netflix behaviour). Its own
+    /// .focusSection() is declared inside TVLetterStrip.
+    private var letterStrip: some View {
+        TVLetterStrip(query: $query, symbols: $stripSymbols, focus: $keyFocus)
+            .padding(.horizontal, 80)
+            .padding(.top, 18)
     }
 
     // MARK: Content states
@@ -317,6 +412,97 @@ struct TVSearchView: View {
             DiagLog.log("search", "loadMore failed kind=\((error as NSError).domain)#\((error as NSError).code)")
         }
         isLoadingMore = false
+    }
+}
+
+// MARK: - Letter strip (L-T14 / FL-384)
+
+/// The on-screen letter strip, adapted from JoeTV's
+/// JoeLetterStrip (JoeSearch.swift) to JTV's theme: ONE row of
+/// real Buttons — a mode key, a space key, the letters, a
+/// delete key — mutating the bound query; the host's
+/// .onChange(of: query) fires its existing search round per
+/// settled edit, so results repaint in this same screen while
+/// typing. The native TextField it replaces summoned the
+/// full-screen system keyboard and hid the results until
+/// "done". The second mode swaps the letters for the digits
+/// and the few symbols film/manga titles carry — JoeTV's exact
+/// sets. Query mutation rules are JoeTV's too: appends capped
+/// at 48 characters, delete removes the last character.
+/// Focus movement is geometric only: the strip is one
+/// .focusSection(), no .onMoveCommand anywhere.
+private struct TVLetterStrip: View {
+    @Binding var query: String
+    // Gate fix pass 3 (C-R4-1): the mode is a binding owned
+    // by TVSearchView (was this strip's own @State) so the
+    // parent's entry .defaultFocus can be chosen against the
+    // strip's CURRENT mode — see the declaration there. The
+    // mode still persists for the strip instance's life,
+    // exactly as before; only its storage moved up one level.
+    @Binding var symbols: Bool
+    var focus: FocusState<TVSearchKeyFocus?>.Binding
+
+    private var letters: [String] {
+        symbols
+            ? ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
+               "-", "'", ".", "&", ":"]
+            : Array("abcdefghijklmnopqrstuvwxyz").map(String.init)
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            key(id: "mode", label: symbols ? "abc" : "123", width: 96) {
+                symbols.toggle()
+            }
+            key(id: "space", label: "space", width: 128) {
+                append(" ")
+            }
+            ForEach(letters, id: \.self) { letter in
+                key(id: letter, label: letter, width: 42) {
+                    append(letter)
+                }
+            }
+            key(id: "del", label: "⌫", width: 96) {
+                if !query.isEmpty { query.removeLast() }
+            }
+        }
+        .focusSection()
+    }
+
+    private func append(_ s: String) {
+        guard query.count < 48 else { return }
+        query += s
+    }
+
+    private func key(id: String, label: String, width: CGFloat,
+                     action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            TVKeyCap(label: label, width: width,
+                     focused: focus.wrappedValue == .key(id))
+        }
+        .tvCardButton()
+        .focused(focus, equals: .key(id))
+    }
+}
+
+/// One strip key's face: a quiet plate unfocused, the theme's
+/// focusRing colour filled with a black label when focused —
+/// the key paints its own focus, because the house button
+/// style (.tvCardButton()) deliberately paints nothing.
+/// Geometry follows JoeTV's JoeKeyCap: 58 pt tall, radius 12.
+private struct TVKeyCap: View {
+    let label: String
+    let width: CGFloat
+    let focused: Bool
+    @Environment(\.tvTheme) private var theme
+
+    var body: some View {
+        Text(label)
+            .font(.system(size: 28, weight: .medium))
+            .foregroundStyle(focused ? .black : theme.textPrimary)
+            .frame(width: width, height: 58)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(focused ? theme.focusRing : Color.white.opacity(0.08)))
     }
 }
 

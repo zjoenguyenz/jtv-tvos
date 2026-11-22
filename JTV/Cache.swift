@@ -91,6 +91,12 @@ enum Net {
                 // as a normal fetch and the plain body is returned.
                 return text
             } catch {
+                // L-T17/FL-385 (log-only): record the real transport
+                // error's domain+code per attempt — without this the
+                // error was reduced to lastError and thrown with no
+                // trace, so a pre-HTTP failure (DNS/TLS/reset/timeout)
+                // was indistinguishable in the device log.
+                DiagLog.log("net", "fetchText failed host=\(url.host ?? "?") attempt=\(attempt) status=\(attemptStatus) err=\((error as NSError).domain)#\((error as NSError).code)")
                 if (error as? URLError)?.code == .cancelled { throw error }
                 lastError = error
                 if (400..<500).contains(attemptStatus), attemptStatus != 429 { throw lastError }
@@ -132,6 +138,9 @@ enum Net {
                 }
                 return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
             } catch {
+                // L-T17/FL-385 (log-only): same per-attempt transport
+                // error record as fetchText (see above).
+                DiagLog.log("net", "fetchTextPOST failed host=\(url.host ?? "?") attempt=\(attempt) status=\(attemptStatus) err=\((error as NSError).domain)#\((error as NSError).code)")
                 if (error as? URLError)?.code == .cancelled { throw error }
                 lastError = error
                 if (400..<500).contains(attemptStatus), attemptStatus != 429 { throw lastError }
@@ -151,6 +160,9 @@ enum Net {
             do {
                 return try await session.data(for: makeRequest(url: url, headers: headers)).0
             } catch {
+                // L-T17/FL-385 (log-only): same per-attempt transport
+                // error record as fetchText (see above).
+                DiagLog.log("net", "fetchData failed host=\(url.host ?? "?") attempt=\(attempt) err=\((error as NSError).domain)#\((error as NSError).code)")
                 if (error as? URLError)?.code == .cancelled { throw error }
                 lastError = error
                 if attempt < 2 {
@@ -411,6 +423,11 @@ final class ImageCacheManager: @unchecked Sendable {
         // dedupe/cache semantics are unchanged.
         var lastClass = "transient"
         var lastStatus = 0
+        // L-T17/FL-385 (log-only): domain+code of the last thrown
+        // transport error, carried to the final failure line below —
+        // a thrown pre-HTTP error otherwise left status=0 with no
+        // trace of its cause (DNS/TLS/reset/timeout indistinguishable).
+        var lastErr = ""
         let backoffs: [UInt64] = [500_000_000, 1_500_000_000]
         for attempt in 0..<3 {
             do {
@@ -442,6 +459,7 @@ final class ImageCacheManager: @unchecked Sendable {
             } catch {
                 if (error as? URLError)?.code == .cancelled { return nil }
                 lastClass = "transient"
+                lastErr = "\((error as NSError).domain)#\((error as NSError).code)"
             }
             if attempt < backoffs.count {
                 try? await Task.sleep(nanoseconds: backoffs[attempt])
@@ -451,7 +469,7 @@ final class ImageCacheManager: @unchecked Sendable {
         // full URL) plus the failure class, so a dead or
         // walled image host stays diagnosable from the
         // exported log (FL-146/147/214).
-        DiagLog.log("image", "fetch failed host=\(url.host ?? "?") class=\(lastClass) status=\(lastStatus)")
+        DiagLog.log("image", "fetch failed host=\(url.host ?? "?") class=\(lastClass) status=\(lastStatus) err=\(lastErr.isEmpty ? "none" : lastErr)")
         return nil
     }
 

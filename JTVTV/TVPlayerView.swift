@@ -279,7 +279,12 @@ private struct TVPlayerSessionView: View {
             // guard. Semantics mirror TVSourcePanelView: current
             // source checked + disabled, default focus on the
             // first switchable row.
-            if session.hasSwitchTargets {
+            // L-T13 (1.3.1): for a TORRENT (hash) title the list
+            // is NOT gated on the episode count — the provider
+            // rows are the switchable sources there, and an
+            // uncached torrent's exempt-from-deadline wait is
+            // exactly when the list must exist.
+            if session.hasSwitchTargets || session.isTorrentHashTitle {
                 TVLoadingSourceListView(session: session)
                     .padding(.top, 6)
             }
@@ -330,7 +335,7 @@ private struct TVPlayerErrorView: View {
                 actionButton(.retry, title: "Thử lại", filled: false) {
                     session.retry()
                 }
-                if session.hasSwitchTargets {
+                if session.hasSwitchRows {
                     actionButton(.sources, title: "Đổi nguồn", filled: false) {
                         session.presentedPanel = .sources
                     }
@@ -404,6 +409,28 @@ private struct TVSourcePanelView: View {
                                 session.presentedPanel = nil
                             }
                         }
+                        // L-T13: provider rows (same hash,
+                        // chosen debrid provider + live cache
+                        // state) under the variant rows.
+                        if !session.providerRows.isEmpty {
+                            Text("Nguồn debrid cho file này")
+                                .font(.system(size: 24, weight: .semibold))
+                                .foregroundStyle(theme.textDim)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.top, 10)
+                            ForEach(session.providerRows) { providerRow in
+                                let isPinned = session.forcedProvider == providerRow.provider
+                                // Gate fix pass (C-F4): a
+                                // .checking provider row is not
+                                // actionable — disabled until its
+                                // probe verdict lands.
+                                row(id: providerRow.id, title: providerRow.title, checked: isPinned,
+                                    disabled: isPinned || providerRow.state == .checking) {
+                                    session.switchProvider(to: providerRow.provider)
+                                    session.presentedPanel = nil
+                                }
+                            }
+                        }
                         row(id: cancelID, title: "Huỷ", checked: false, disabled: false) {
                             session.presentedPanel = nil
                         }
@@ -425,11 +452,22 @@ private struct TVSourcePanelView: View {
     /// Default focus lands on the first switchable (enabled)
     /// target — the current episode's row is always disabled,
     /// so focusing it would strand the panel. When no other
-    /// target exists, fall back to the current episode's id.
+    /// episode target exists, the first unpinned provider row
+    /// (L-T13) takes it; last resort is the current episode.
     private var defaultTargetID: String {
-        session.switchTargets.first(where: {
+        if let episode = session.switchTargets.first(where: {
             $0.id != session.currentRequest.episode.id
-        })?.id ?? session.currentRequest.episode.id
+        }) { return episode.id }
+        // Gate fix pass (C-F4): default focus skips disabled
+        // rows — a .checking provider row is disabled, so it
+        // cannot take the panel's default focus.
+        if let providerRow = session.providerRows.first(where: {
+            session.forcedProvider != $0.provider && $0.state != .checking
+        }) { return providerRow.id }
+        // Guaranteed-enabled fallback: the Huỷ row is always
+        // present and enabled (the current episode's row is
+        // disabled, so it must never be the fallback).
+        return cancelID
     }
 
     private func row(id: String, title: String, checked: Bool, disabled: Bool,
@@ -502,6 +540,27 @@ private struct TVLoadingSourceListView: View {
                         let isCurrent = episode.id == session.currentRequest.episode.id
                         row(episode: episode, isCurrent: isCurrent)
                     }
+                    // L-T13: provider rows on the loading list
+                    // too — for a torrent title these are the
+                    // rows that make the list exist at all.
+                    if !session.providerRows.isEmpty {
+                        Text("Nguồn debrid cho file này")
+                            .font(.system(size: 23, weight: .semibold))
+                            .foregroundStyle(theme.textDim)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 8)
+                        ForEach(session.providerRows) { providerRow in
+                            providerRowView(providerRow)
+                        }
+                    }
+                    // Gate fix pass (C-F5): the guaranteed
+                    // focusable fallback row — always present,
+                    // always enabled, so the loading list can
+                    // never be focus-less even when every other
+                    // row is disabled (current episode, pinned
+                    // or .checking providers, probe filtering
+                    // every provider out).
+                    closeRow
                 }
                 .padding(.vertical, 6)
             }
@@ -511,10 +570,86 @@ private struct TVLoadingSourceListView: View {
         .defaultFocus($focusedID, defaultTargetID)
     }
 
+    /// Gate fix pass (C-F5): the loading list's fallback row
+    /// id — the close affordance below, always enabled.
+    private var closeID: String { "__close" }
+
     private var defaultTargetID: String {
-        session.switchTargets.first(where: {
+        // Gate fix pass (C-F4/C-F5): default focus = the first
+        // ENABLED row — non-current episodes are enabled;
+        // provider rows only when unpinned AND not .checking.
+        if let episode = session.switchTargets.first(where: {
             $0.id != session.currentRequest.episode.id
-        })?.id ?? session.currentRequest.episode.id
+        }) { return episode.id }
+        if let providerRow = session.providerRows.first(where: {
+            session.forcedProvider != $0.provider && $0.state != .checking
+        }) { return providerRow.id }
+        // No row is enabled: the guaranteed focusable close
+        // row takes default focus — never the disabled current
+        // episode's row.
+        return closeID
+    }
+
+    private var closeRow: some View {
+        let isFocused = focusedID == closeID
+        return Button {
+            session.dismiss()
+        } label: {
+            HStack(spacing: 16) {
+                Spacer().frame(width: 30)
+                Text("Đóng")
+                    .font(.system(size: 26, weight: .semibold))
+                    .foregroundStyle(theme.textPrimary)
+                    .lineLimit(1)
+                Spacer()
+            }
+            .padding(.horizontal, 26)
+            .padding(.vertical, 14)
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .tvCardButton()
+        .focused($focusedID, equals: closeID)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(isFocused ? Color.white.opacity(0.14) : theme.cardFill))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .strokeBorder(isFocused ? theme.focusRing : .clear,
+                          lineWidth: isFocused ? theme.ringWidth : 0))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private func providerRowView(_ providerRow: TVPlayerSession.ProviderRow) -> some View {
+        let isPinned = session.forcedProvider == providerRow.provider
+        let isFocused = focusedID == providerRow.id
+        return Button {
+            session.switchProvider(to: providerRow.provider)
+        } label: {
+            HStack(spacing: 16) {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(theme.accent)
+                    .opacity(isPinned ? 1 : 0)
+                    .frame(width: 30)
+                Text(providerRow.title)
+                    .font(.system(size: 26, weight: .semibold))
+                    .foregroundStyle(theme.textPrimary)
+                    .lineLimit(1)
+                Spacer()
+            }
+            .padding(.horizontal, 26)
+            .padding(.vertical, 14)
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .tvCardButton()
+        .focused($focusedID, equals: providerRow.id)
+        // Gate fix pass (C-F4): a .checking provider row is not
+        // actionable on the loading list either.
+        .disabled(isPinned || providerRow.state == .checking)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(isFocused ? Color.white.opacity(0.14) : theme.cardFill))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .strokeBorder(isFocused ? theme.focusRing : .clear,
+                          lineWidth: isFocused ? theme.ringWidth : 0))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     private func row(episode: Episode, isCurrent: Bool) -> some View {

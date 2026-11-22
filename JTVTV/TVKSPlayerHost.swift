@@ -57,6 +57,14 @@ final class TVKSPlayerHostViewController: UIViewController, KSPlayerLayerDelegat
     private var stream: StreamInfo?
     private var attemptID = 0
     private var session: TVPlayerSession?
+    // Gate fix pass 4 (B-R6-1): validity flag for the
+    // resume-seek completion's MainActor hop — teardown()
+    // clears it FIRST, so a seek completing after teardown
+    // no-ops instead of doing surface work on the dismantled
+    // host (the F-B-R4-1 class, mirroring TVAVPlayerHost).
+    // teardown() also nils the session reference, as a
+    // second layer for other late callbacks.
+    private var hostValid = true
 
     private var layer: KSPlayerLayer?
     /// Play/pause is commanded from this intent flag, never
@@ -92,6 +100,16 @@ final class TVKSPlayerHostViewController: UIViewController, KSPlayerLayerDelegat
     private var timeLabel: UILabel?
     private var seekBar: TVSeekBarView?
     private var barVisible = false
+    /// Gate fix pass (C-F3): the Đổi nguồn button's visibility
+    /// is LATCHED per presentation. It starts hidden and is
+    /// shown only once switchable rows exist (the initial
+    /// gating is unchanged), but once shown it is NEVER hidden
+    /// again while this host lives — one host == one
+    /// presentation (recreated per attempt via .id(attemptID))
+    /// — so a probe landing mid-browse (hasSwitchRows flipping
+    /// true → false) cannot remove the button while it holds
+    /// focus or while the controls are presented.
+    private var sourceButtonLatchedVisible = false
 
     // MARK: View lifecycle
 
@@ -175,6 +193,12 @@ final class TVKSPlayerHostViewController: UIViewController, KSPlayerLayerDelegat
     }
 
     func teardown() {
+        // Gate fix pass 4 (B-R6-1): validity cleared FIRST —
+        // a resume-seek completion already enqueued on the
+        // MainActor before the cancellations below must find
+        // the host invalid and no-op (mirroring
+        // TVAVPlayerHost.invalidate() ordering).
+        hostValid = false
         watchdogTask?.cancel()
         watchdogTask = nil
         hideTask?.cancel()
@@ -185,6 +209,12 @@ final class TVKSPlayerHostViewController: UIViewController, KSPlayerLayerDelegat
         layer?.stop()
         layer = nil
         session?.deregisterHost(attempt: attemptID)
+        // Gate fix pass 4 (B-R6-1): nil the session LAST, so
+        // any other late delegate/task callback reaching
+        // session? no-ops on the reference itself, not only
+        // on the session's attempt guards. Done last: every
+        // step above still needs the session.
+        session = nil
     }
 
     /// Creates the layer — but only once the host view has
@@ -278,6 +308,13 @@ final class TVKSPlayerHostViewController: UIViewController, KSPlayerLayerDelegat
                     layer.seek(time: target, autoPlay: false) { [weak self, weak layer] finished in
                         Task { @MainActor [weak self] in
                             guard let self else { return }
+                            // Gate fix pass 4 (B-R6-1): a seek
+                            // completing after teardown() must
+                            // not note the session, play the
+                            // dismantled layer, or touch the
+                            // controls/bar (mirrors the AV
+                            // surface's F-B-R4-1 guard).
+                            guard self.hostValid else { return }
                             self.session?.noteResumeSeek(attempt: self.attemptID,
                                                          target: target, finished: finished)
                             if finished {
@@ -699,6 +736,9 @@ final class TVKSPlayerHostViewController: UIViewController, KSPlayerLayerDelegat
         timeLabel = label
 
         let source = Self.makeBarButton(title: "Đổi nguồn")
+        // L-T13 §5.3: starts hidden; refreshBar() unhides it
+        // only when switchable rows exist.
+        source.isHidden = true
         source.addTarget(self, action: #selector(sourceTapped), for: .primaryActionTriggered)
         bar.addSubview(source)
         sourceButton = source
@@ -773,6 +813,26 @@ final class TVKSPlayerHostViewController: UIViewController, KSPlayerLayerDelegat
     }
 
     @objc private func sourceTapped() {
+        // L-T13 §5.3 (1.3.1): the KS Đổi nguồn button is gated
+        // like every other surface — with nothing to switch to
+        // it no longer opens a one-row dead panel (the panel
+        // itself carries the provider rows for hash titles).
+        // Gate fix pass 2 (C2): behaviour must match
+        // VISIBILITY. The F3 latch keeps this button visible
+        // and focusable after the probe flips hasSwitchRows to
+        // false (≤1 configured provider), so in exactly that
+        // latched state the tap must still present the source
+        // panel — populated with whatever switch rows
+        // currently exist (a single row reads as the current
+        // source) — never a silent dead tap. The guard below
+        // therefore passes when rows exist OR the button is
+        // latched visible; a hidden (never-latched, no-rows)
+        // button cannot be tapped at all, and the guard keeps
+        // that invariant if it ever were.
+        guard session?.hasSwitchRows == true || sourceButtonLatchedVisible else { return }
+        if session?.hasSwitchRows != true {
+            DiagLog.log("player", "source.tapped latched=true rows=current-only panel=sources")
+        }
         session?.presentedPanel = .sources
     }
 
@@ -782,6 +842,18 @@ final class TVKSPlayerHostViewController: UIViewController, KSPlayerLayerDelegat
 
     private func refreshBar() {
         guard let playPauseButton else { return }
+        // L-T13 §5.3: hide the Đổi nguồn button when the total
+        // switchable rows (episode variants + provider rows)
+        // are ≤ 1 — the same gate as the AV menu and the
+        // loading/error surfaces.
+        // Gate fix pass (C-F3): through the per-presentation
+        // latch — once hasSwitchRows has shown the button, a
+        // later flip (the probe publishing ≤1 configured
+        // provider) no longer hides it mid-presentation.
+        if session?.hasSwitchRows == true {
+            sourceButtonLatchedVisible = true
+        }
+        sourceButton?.isHidden = !sourceButtonLatchedVisible
         var config = playPauseButton.configuration
         config?.image = UIImage(systemName: intentPlaying ? "pause.fill" : "play.fill")
         playPauseButton.configuration = config

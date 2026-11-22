@@ -68,6 +68,65 @@ enum DebridError: LocalizedError {
 /// it to the KSPlayer (FFmpeg) surface, which opens MKV/AVI
 /// natively.
 enum DebridResolver {
+    // MARK: Provider switch types (L-T13, 1.3.1 — tvOS adaptation)
+
+    /// One debrid provider, for the in-player provider switch.
+    enum Provider: String, CaseIterable {
+        case torbox
+        case realDebrid
+        case premiumize
+
+        var displayName: String {
+            switch self {
+            case .torbox: return "TorBox"
+            case .realDebrid: return "Real-Debrid"
+            case .premiumize: return "Premiumize"
+            }
+        }
+        /// Short token used in DiagLog lines (never a credential).
+        var logToken: String {
+            switch self {
+            case .torbox: return "torbox"
+            case .realDebrid: return "rd"
+            case .premiumize: return "premiumize"
+            }
+        }
+    }
+
+    /// Live cache state of one provider for one hash.
+    enum CacheState: Equatable {
+        case checking
+        case cached
+        case notCached
+        case probeError
+        case notConfigured
+
+        var logToken: String {
+            switch self {
+            case .checking: return "checking"
+            case .cached: return "cached"
+            case .notCached: return "not-cached"
+            case .probeError: return "probe-error"
+            case .notConfigured: return "not-configured"
+            }
+        }
+        /// Row suffix for the switch surfaces (Vietnamese).
+        var rowLabel: String {
+            switch self {
+            case .checking: return "đang kiểm tra…"
+            case .cached: return "đã cache"
+            case .notCached: return "chưa cache"
+            case .probeError: return "lỗi kiểm tra"
+            case .notConfigured: return "chưa cấu hình"
+            }
+        }
+    }
+
+    struct ProviderProbe: Equatable {
+        let provider: Provider
+        let state: CacheState
+    }
+
     private static let videoExts: Set<String> = ["mkv", "mp4", "avi", "m4v", "mov", "ts", "m2ts", "wmv", "flv", "webm"]
     private static let friendlyExts: Set<String> = ["mp4", "m4v", "mov"]
     /// Server-side downloads of uncached torrents get a long but
@@ -237,12 +296,98 @@ enum DebridResolver {
         return nil
     }
 
+    /// L-T13 (1.3.1, tvOS adaptation): per-provider cache state
+    /// for one hash — the Phase-1 probe set generalised so the
+    /// player session can render provider switch rows with LIVE
+    /// state. Probe-only exactly like `resolveCachedOnly`: it
+    /// never starts a server-side download. Providers without a
+    /// configured token report `.notConfigured`.
+    static func probeAll(hash: String) async -> [ProviderProbe] {
+        let clean = hash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard clean.count >= 32 else {
+            DiagLog.log("debrid", "provider=all phase=probe-all outcome=invalid-hash")
+            return Provider.allCases.map { ProviderProbe(provider: $0, state: .probeError) }
+        }
+        var probes: [ProviderProbe] = []
+        let tb = DebridTokens.torbox, rd = DebridTokens.rd, pm = DebridTokens.premiumize
+        if tb.isEmpty {
+            probes.append(ProviderProbe(provider: .torbox, state: .notConfigured))
+        } else {
+            probes.append(ProviderProbe(provider: .torbox,
+                                        state: await torboxCacheState(hash: clean, token: tb)))
+        }
+        if Task.isCancelled { return probes }
+        if rd.isEmpty {
+            probes.append(ProviderProbe(provider: .realDebrid, state: .notConfigured))
+        } else {
+            probes.append(ProviderProbe(provider: .realDebrid,
+                                        state: await rdCacheState(hash: clean, token: rd)))
+        }
+        if Task.isCancelled { return probes }
+        if pm.isEmpty {
+            probes.append(ProviderProbe(provider: .premiumize, state: .notConfigured))
+        } else {
+            probes.append(ProviderProbe(provider: .premiumize,
+                                        state: await premiumizeCacheState(hash: clean, token: pm)))
+        }
+        let summary = probes.map { "\($0.provider.logToken)=\($0.state.logToken)" }.joined(separator: " ")
+        DiagLog.log("debrid", "provider=all phase=probe-all outcome=done \(summary)")
+        return probes
+    }
+
+    /// L-T13 (1.3.1, tvOS adaptation): provider-PINNED resolve
+    /// for a user-initiated provider switch. Runs ONLY the named
+    /// provider's flow, reusing the existing per-provider
+    /// internals — for Premiumize the cached directdl first,
+    /// then its full flow; TorBox / Real-Debrid run their own
+    /// flow (which serves both the cached and the download
+    /// case). A user pick may therefore start a server-side
+    /// download on that provider — the cached-only rule binds
+    /// the PREVIEW probe, never a user intent. The default
+    /// `resolve(hash:)` above is unchanged.
+    static func resolve(hash: String, provider: Provider) async throws -> StreamInfo {
+        let clean = hash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard clean.count >= 32 else {
+            DiagLog.log("debrid", "provider=\(provider.logToken) phase=provider-pinned outcome=invalid-hash")
+            throw DebridError.message("Mã torrent không hợp lệ.")
+        }
+        DiagLog.log("debrid", "provider=\(provider.logToken) phase=provider-pinned outcome=start")
+        switch provider {
+        case .torbox:
+            let token = DebridTokens.torbox
+            guard !token.isEmpty else { throw DebridError.noToken }
+            return try await resolveTorBox(hash: clean, token: token)
+        case .realDebrid:
+            let token = DebridTokens.rd
+            guard !token.isEmpty else { throw DebridError.noToken }
+            return try await resolveRD(hash: clean, token: token)
+        case .premiumize:
+            let token = DebridTokens.premiumize
+            guard !token.isEmpty else { throw DebridError.noToken }
+            if let hit = try? await premiumizeDirectDL(hash: clean, token: token) {
+                return hit
+            }
+            if Task.isCancelled { throw CancellationError() }
+            return try await resolvePremiumize(hash: clean, token: token,
+                                               deadline: Date().addingTimeInterval(budget))
+        }
+    }
+
     // MARK: - Cache probes
 
     /// TorBox cache check: does TorBox already hold this hash?
     /// Response shapes vary (list or dict keyed by hash), so the
     /// parse is defensive: any entry for our hash flagged cached.
     private static func torboxIsCached(hash: String, token: String) async -> Bool {
+        await torboxCacheState(hash: hash, token: token) == .cached
+    }
+
+    /// L-T13 generalisation of `torboxIsCached`: the same probe
+    /// and the same log lines, but the outcome distinguishes a
+    /// probe ERROR from a plain not-cached (the Bool wrapper
+    /// above keeps the historical Phase-1 fallback — `false`
+    /// on any failure).
+    private static func torboxCacheState(hash: String, token: String) async -> CacheState {
         let base = "https://api.torbox.app/v1/api"
         // v1.22.15 (B-2, V-14): was `try?` — a failed probe
         // returned the same `false` as "not cached". The
@@ -254,11 +399,11 @@ enum DebridResolver {
                                                "/torrents/checkcached?hash=\(hash)&format=list", form: nil)
         } catch {
             DiagLog.log("debrid", "provider=torbox phase=probe outcome=probe-error kind=\((error as NSError).domain)#\((error as NSError).code)")
-            return false
+            return .probeError
         }
         guard (response["success"] as? Bool) ?? true else {
             DiagLog.log("debrid", "provider=torbox phase=probe outcome=not-cached")
-            return false
+            return .notCached
         }
         let result: Bool
         if let list = response["data"] as? [[String: Any]] {
@@ -271,12 +416,19 @@ enum DebridResolver {
             result = false
         }
         DiagLog.log("debrid", "provider=torbox phase=probe outcome=\(result ? "hit" : "not-cached")")
-        return result
+        return result ? .cached : .notCached
     }
 
     /// Real-Debrid instant availability: a non-empty variant list
     /// for the hash means RD can serve it without downloading.
     private static func rdIsAvailable(hash: String, token: String) async -> Bool {
+        await rdCacheState(hash: hash, token: token) == .cached
+    }
+
+    /// L-T13 generalisation of `rdIsAvailable`: same probe, same
+    /// log lines, with the probe-error outcome distinguished
+    /// (the Bool wrapper keeps the historical `false` fallback).
+    private static func rdCacheState(hash: String, token: String) async -> CacheState {
         let base = "https://api.real-debrid.com/rest/1.0"
         // v1.22.15 (B-2, V-14): same `try?` distinction fix as
         // torboxIsCached — identical `false` fallback, probe
@@ -288,16 +440,36 @@ enum DebridResolver {
                                            "/torrents/instantAvailability/\(hash)", form: nil)
         } catch {
             DiagLog.log("debrid", "provider=rd phase=probe outcome=probe-error kind=\((error as NSError).domain)#\((error as NSError).code)")
-            return false
+            return .probeError
         }
         guard let entry = response[hash] as? [String: Any],
               let variants = entry["rd"] as? [[String: Any]] else {
             DiagLog.log("debrid", "provider=rd phase=probe outcome=not-cached")
-            return false
+            return .notCached
         }
         let result = variants.contains { !($0.isEmpty) }
         DiagLog.log("debrid", "provider=rd phase=probe outcome=\(result ? "hit" : "not-cached")")
-        return result
+        return result ? .cached : .notCached
+    }
+
+    /// L-T13: Premiumize's cache state — `premiumizeDirectDL`
+    /// IS the probe (it returns the final links iff cached and
+    /// throws the known not-cached message otherwise, both
+    /// already logged inside). The resolved stream is discarded
+    /// here; only the state is reported.
+    private static func premiumizeCacheState(hash: String, token: String) async -> CacheState {
+        do {
+            _ = try await premiumizeDirectDL(hash: hash, token: token)
+            return .cached
+        } catch let error as DebridError {
+            if case .message(let text) = error,
+               text == "Premiumize chưa có sẵn torrent này." {
+                return .notCached
+            }
+            return .probeError
+        } catch {
+            return .probeError
+        }
     }
 
     static func needsCompatEngine(filename: String) -> Bool {
@@ -379,6 +551,21 @@ enum DebridResolver {
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(code) else {
             DiagLog.log("debrid", "provider=rd phase=request outcome=http-error status=\(code)")
+            // L-T15 (1.3.1, log-only): the RD error BODY was
+            // discarded on this path — callers (probe /
+            // unrestrict) only ever saw domain#code, so RD's
+            // own error_code (e.g. the disabled-endpoint code
+            // behind the recurring probe 403) could never be
+            // read from a device log. One line: status + a
+            // short, single-line body excerpt. The body is
+            // RD's error payload (error / error_code fields);
+            // the bearer token travels in the request HEADER,
+            // never in a response body, so nothing secret can
+            // appear here. No behaviour change.
+            let bodyExcerpt = (String(data: data, encoding: .utf8) ?? "")
+                .replacingOccurrences(of: "\n", with: " ")
+                .prefix(160)
+            DiagLog.log("debrid", "provider=rd phase=request outcome=http-error-body status=\(code) body=\(bodyExcerpt)")
             throw DebridError.http(code, String(data: data, encoding: .utf8)?.prefix(160).description ?? "")
         }
         if data.isEmpty { return [:] }

@@ -18,6 +18,13 @@ enum MovieServiceError: Error, LocalizedError {
     }
 }
 
+/// (Removed in the 1.3.1 gate fix pass, F-B1: the preview
+/// probe's budget race is now a structured task group inside
+/// `resolveEpisodeForPreview` itself, so cancelling the
+/// façade task — or the budget winning the race — cancels
+/// the in-flight resolve chain instead of merely resuming a
+/// continuation with nil while the chain ran on orphaned.)
+
 /// Resume-once box for the cancellation-responsive pre-resolve
 /// join (gate fix pass, Round 1 on R2, Lens 2 F5a): whichever
 /// arrives first — the warm task's completion or the joining
@@ -265,7 +272,16 @@ final class MovieService: ObservableObject {
               !stage2.servers.isEmpty else { return detail }
         var resolved = detail
         resolved.servers = stage2.servers
-        return await mergeMediaFusion(pluginId: pluginId, movieId: movieId, detail: resolved)
+        // L-T13 §5.0 (1.3.1): count breadcrumb around the
+        // MediaFusion merge ONLY — servers/episodes before and
+        // after, so the next device log can convict the Lane B
+        // counts. mergeMediaFusion's behaviour is NOT changed.
+        let beforeServers = resolved.servers.count
+        let beforeEpisodes = resolved.servers.reduce(0) { $0 + $1.episodes.count }
+        let merged = await mergeMediaFusion(pluginId: pluginId, movieId: movieId, detail: resolved)
+        let afterEpisodes = merged.servers.reduce(0) { $0 + $1.episodes.count }
+        DiagLog.log("detail", "stage2.counts plugin=\(pluginId) servers=\(beforeServers)->\(merged.servers.count) episodes=\(beforeEpisodes)->\(afterEpisodes)")
+        return merged
     }
 
     /// v1.22.5: MediaFusion merge (owner request — the same
@@ -406,7 +422,83 @@ final class MovieService: ObservableObject {
         try await resolveEpisode(request, joiningPrefetch: true)
     }
 
-    private func resolveEpisode(_ request: PlaybackRequest, joiningPrefetch: Bool) async throws -> PlaybackResolution {
+    /// L-T12 (1.3.1) PROBE-ONLY façade for the Detail backdrop
+    /// preview (DIAG-131-PREVIEW §6.2). ADDITIVE: it runs the
+    /// SAME resolve machinery as `resolveEpisode` — the
+    /// existing fetch/link chain is reused as-is and no existing
+    /// function's behaviour changes — under three hard
+    /// constraints:
+    /// - it NEVER reaches `DebridResolver.resolve`: a
+    ///   `jtvhash:` target is refused outright (the caller
+    ///   routes hashes to `resolveCachedOnly` itself);
+    /// - it NEVER consumes the Play tap's single-consumer
+    ///   prefetched embed (the private chain's probeOnly flag
+    ///   skips exactly that one step, on this path only);
+    /// - for the prefetch-warm plugins (123av / javhd /
+    ///   avdbapi) it may only JOIN an in-flight warm (the join
+    ///   is non-consuming for the joiner); with no warm in
+    ///   flight it returns nil rather than burning a fresh
+    ///   chain — the 1.3.0 protection, kept for exactly the
+    ///   plugins it was written for.
+    /// Bounded at 6 s (Play's measured chains are 0.55–0.85 s;
+    /// the budget protects the backdrop, not the resolver) and
+    /// cancellation-responsive, both via the structured task
+    /// group inside (F-B1 gate fix: the group cancels the
+    /// in-flight chain, not just the wait).
+    /// Returns nil on refusal / timeout / cancellation / error;
+    /// the caller logs the per-rung outcome.
+    func resolveEpisodeForPreview(_ request: PlaybackRequest) async -> PlaybackResolution? {
+        let target = request.episode.id
+        if target.hasPrefix("jtvhash:") {
+            DiagLog.log("preview", "probe facade outcome=refused-hash plugin=\(request.pluginId)")
+            return nil
+        }
+        if request.isManga {
+            DiagLog.log("preview", "probe facade outcome=refused-manga plugin=\(request.pluginId)")
+            return nil
+        }
+        if ["123av", "javhd", "avdbapi"].contains(request.pluginId) {
+            let key = request.pluginId + "|" + target
+            guard let inFlight = inFlightPrefetch[key] else {
+                DiagLog.log("preview", "probe facade outcome=embed-unpreviewable plugin=\(request.pluginId)")
+                return nil
+            }
+            DiagLog.log("preview", "probe facade outcome=join-warm plugin=\(request.pluginId)")
+            if let shared = await Self.joinInFlightPrefetch(inFlight.task) {
+                return shared
+            }
+            if Task.isCancelled { return nil }
+            DiagLog.log("preview", "probe facade outcome=warm-failed plugin=\(request.pluginId)")
+            return nil
+        }
+        // Gate fix pass (F-B1): REAL cancellation propagation.
+        // The probe runs as a structured task group: the worker
+        // child runs the resolve chain and the budget child
+        // sleeps 6 s; whichever finishes first wins, and
+        // `group.cancelAll()` then cancels the loser — the
+        // worker included. Cancelling the CALLER's task cancels
+        // the group (structured concurrency propagates the
+        // cancellation into both children), so the chain's own
+        // cooperative checks (Net fetches, Task.isCancelled
+        // gates) actually fire. The previous shape resumed a
+        // continuation with nil from onCancel while two
+        // unstructured, handle-less Tasks ran the chain to its
+        // natural end behind the caller.
+        return await withTaskGroup(of: PlaybackResolution?.self) { group in
+            group.addTask {
+                try? await self.resolveEpisode(request, joiningPrefetch: true, probeOnly: true)
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(6))
+                return nil
+            }
+            let winner = await group.next() ?? nil
+            group.cancelAll()
+            return winner
+        }
+    }
+
+    private func resolveEpisode(_ request: PlaybackRequest, joiningPrefetch: Bool, probeOnly: Bool = false) async throws -> PlaybackResolution {
         // v1.22.15 (B-4): register the MediaFusion credential host
         // with the logger BEFORE any line below can carry an MF
         // stream URL through urlForLog. A persisted MF episode can
@@ -433,7 +525,11 @@ final class MovieService: ObservableObject {
             : MediaURL.isDirectMedia(target) ? "direct" : "embed"
         DiagLog.log("resolve", "start plugin=\(pluginId) kind=\(targetKind) target=\(DiagLog.urlForLog(target))")
 
-        if let prefetched = consumePrefetchedEmbed(pluginId: pluginId, target: target) {
+        // L-T12: the preview probe NEVER consumes the
+        // single-consumer prefetched embed — that step is
+        // skipped on the probeOnly path only; Play's path
+        // (probeOnly == false) is byte-for-byte unchanged.
+        if !probeOnly, let prefetched = consumePrefetchedEmbed(pluginId: pluginId, target: target) {
             DiagLog.log("resolve", "route=embed via=prefetched")
             return prefetched
         }
@@ -486,6 +582,14 @@ final class MovieService: ObservableObject {
         // Premiumize), flagging containers AVPlayer cannot open
         // for the KSPlayer surface.
         if target.hasPrefix("jtvhash:") {
+            // L-T12: the preview probe must never start a
+            // server-side download — the façade refuses hash
+            // targets before this point; this is the private
+            // chain's own backstop for the same rule.
+            if probeOnly {
+                DiagLog.log("resolve", "route=debrid outcome=refused-probe-only")
+                throw MovieServiceError.unresolvedEpisode
+            }
             let hash = String(target.dropFirst("jtvhash:".count))
             DiagLog.log("resolve", "route=debrid")
             return .video(try await DebridResolver.resolve(hash: hash))

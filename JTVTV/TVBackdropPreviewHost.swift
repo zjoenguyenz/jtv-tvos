@@ -145,6 +145,30 @@ struct TVBackdropPreviewHost: UIViewRepresentable {
                     case .readyToPlay:
                         self.itemReady = true
                         self.readyWatchdog?.cancel()
+                        // Quality gate, stage B (owner rule
+                        // 2026-11-21 17:52; L-T12, 1.3.1):
+                        // MEASURED quality, read HERE — at
+                        // .readyToPlay, BEFORE play() and
+                        // BEFORE any fade-in. The 720p floor
+                        // is adopted from the owner's
+                        // same-evening JoeTV rule. Below the
+                        // floor the preview retires with
+                        // reason=low-quality and the static
+                        // backdrop simply stays; nothing was
+                        // ever shown, so the retire is not
+                        // animated. An unmeasurable stream
+                        // (no video track dimensions yet)
+                        // passes — the gate only convicts a
+                        // MEASURED low quality.
+                        let measuredHeight = self.measuredVideoHeight(item: item)
+                        if let height = measuredHeight, height < 720 {
+                            DiagLog.log("preview", "quality verdict=low-quality measured-height=\(height)")
+                            self.retire(reason: "low-quality", animated: false)
+                            return
+                        }
+                        if let height = measuredHeight {
+                            DiagLog.log("preview", "quality verdict=pass measured-height=\(height)")
+                        }
                         // Ready-gated play (FL-201).
                         self.player?.play()
                         self.armCap()
@@ -187,6 +211,31 @@ struct TVBackdropPreviewHost: UIViewRepresentable {
             })
         }
 
+        /// Measured video height for the stage-B quality
+        /// gate: the video track's naturalSize (preferred
+        /// transform applied), falling back to the item's
+        /// presentationSize; the HLS variant's peak bitrate is
+        /// logged alongside as evidence. nil = unmeasurable.
+        private func measuredVideoHeight(item: AVPlayerItem) -> Int? {
+            let track = item.asset.tracks(withMediaType: .video).first
+            var height = 0
+            if let track {
+                let size = track.naturalSize.applying(track.preferredTransform)
+                height = max(height, Int(abs(size.height)))
+                let rate = track.estimatedDataRate
+                if rate.isFinite, rate > 0 {
+                    DiagLog.log("preview", "quality measured height=\(height) peakBitRate=\(Int(rate))")
+                }
+            }
+            let presented = item.presentationSize
+            if presented.height.isFinite, presented.height > 0 {
+                height = max(height, Int(presented.height))
+            }
+            if height > 0 { return height }
+            DiagLog.log("preview", "quality verdict=unknown measured-height=0")
+            return nil
+        }
+
         /// The 90 s play-once cap: at the cap the preview fades
         /// back to the still and retires (NEXT-D §3.3).
         private func armCap() {
@@ -226,6 +275,13 @@ struct TVBackdropPreviewHost: UIViewRepresentable {
             readyWatchdog = nil
             capTask?.cancel()
             capTask = nil
+            // F-B4 (gate fix pass): the deferred teardown task
+            // is cancelled here too — every other task already
+            // was; leaving retireTask alive let a second,
+            // redundant teardown fire after an external
+            // dismantle during the fade window.
+            retireTask?.cancel()
+            retireTask = nil
             statusObservation?.invalidate()
             statusObservation = nil
             timeControlObservation?.invalidate()
