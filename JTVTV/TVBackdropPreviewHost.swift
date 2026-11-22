@@ -90,6 +90,12 @@ struct TVBackdropPreviewHost: UIViewRepresentable {
         private var itemReady = false
         private var firstFrameShown = false
         private var retired = false
+        /// L-T22 (1.3.2, logging-only): the resolved URL of
+        /// the current item, kept solely so an item failure
+        /// can log a stable fingerprint of WHICH object was
+        /// refused (see the .failed branch). Never logged in
+        /// full — house style (kind + host + fingerprint).
+        private var currentURLString: String?
 
         init(onFirstFrame: @escaping () -> Void, onRetire: @escaping (String) -> Void) {
             self.onFirstFrame = onFirstFrame
@@ -102,6 +108,7 @@ struct TVBackdropPreviewHost: UIViewRepresentable {
                 retire(reason: "bad-url", animated: false)
                 return
             }
+            currentURLString = stream.url
             DiagLog.log("preview", "resolved kind=video host=\(url.host ?? "?")")
             var options: [String: Any] = [:]
             if !stream.headers.isEmpty {
@@ -175,6 +182,26 @@ struct TVBackdropPreviewHost: UIViewRepresentable {
                     case .failed:
                         let error = item.error as NSError?
                         DiagLog.log("preview", "failed kind=item domain=\(error?.domain ?? "?")#\(error?.code ?? 0)")
+                        // L-T22 (1.3.2, LOGGING-ONLY — no
+                        // behaviour change): the -1102 failures
+                        // in log_9 could not be convicted
+                        // per-title because every preview line
+                        // is host-only and the underlying error
+                        // was discarded. Log the underlying
+                        // error chain (domain#code, two levels)
+                        // plus a stable fingerprint of the
+                        // resolved URL, so the next device log
+                        // separates a mis-extracted object id
+                        // from a server-side refusal of the
+                        // correct object.
+                        var chain: [String] = []
+                        var cursor = error?.userInfo[NSUnderlyingErrorKey] as? NSError
+                        while let current = cursor, chain.count < 2 {
+                            chain.append("\(current.domain)#\(current.code)")
+                            cursor = current.userInfo[NSUnderlyingErrorKey] as? NSError
+                        }
+                        let fingerprint = self.currentURLString.map { Self.urlFingerprint($0) } ?? "-"
+                        DiagLog.log("preview", "failed.detail fp=\(fingerprint) underlying=\(chain.isEmpty ? "-" : chain.joined(separator: ","))")
                         self.retire(reason: "item-failed", animated: false)
                     default:
                         break
@@ -234,6 +261,19 @@ struct TVBackdropPreviewHost: UIViewRepresentable {
             if height > 0 { return height }
             DiagLog.log("preview", "quality verdict=unknown measured-height=0")
             return nil
+        }
+
+        /// Stable FNV-1a (32-bit) fingerprint of a URL
+        /// string — deterministic across runs (unlike
+        /// Hasher), so a device log's fp= can be matched
+        /// against an off-device fetch of the same title.
+        private static func urlFingerprint(_ value: String) -> String {
+            var hash: UInt32 = 2_166_136_261
+            for byte in value.utf8 {
+                hash ^= UInt32(byte)
+                hash = hash &* 16_777_619
+            }
+            return String(format: "%08x", hash)
         }
 
         /// The 90 s play-once cap: at the cap the preview fades

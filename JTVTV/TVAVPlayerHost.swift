@@ -46,6 +46,15 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
         private var watchdogTask: Task<Void, Never>?
         private var waitingSince: Date?
 
+        private var stallTask: Task<Void, Never>?
+        /// L-T21: seconds a mid-playback stall may persist
+        /// before the stall fast path takes the watchdog's
+        /// exit (fail the attempt → the session re-resolves
+        /// and resumes) instead of waiting out the full 30 s
+        /// watchdog. The grace only forgives stalls the
+        /// player recovers from on its own inside the window.
+        private let stallGraceSeconds = 5
+
         // Gate fix pass (F-B3/C-F2): the transport menu is a
         // snapshot of session.providerRows, so the coordinator
         // observes that ONE published property (the same
@@ -281,8 +290,11 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
             ) { [weak self] _ in
                 Task { @MainActor [weak self] in
                     // A stall is evidence, not a verdict: the
-                    // waiting-state watchdog judges it (§3.3).
+                    // waiting-state watchdog judges it (§3.3) —
+                    // and, since L-T21, the stall fast path
+                    // arms its short grace on it (noteStall).
                     DiagLog.log("player", "stall attempt=\(self?.attemptID ?? -1) surface=av")
+                    self?.noteStall()
                 }
             })
             notificationTokens.append(center.addObserver(
@@ -319,6 +331,7 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
             stopMenuRebuildTimer()
             watchdogTask?.cancel()
             watchdogTask = nil
+            cancelStallTask()
             statusObservation?.invalidate()
             statusObservation = nil
             timeControlObservation?.invalidate()
@@ -430,6 +443,15 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
 
         private func handleTimeControlStatus() {
             guard let player else { return }
+            // L-T21: playback resuming inside the grace
+            // window disarms the stall fast path — the stall
+            // recovered on its own and is not a failure. A
+            // user pause disarms it too: paused playback is
+            // never failed for stalling.
+            if player.timeControlStatus == .playing
+                || player.timeControlStatus == .paused {
+                cancelStallTask()
+            }
             // User-intent tracking for the resume-seek window
             // (Fix 2): a transition INTO .paused after the
             // status had left .paused since the seek started
@@ -467,8 +489,53 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
             failed = true
             watchdogTask?.cancel()
             watchdogTask = nil
+            cancelStallTask()
             player?.pause()
             session?.itemFailed(attempt: attemptID, errorLabel: errorLabel)
+        }
+
+        // MARK: Stall fast path (L-T21)
+
+        /// A stall AFTER first frame means the host stopped
+        /// feeding a playing item (log_9: hentaihub stalled
+        /// ~8 s into playback and never recovered; the 30 s
+        /// watchdog was the only reaction, so the viewer sat
+        /// on a frozen frame for ~31 s). Arm a short grace:
+        /// if the player is still waiting when it expires,
+        /// take the watchdog's exact exit — fail the attempt
+        /// through session.watchdogFailed, so the session's
+        /// existing retry (re-resolve + resume seek) runs
+        /// unchanged, only sooner. Pre-first-frame stalls
+        /// stay with the watchdog alone: they are load waits,
+        /// and the load path already has its own budget. A
+        /// user pause (.paused) never arms the grace.
+        private func noteStall() {
+            guard hostValid, firstFrameReported, !failed, !ended,
+                  let player, player.timeControlStatus != .paused else { return }
+            stallTask?.cancel()
+            stallTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(stallGraceSeconds))
+                guard let self, !Task.isCancelled else { return }
+                self.stallGraceExpired()
+            }
+        }
+
+        private func stallGraceExpired() {
+            stallTask = nil
+            guard hostValid, !failed, !ended, let player,
+                  player.timeControlStatus == .waitingToPlayAtSpecifiedRate else { return }
+            DiagLog.log("player", "stall.fastfail attempt=\(attemptID) surface=av waited=\(stallGraceSeconds)")
+            failed = true
+            watchdogTask?.cancel()
+            watchdogTask = nil
+            stallTask = nil
+            player.pause()
+            session?.watchdogFailed(attempt: attemptID, surface: "av", waitedSeconds: stallGraceSeconds)
+        }
+
+        private func cancelStallTask() {
+            stallTask?.cancel()
+            stallTask = nil
         }
 
         // MARK: Watchdog (FL-042)
@@ -506,6 +573,7 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
                     failed = true
                     watchdogTask?.cancel()
                     watchdogTask = nil
+                    cancelStallTask()
                     player.pause()
                     session?.watchdogFailed(attempt: attemptID, surface: "av", waitedSeconds: waited)
                 }

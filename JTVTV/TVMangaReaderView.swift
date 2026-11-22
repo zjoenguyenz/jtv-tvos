@@ -1,30 +1,42 @@
 import SwiftUI
 import UIKit
 
-/// JTV tvOS 1.3.0 (NEXT-B) — the focus-stepped manga reader.
+/// JTV tvOS manga reader — PAGE MODE (1.3.2 staging, L-T18 /
+/// FL-394). Rebuilt from the 1.3.0 stepped-window reader after
+/// the owner's device verdict: "Nó hiện là hiển thị dạng cột
+/// trang truyện như trên điện thoại nên 1 trang truyện nó sẽ
+/// ko kéo đủ trên màn hình tv." The 1.3.0 reader never actually
+/// cut anything — it rendered the whole strip as ONE image
+/// ~26,667 pt tall and jumped an offset (29 windows per strip,
+/// ~320–380 presses per chapter). The owner approved the
+/// page-mode proposal verbatim ("Làm theo cách chia trang đó").
 ///
-/// Replaces the Phase 4 placeholder for the session's `.manga`
-/// phase (sayhentai + misskon). It is a CHILD of the player
-/// session: dependencies arrive as values (the session itself —
-/// no @EnvironmentObject inside the cover subtree, L-T06 rule),
-/// chapter state lives here, and chapter switches resolve
-/// INSIDE the reader through `MovieService.resolveMangaChapter`
-/// — never through session.beginAttempt/switchSource (attempt
-/// churn would reset the cover per chapter, NEXT-B §2.1).
+/// Reading model (page mode): sayhentai "pages" are intact
+/// long strips (~720×10,000 px). At chapter load each decoded
+/// strip is SLICED into segments whose aspect matches the TV
+/// screen exactly, so every segment is one full-screen PAGE.
+/// Reading is discrete page turns: one press = one page.
+/// A background indexing pass measures every strip in the
+/// chapter (segment counts only — bitmaps are not retained
+/// beyond the reading window) so the indicator can show the
+/// page position across the whole chapter.
 ///
-/// Reading model (NEXT-B §3.2): sayhentai "pages" are intact
-/// long strips (~720×10,000 px), so reading is STEPPED, not
-/// scrolled. A strip is shown full-width in a screen-height
-/// window; one press advances the window by one screen height
-/// minus a ~15% overlap; the last window is bottom-aligned. An
-/// image that fits the screen is a single page-step.
+/// It is a CHILD of the player session: dependencies arrive
+/// as values (the session itself — no @EnvironmentObject
+/// inside the cover subtree, L-T06 rule), chapter state lives
+/// here, and chapter switches resolve INSIDE the reader
+/// through `MovieService.resolveMangaChapter` — never through
+/// session.beginAttempt/switchSource (attempt churn would
+/// reset the cover per chapter, NEXT-B §2.1).
 ///
-/// Input (NEXT-B §3.3, KS-host precedent): ONE focusable UIKit
-/// press surface. Right/Down/Select/PlayPause = forward,
-/// Left/Up = back, Menu is NEVER handled here — the cover's
-/// single Menu arbiter (FL-048) owns it, and the chapter-end
-/// bar is a session panel (`.mangaChapterEnd`) so the arbiter
-/// closes it first, exactly like the other panels.
+/// Input (KS-host precedent): ONE focusable UIKit press
+/// surface. Right/Down/Select/PlayPause = forward, Left/Up =
+/// back, Menu is NEVER handled here — the cover's single Menu
+/// arbiter (FL-048) owns it, and the chapter-end bar is a
+/// session panel (`.mangaChapterEnd`) so the arbiter closes
+/// it first, exactly like the other panels. Paging back from
+/// page 1 of a chapter loads the previous chapter and lands
+/// on its LAST page.
 ///
 /// Images render through the bucketed pipeline at bucket 1920
 /// EXPLICITLY (NEXT-B R-2: the `cachedImage(for:)` wrapper
@@ -39,16 +51,32 @@ struct TVMangaReaderView: View {
     @State private var stream: StreamInfo
     @State private var chapterList: [Episode]
     @State private var imageIndex: Int
-    @State private var windowIndex: Int = 0
+    /// Page-mode position: the segment (page) within the
+    /// current strip. A chapter position is the pair
+    /// (imageIndex, segmentIndex); the flat page number is
+    /// derived from `segmentCounts`.
+    @State private var segmentIndex: Int = 0
+
+    /// Pages per strip, filled as strips decode (position
+    /// loads + the background indexing pass). A failed strip
+    /// counts as exactly 1 page (its failure tile).
+    @State private var segmentCounts: [Int: Int] = [:]
+    /// Cropped page bitmaps near the reading position.
+    /// Crops share the source strip's pixel data; the cache
+    /// is evicted with the ±2 strip window (NEXT-B R-1
+    /// memory discipline).
+    @State private var pageCache: [String: UIImage] = [:]
 
     /// Decoded bitmaps near the reading position (current ±2).
     /// Bounded deliberately (NEXT-B R-1: one strip decodes to
     /// ~28.8 MB; the memory cache is 48–120 MB shared).
     @State private var loadedImages: [Int: UIImage] = [:]
     @State private var failedImages: Set<Int> = []
-    /// The last bitmap actually shown — held on screen while a
-    /// step's target decodes (hold-last-frame, NEXT-B §3.4).
-    @State private var lastShown: UIImage?
+    /// The last PAGE actually shown — held on screen while
+    /// the next page's strip decodes (hold-last-frame,
+    /// NEXT-B §3.4). Page mode holds the last page crop,
+    /// never the whole strip fitted into the screen.
+    @State private var lastShownPage: UIImage?
 
     @State private var isLoadingChapter = false
     /// D-1 (owner-approved deviation): a failed chapter resolve
@@ -65,19 +93,17 @@ struct TVMangaReaderView: View {
     @State private var chromeVisible = true
     @State private var chromeHideTask: Task<Void, Never>?
 
-    /// Review-gate fix (1.3.0): "land bottom-aligned when the
-    /// bitmap arrives" as EXPLICIT state, replacing the old
-    /// windowIndex = Int.max sentinel. True only while the
-    /// current image is undecoded and the reader conceptually
-    /// sits at its last window; the load completion (or a load
-    /// failure, or the user stepping away) resolves it. All
-    /// step arithmetic uses ordinary Ints only.
-    @State private var pendingBottomAlign = false
-    /// Review-gate fix (1.3.0): the chapter-resolve task is
-    /// stored so onDisappear can cancel it, and `readerAlive`
-    /// gates every post-await publish in resolveChapter — a
-    /// dismissed reader writes no history and touches no
-    /// session state.
+    /// Back-stepping into a strip whose segment count is not
+    /// known yet (never decoded, indexer has not reached it):
+    /// the intent to land on its LAST page, resolved by the
+    /// load completion the moment the count exists. Ordinary
+    /// state — no sentinel arithmetic anywhere.
+    @State private var landOnLastSegment = false
+    /// The chapter-resolve task is stored so onDisappear can
+    /// cancel it, and `readerAlive` gates every post-await
+    /// publish in resolveChapter — a dismissed reader writes
+    /// no history and touches no session state (1.3.0 gate fix,
+    /// kept verbatim in the page-mode rebuild).
     @State private var chapterTask: Task<Void, Never>?
     @State private var readerAlive = false
 
@@ -98,7 +124,8 @@ struct TVMangaReaderView: View {
         _chapterList = State(initialValue: request.allEpisodes.isEmpty
                             ? [request.episode] : request.allEpisodes)
         // Resume (P-6): the saved position is an image INDEX,
-        // clamped into the chapter (iOS MangaReaderView:134-139).
+        // clamped into the chapter (iOS MangaReaderView:134-139);
+        // page mode lands on that strip's first page.
         let start = Int(request.startPosition)
         _imageIndex = State(initialValue: initialStream.images.isEmpty
                             ? 0 : min(max(0, start), initialStream.images.count - 1))
@@ -165,24 +192,90 @@ struct TVMangaReaderView: View {
         return name
     }
 
-    // MARK: Step geometry (NEXT-B §3.2)
+    // MARK: Page geometry (page mode)
 
-    /// Displayed height of an image at full viewport width.
-    private func displayHeight(of image: UIImage) -> CGFloat {
-        guard image.size.width > 0 else { return viewportSize.height }
-        return image.size.height * (viewportSize.width / image.size.width)
+    /// Height in PIXELS of one page segment of a strip: the
+    /// segment's aspect matches the viewport aspect exactly,
+    /// so a full segment fills the screen with no letterbox.
+    private func segmentPixelHeight(for image: UIImage) -> Int {
+        guard let cg = image.cgImage, cg.width > 0,
+              viewportSize.width > 0, viewportSize.height > 0 else { return 1 }
+        let h = Int((Double(cg.width) * Double(viewportSize.height)
+                     / Double(viewportSize.width)).rounded())
+        return max(1, h)
     }
 
-    /// Windows in the current image: 1 for a screen-fitting
-    /// page; for a strip, one window per (screen height − 15%
-    /// overlap) of remaining height, last window bottom-aligned.
-    private var windowCount: Int {
-        guard let image = loadedImages[imageIndex] else { return 1 }
-        let dispH = displayHeight(of: image)
-        let screenH = viewportSize.height
-        guard dispH > screenH + 1 else { return 1 }
-        let step = screenH * 0.85
-        return Int(ceil((dispH - screenH) / step)) + 1
+    /// Pages in one decoded strip: 1 for a screen-fitting
+    /// image, ceil(height / segment height) for a strip.
+    private func segmentCount(for image: UIImage) -> Int {
+        guard let cg = image.cgImage else { return 1 }
+        let segH = segmentPixelHeight(for: image)
+        guard segH > 0 else { return 1 }
+        return max(1, (cg.height + segH - 1) / segH)
+    }
+
+    /// Known page count of a strip (nil while unmeasured).
+    private func knownCount(at idx: Int) -> Int? {
+        if let image = loadedImages[idx] { return segmentCount(for: image) }
+        return segmentCounts[idx]
+    }
+
+    /// Total pages in the chapter once every strip is
+    /// measured; nil while the indexing pass is incomplete.
+    private var totalPages: Int? {
+        guard segmentCounts.count == stream.images.count else { return nil }
+        return segmentCounts.values.reduce(0, +)
+    }
+
+    /// Flat 1-based page number of the current position
+    /// across the chapter; nil while an earlier strip is
+    /// still unmeasured.
+    private var flatPageNumber: Int? {
+        var sum = segmentIndex + 1
+        for idx in 0..<imageIndex {
+            guard let count = segmentCounts[idx] else { return nil }
+            sum += count
+        }
+        return sum
+    }
+
+    private var pageIndicatorText: String {
+        if let flat = flatPageNumber, let total = totalPages {
+            return "Trang \(flat)/\(total)"
+        }
+        if let count = knownCount(at: imageIndex) {
+            return "Trang \(segmentIndex + 1)/\(count) • Ảnh \(imageIndex + 1)/\(max(stream.images.count, 1))"
+        }
+        return "Ảnh \(imageIndex + 1)/\(max(stream.images.count, 1))"
+    }
+
+    /// The current page's bitmap: a crop of the current
+    /// strip, cached per (strip, segment). Cropping shares
+    /// the strip's pixel data — no re-encode, no copy of the
+    /// full bitmap. READ-ONLY: this is called from the view
+    /// body, so it never writes state — the load task stores
+    /// crops into `pageCache` explicitly (storePage).
+    private func pageImage(at idx: Int, segment: Int) -> UIImage? {
+        let key = "\(idx):\(segment)"
+        if let hit = pageCache[key] { return hit }
+        guard let image = loadedImages[idx], let cg = image.cgImage else { return nil }
+        let segH = segmentPixelHeight(for: image)
+        let y = segment * segH
+        guard y < cg.height else { return nil }
+        let rect = CGRect(x: 0, y: y, width: cg.width,
+                          height: min(segH, cg.height - y))
+        guard let crop = cg.cropping(to: rect) else { return nil }
+        return UIImage(cgImage: crop, scale: image.scale,
+                       orientation: image.imageOrientation)
+    }
+
+    /// Stores the (idx, segment) crop into the page cache
+    /// and returns it — called only from load tasks, never
+    /// from the view body.
+    private func storePage(at idx: Int, segment: Int) -> UIImage? {
+        guard let page = pageImage(at: idx, segment: segment) else { return nil }
+        pageCache["\(idx):\(segment)"] = page
+        return page
     }
 
     // MARK: Body
@@ -201,10 +294,9 @@ struct TVMangaReaderView: View {
             if session.presentedPanel == .mangaChapterEnd {
                 chapterEndBar
             }
-            // Review-gate fix (1.3.0): the loading indicator
-            // renders ABOVE the chapter-end bar's dim (it sat
-            // under it before), so a chapter resolve in flight
-            // is visible.
+            // The loading indicator renders ABOVE the
+            // chapter-end bar's dim, so a chapter resolve in
+            // flight is visible (1.3.0 gate fix, kept).
             if isLoadingChapter {
                 ProgressView()
                     .tint(.white)
@@ -233,14 +325,17 @@ struct TVMangaReaderView: View {
             // The reader's own designed flush (B1) — synchronous,
             // while the reader is still the live surface.
             saveProgress(force: true)
-            // Review-gate fix (1.3.0): from here the reader is
-            // dead — cancel the chapter task and close the
-            // alive gate so no post-await publish can land.
+            // From here the reader is dead — cancel the chapter
+            // task and close the alive gate so no post-await
+            // publish can land (1.3.0 gate fix, kept).
             chapterTask?.cancel()
             chapterTask = nil
             readerAlive = false
         }
         .task { await healChapterListIfNeeded() }
+        .task(id: currentEpisode.id) {
+            await indexChapterSizes()
+        }
         .task(id: "\(currentEpisode.id)|\(imageIndex)") {
             await loadCurrentAndWarm()
         }
@@ -264,10 +359,19 @@ struct TVMangaReaderView: View {
     private var pageLayer: some View {
         GeometryReader { geo in
             ZStack {
-                if let image = loadedImages[imageIndex] {
-                    stripOrPage(image: image, size: geo.size)
+                if let page = pageImage(at: imageIndex, segment: segmentIndex) {
+                    // One page, full width. A full segment's
+                    // aspect IS the screen aspect, so it fills
+                    // the screen exactly; the tail segment of a
+                    // strip is shorter and centres on black.
+                    Image(uiImage: page)
+                        .resizable()
+                        .frame(width: geo.size.width,
+                               height: geo.size.width * page.size.height
+                                   / max(page.size.width, 1))
+                        .frame(width: geo.size.width, height: geo.size.height)
                 } else if failedImages.contains(imageIndex) {
-                    // A dead page never traps stepping (NEXT-B
+                    // A dead page never traps paging (NEXT-B
                     // §3.4): the failure tile shows, presses
                     // still move on.
                     Rectangle()
@@ -277,13 +381,16 @@ struct TVMangaReaderView: View {
                                 .font(.system(size: 54))
                                 .foregroundStyle(theme.textFaint)
                         }
-                } else if let lastShown {
-                    // Hold-last-frame: the previous bitmap stays
-                    // up (whole, fitted) while the step target
-                    // decodes — never a black flash.
-                    Image(uiImage: lastShown)
+                } else if let lastShownPage {
+                    // Hold-last-frame: the previous PAGE stays
+                    // up (full width, as a page) while the
+                    // target strip decodes — never a black
+                    // flash, never the whole strip fitted in.
+                    Image(uiImage: lastShownPage)
                         .resizable()
-                        .aspectRatio(contentMode: .fit)
+                        .frame(width: geo.size.width,
+                               height: geo.size.width * lastShownPage.size.height
+                                   / max(lastShownPage.size.width, 1))
                         .frame(width: geo.size.width, height: geo.size.height)
                 } else {
                     ProgressView()
@@ -293,32 +400,23 @@ struct TVMangaReaderView: View {
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .onAppear { viewportSize = geo.size }
-            .onChange(of: geo.size) { _, newSize in viewportSize = newSize }
+            .onChange(of: geo.size) { _, newSize in
+                // Segment geometry is derived from the viewport
+                // aspect; a real change invalidates every
+                // measured count and crop (in practice the TV
+                // viewport is constant 1920×1080).
+                if newSize.width > 0, newSize.height > 0,
+                   abs(newSize.width / newSize.height
+                       - viewportSize.width / max(viewportSize.height, 1)) > 0.001 {
+                    segmentCounts = [:]
+                    pageCache = [:]
+                    segmentIndex = 0
+                    Task { await indexChapterSizes() }
+                }
+                viewportSize = newSize
+            }
         }
         .ignoresSafeArea()
-    }
-
-    @ViewBuilder
-    private func stripOrPage(image: UIImage, size: CGSize) -> some View {
-        let dispH = displayHeight(of: image)
-        if dispH <= size.height + 1 {
-            Image(uiImage: image)
-                .resizable()
-                .frame(width: size.width, height: dispH)
-                .frame(width: size.width, height: size.height)
-        } else {
-            let step = size.height * 0.85
-            let maxTop = dispH - size.height
-            let top = min(CGFloat(windowIndex) * step, maxTop)
-            ZStack {
-                Image(uiImage: image)
-                    .resizable()
-                    .frame(width: size.width, height: dispH)
-                    .offset(y: -top)
-            }
-            .frame(width: size.width, height: size.height)
-            .clipped()
-        }
     }
 
     // MARK: Chrome (D-2)
@@ -330,7 +428,7 @@ struct TVMangaReaderView: View {
                     .font(.system(size: 28, weight: .bold))
                     .foregroundStyle(theme.textPrimary)
                     .lineLimit(1)
-                Text("Chap \(chapterDisplayName) • Trang \(min(imageIndex + 1, max(stream.images.count, 1)))/\(stream.images.count) • ◂ ▸ để lật trang")
+                Text("Chap \(chapterDisplayName) • \(pageIndicatorText) • ◂ ▸ để lật trang")
                     .font(.system(size: 22))
                     .foregroundStyle(theme.textDim)
             }
@@ -368,11 +466,11 @@ struct TVMangaReaderView: View {
                     .multilineTextAlignment(.center)
                 HStack(spacing: 18) {
                     if isLoadingChapter {
-                        // Review-gate fix (1.3.0): while a
-                        // chapter resolve is in flight the bar
-                        // keeps a FOCUSABLE, INERT landing, so
-                        // focus is never stranded on a bar whose
-                        // buttons are all disabled.
+                        // While a chapter resolve is in flight
+                        // the bar keeps a FOCUSABLE, INERT
+                        // landing, so focus is never stranded
+                        // on a bar whose buttons are all
+                        // disabled (1.3.0 gate fix, kept).
                         loadingFocusPad
                     } else {
                         barButton(.prev, title: previousChapterTitle, enabled: canGoPrevious) {
@@ -411,10 +509,10 @@ struct TVMangaReaderView: View {
         .defaultFocus($barFocus, barDefaultFocus)
     }
 
-    /// Review-gate fix (1.3.0): default focus is the first
-    /// ENABLED target in the order Next → Retry → Prev → Đóng —
-    /// never a disabled button. While loading, the inert
-    /// loading pad is the landing.
+    /// Default focus is the first ENABLED target in the order
+    /// Next → Retry → Prev → Đóng — never a disabled button.
+    /// While loading, the inert loading pad is the landing.
+    /// (1.3.0 gate fix, kept verbatim.)
     private var barDefaultFocus: BarButton {
         if isLoadingChapter { return .loading }
         if canGoNext { return .next }
@@ -465,37 +563,23 @@ struct TVMangaReaderView: View {
         .disabled(!enabled || isLoadingChapter)
     }
 
-    // MARK: Stepping
+    // MARK: Paging
 
-    // Stepping is a total function of (imageIndex, windowIndex,
-    // pendingBottomAlign) with ordinary Ints only — the old
-    // Int.max sentinel is gone (review-gate fix, 1.3.0).
-    // pendingBottomAlign == true means: the current image is
-    // undecoded and the reader conceptually sits at its LAST
-    // window (windowIndex stays 0 until the bitmap lands and
-    // the completion assigns the real last window).
+    // Paging is a total function of (imageIndex, segmentIndex,
+    // landOnLastSegment) with ordinary Ints only. While the
+    // current strip is neither decoded nor failed, presses
+    // are ignored — the hold/spinner surface is up and the
+    // decode lands momentarily (prefetch keeps it warm).
 
     private func stepForward() {
         guard !isLoadingChapter else { return }
-        if pendingBottomAlign {
-            // Conceptually at the bottom of an undecoded image:
-            // forward leaves it for the next image's top (or
-            // the chapter end). The bottom-align intent is
-            // consumed by leaving.
-            pendingBottomAlign = false
-            if imageIndex + 1 < stream.images.count {
-                imageIndex += 1
-                windowIndex = 0
-            } else {
-                session.presentedPanel = .mangaChapterEnd
-            }
-            return
-        }
-        if windowIndex + 1 < windowCount {
-            windowIndex += 1
+        guard loadedImages[imageIndex] != nil || failedImages.contains(imageIndex)
+        else { return }
+        if segmentIndex + 1 < (knownCount(at: imageIndex) ?? 1) {
+            segmentIndex += 1
         } else if imageIndex + 1 < stream.images.count {
             imageIndex += 1
-            windowIndex = 0
+            segmentIndex = 0
         } else {
             // Chapter end: no auto-advance (iOS requires an
             // explicit pill tap, P-8) — present the bar as a
@@ -506,49 +590,50 @@ struct TVMangaReaderView: View {
 
     private func stepBack() {
         guard !isLoadingChapter else { return }
-        if pendingBottomAlign {
-            // Conceptually at the bottom of an undecoded image:
-            // back leaves it for the previous image's bottom.
-            if imageIndex > 0 {
-                moveToPreviousImageBottom()
-            }
-            return
-        }
-        if windowIndex > 0 {
-            windowIndex -= 1
+        guard loadedImages[imageIndex] != nil || failedImages.contains(imageIndex)
+        else { return }
+        if segmentIndex > 0 {
+            segmentIndex -= 1
         } else if imageIndex > 0 {
-            moveToPreviousImageBottom()
+            moveToPreviousStripLastPage()
+        } else if canGoPrevious {
+            // Page 1 of the chapter: paging up crosses into
+            // the previous chapter and lands on its LAST page
+            // (owner-approved page-mode behaviour, L-T18).
+            let target = orderedEpisodes[currentPosition - 1]
+            startChapterTask(target, landAtEnd: true)
         }
     }
 
-    /// Lands on the previous image's last window: immediately
-    /// when its bitmap is already decoded; otherwise as a
-    /// pending bottom-align intent the load completion (or a
-    /// load failure, which clears it) resolves.
-    private func moveToPreviousImageBottom() {
+    /// Lands on the previous strip's last page: immediately
+    /// when its count is already known; otherwise as a
+    /// pending last-page intent the load completion resolves
+    /// the moment the strip decodes.
+    private func moveToPreviousStripLastPage() {
         imageIndex -= 1
-        windowIndex = 0
-        if loadedImages[imageIndex] != nil {
-            windowIndex = windowCount - 1
-            pendingBottomAlign = false
+        segmentIndex = 0
+        if let count = knownCount(at: imageIndex) {
+            segmentIndex = count - 1
+            landOnLastSegment = false
         } else {
-            pendingBottomAlign = true
+            landOnLastSegment = true
         }
     }
 
     // MARK: Image loading + prefetch (NEXT-B §3.4)
 
-    /// Loads the current image at bucket 1920, then warms the
-    /// next one at the same bucket and prefetches the next 3
-    /// (iOS's window, P-4) with the chapter headers. A load
-    /// failure marks the image failed but never traps stepping.
+    /// Loads the current strip at bucket 1920, records its
+    /// page count, resolves a pending last-page landing, then
+    /// warms the next strip at the same bucket and prefetches
+    /// the next 3 (iOS's window, P-4) with the chapter
+    /// headers. A load failure marks the strip failed (one
+    /// page: its tile) but never traps paging.
     private func loadCurrentAndWarm() async {
-        // Review-gate fix (1.3.0): every post-await mutation is
-        // guarded — the task must not be cancelled AND the
-        // captured (episodeId, idx) must still be the reader's
-        // current position. A superseded completion writes
-        // NOTHING (no loadedImages/failedImages/lastShown
-        // writes, no eviction).
+        // Every post-await mutation is guarded — the task
+        // must not be cancelled AND the captured (episodeId,
+        // idx) must still be the reader's current position.
+        // A superseded completion writes NOTHING (1.3.0 gate
+        // fix, kept).
         let episodeId = currentEpisode.id
         let idx = imageIndex
         let images = stream.images
@@ -557,47 +642,101 @@ struct TVMangaReaderView: View {
         func stillCurrent() -> Bool {
             !Task.isCancelled && currentEpisode.id == episodeId && imageIndex == idx
         }
-        if loadedImages[idx] == nil {
+        if loadedImages[idx] == nil && !failedImages.contains(idx) {
             let image = await ImageCacheManager.shared.loadImage(
                 urlString: images[idx], headers: headers, bucket: 1920)
             guard stillCurrent() else { return }
             if let image {
                 loadedImages[idx] = image
-                lastShown = image
-                if pendingBottomAlign {
-                    // The bitmap landed: assign the real last
-                    // window and consume the intent.
-                    windowIndex = windowCount - 1
-                    pendingBottomAlign = false
+                segmentCounts[idx] = segmentCount(for: image)
+                if landOnLastSegment {
+                    segmentIndex = (segmentCounts[idx] ?? 1) - 1
+                    landOnLastSegment = false
+                }
+                if let count = segmentCounts[idx], segmentIndex >= count {
+                    segmentIndex = count - 1
+                }
+                if let page = storePage(at: idx, segment: segmentIndex) {
+                    lastShownPage = page
                 }
             } else {
                 failedImages.insert(idx)
-                // A failed load also clears the pending
-                // bottom-align intent (ordinary state, no
-                // sentinel left behind).
-                if pendingBottomAlign { pendingBottomAlign = false }
+                segmentCounts[idx] = 1
+                segmentIndex = 0
+                landOnLastSegment = false
             }
-        } else {
-            lastShown = loadedImages[idx]
+        } else if loadedImages[idx] != nil {
+            if segmentCounts[idx] == nil, let image = loadedImages[idx] {
+                segmentCounts[idx] = segmentCount(for: image)
+            }
+            if let page = storePage(at: idx, segment: segmentIndex) {
+                lastShownPage = page
+            }
         }
-        // Evict far bitmaps (R-1 memory discipline).
+        // Evict far bitmaps + their crops (R-1 discipline).
         loadedImages = loadedImages.filter { abs($0.key - idx) <= 2 }
+        pageCache = pageCache.filter { entry in
+            guard let strip = Int(entry.key.split(separator: ":").first ?? "") else { return false }
+            return abs(strip - idx) <= 2
+        }
         // Prefetch the next 3 with the chapter headers (P-4)…
         let upcoming = Array(images.dropFirst(idx + 1).prefix(3))
         if !upcoming.isEmpty {
             ImageCacheManager.shared.prefetch(urlStrings: upcoming, headers: headers)
         }
-        // …and warm image+1 directly at bucket 1920 so the next
-        // step's bitmap is memory-warm, not just disk-warm. Its
-        // write is guarded the same way.
+        // …and warm image+1 directly at bucket 1920 so the
+        // next strip's bitmap is memory-warm, not just
+        // disk-warm; its page count is recorded on the way.
         let next = idx + 1
-        if images.indices.contains(next), loadedImages[next] == nil {
+        if images.indices.contains(next), loadedImages[next] == nil,
+           !failedImages.contains(next) {
             let image = await ImageCacheManager.shared.loadImage(
                 urlString: images[next], headers: headers, bucket: 1920)
             guard stillCurrent() else { return }
             if let image {
                 loadedImages[next] = image
+                if segmentCounts[next] == nil {
+                    segmentCounts[next] = segmentCount(for: image)
+                }
             }
+        }
+    }
+
+    /// Background indexing pass: measures every strip in the
+    /// chapter ONCE (through the same bucket-1920 pipeline —
+    /// in-flight loads dedupe inside the pipeline, and the
+    /// disk tier makes later reads cheap) and records only
+    /// the page COUNT. Bitmaps are never retained here; the
+    /// reading window (±2) is owned by loadCurrentAndWarm.
+    /// Runs sequentially so a chapter never bursts.
+    private func indexChapterSizes() async {
+        let episodeId = currentEpisode.id
+        let images = stream.images
+        let headers = stream.headers
+        for idx in images.indices {
+            if Task.isCancelled || !readerAlive || currentEpisode.id != episodeId { return }
+            if segmentCounts[idx] != nil { continue }
+            if failedImages.contains(idx) {
+                segmentCounts[idx] = 1
+                continue
+            }
+            if let image = loadedImages[idx] {
+                segmentCounts[idx] = segmentCount(for: image)
+                continue
+            }
+            let image = await ImageCacheManager.shared.loadImage(
+                urlString: images[idx], headers: headers, bucket: 1920)
+            guard !Task.isCancelled, readerAlive, currentEpisode.id == episodeId
+            else { return }
+            if let image {
+                segmentCounts[idx] = segmentCount(for: image)
+            } else {
+                failedImages.insert(idx)
+                segmentCounts[idx] = 1
+            }
+        }
+        if currentEpisode.id == episodeId, let total = totalPages {
+            DiagLog.log("manga", "indexed images=\(images.count) pages=\(total)")
         }
     }
 
@@ -609,36 +748,53 @@ struct TVMangaReaderView: View {
         startChapterTask(orderedEpisodes[target])
     }
 
-    /// Review-gate fix (1.3.0): the chapter-resolve task is
-    /// stored in @State (a new tap supersedes the old one) and
-    /// cancelled in onDisappear.
-    private func startChapterTask(_ episode: Episode) {
+    /// The chapter-resolve task is stored in @State (a new
+    /// tap supersedes the old one) and cancelled in
+    /// onDisappear (1.3.0 gate fix, kept).
+    private func startChapterTask(_ episode: Episode, landAtEnd: Bool = false) {
         chapterTask?.cancel()
-        chapterTask = Task { await resolveChapter(episode) }
+        chapterTask = Task { await resolveChapter(episode, landAtEnd: landAtEnd) }
     }
 
-    private func resolveChapter(_ episode: Episode) async {
+    private func resolveChapter(_ episode: Episode, landAtEnd: Bool = false) async {
         pendingTarget = episode
         isLoadingChapter = true
         do {
             let resolved = try await session.mangaService.resolveMangaChapter(
                 pluginId: request.pluginId, episode: episode)
-            // Review-gate fix (1.3.0): a dismissed or superseded
-            // reader publishes NOTHING — no state mutation, no
-            // history write, no session-panel or chrome touch.
+            // A dismissed or superseded reader publishes
+            // NOTHING — no state mutation, no history write,
+            // no session-panel or chrome touch (1.3.0 gate
+            // fix, kept).
             guard readerAlive, !Task.isCancelled else { return }
-            isLoadingChapter = false
             let from = currentEpisode.name
             currentEpisode = episode
             stream = resolved
             imageIndex = 0
-            windowIndex = 0
-            pendingBottomAlign = false
+            segmentIndex = 0
+            landOnLastSegment = false
             loadedImages = [:]
             failedImages = []
+            segmentCounts = [:]
+            pageCache = [:]
+            lastShownPage = nil
             chapterError = false
             pendingTarget = nil
             session.presentedPanel = nil
+            if landAtEnd {
+                // Page-mode chapter crossing (L-T18): measure
+                // the whole chapter first, then land on its
+                // very last page. isLoadingChapter stays up
+                // (paging is gated) until the landing is set.
+                await indexChapterSizes()
+                guard readerAlive, !Task.isCancelled,
+                      currentEpisode.id == episode.id else { return }
+                if !resolved.images.isEmpty {
+                    imageIndex = resolved.images.count - 1
+                    segmentIndex = (segmentCounts[imageIndex] ?? 1) - 1
+                }
+            }
+            isLoadingChapter = false
             saveProgress(force: true)
             showChrome()
             DiagLog.log("manga", "chapter from=\(from) to=\(episode.name) images=\(resolved.images.count)")
@@ -674,10 +830,10 @@ struct TVMangaReaderView: View {
             }
         }
         guard let detail else { return }
-        // Gate fix pass (Round 1 on R2, Lens 2 F4): the final
-        // publish below — and its heal log line — get the same
-        // alive/cancellation guard as resolveChapter's paths:
-        // a reader dismissed mid-heal writes nothing.
+        // The final publish — and its heal log line — get the
+        // same alive/cancellation guard as resolveChapter's
+        // paths: a reader dismissed mid-heal writes nothing
+        // (gate fix, kept).
         guard readerAlive, !Task.isCancelled else { return }
         let server = detail.servers.first { $0.name == request.serverName }
             ?? detail.servers.first { srv in srv.episodes.contains { $0.id == currentEpisode.id } }
@@ -695,6 +851,8 @@ struct TVMangaReaderView: View {
     /// count, streamURL = "". Written on imageIndex change and
     /// force-written on disappear (the session's flushHistory
     /// is seconds-shaped and must never see manga indices).
+    /// Page mode keeps this shape: resume lands on the saved
+    /// strip's first page.
     private func saveProgress(force: Bool = false) {
         let record = HistoryRecord(
             pluginId: request.pluginId,

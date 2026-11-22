@@ -190,12 +190,14 @@ struct TVDetailView: View {
                             resumeBanner(record: record, detail: detail)
                                 .focusSection()
                         }
-                        metaBlock(detail)
+                        if hasVisibleMeta(detail) {
+                            metaBlock(detail)
+                        }
                         if !detail.description.isEmpty {
                             descBlock(detail)
                                 .focusSection()
                         }
-                        if !detail.castNames.isEmpty {
+                        if !visibleCastNames(detail).isEmpty {
                             castsBlock(detail)
                                 .focusSection()
                         }
@@ -371,6 +373,32 @@ struct TVDetailView: View {
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
+    /// L-T19 / FL-403 (owner ruling 2026-11-22): a metadata
+    /// value that is raw markdown-link text must never reach
+    /// the screen. missav's plugin formats linked fields as
+    /// "[name](/vi/…)" (plugin parseMovieDetail), and the
+    /// detail model carries those strings verbatim — printed
+    /// as-is they spill over the whole screen (owner photo:
+    /// the Thể loại row, the Đạo diễn row and every Diễn viên
+    /// chip). The owner's ruling: remove those blocks
+    /// ("dẹp bỏ cái chỗ thể loại này ở missav — những chỗ nào
+    /// bị như vậy thì bỏ đi"). Suppression is by VALUE, so it
+    /// removes exactly the sprawl and nothing else: clean
+    /// values from the other plugins keep rendering exactly
+    /// as the approved Phase 2 detail design draws them.
+    private func isRawLinkSprawl(_ value: String) -> Bool {
+        value.contains("](")
+    }
+
+    private func hasVisibleMeta(_ detail: MovieDetail) -> Bool {
+        [detail.episode_current, detail.category, detail.country, detail.director]
+            .contains { !$0.isEmpty && !isRawLinkSprawl($0) }
+    }
+
+    private func visibleCastNames(_ detail: MovieDetail) -> [String] {
+        detail.castNames.filter { !isRawLinkSprawl($0) }
+    }
+
     private func metaBlock(_ detail: MovieDetail) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             metaRow("Tiến độ", detail.episode_current)
@@ -382,7 +410,7 @@ struct TVDetailView: View {
 
     @ViewBuilder
     private func metaRow(_ label: String, _ value: String) -> some View {
-        if !value.isEmpty {
+        if !value.isEmpty, !isRawLinkSprawl(value) {
             HStack(alignment: .top, spacing: 20) {
                 Text(label)
                     .font(.system(size: 26))
@@ -423,7 +451,7 @@ struct TVDetailView: View {
             TVSectionHeader(title: "Diễn viên")
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(spacing: 16) {
-                    ForEach(detail.castNames, id: \.self) { name in
+                    ForEach(visibleCastNames(detail), id: \.self) { name in
                         TVChip(title: name, selected: false) {
                             navPushSearch(name)
                         }

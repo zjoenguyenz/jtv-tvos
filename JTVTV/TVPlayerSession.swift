@@ -522,7 +522,9 @@ final class TVPlayerSession: ObservableObject {
                 self.streamxxLaneFailed(attempt: attempt, reason: "fetch")
                 return
             }
-            guard let mediaURL = Self.streamxxMediaURL(from: page) else {
+            let extraction = Self.streamxxMediaURL(from: page)
+            guard let mediaURL = extraction.url else {
+                DiagLog.log("player", "streamxx-lane parse-detail \(extraction.diagnostics) pageBytes=\(page.utf8.count)")
                 self.streamxxLaneFailed(attempt: attempt, reason: "parse")
                 return
             }
@@ -557,37 +559,89 @@ final class TVPlayerSession: ObservableObject {
         }
     }
 
-    /// Extracts the playable MP4 URL from the player page's
-    /// inline EMBED_CONFIG. Accepts only an https URL on a
-    /// Backblaze B2 host whose path ends in .mp4 (the study's
-    /// validation rule); anything else is a parse failure.
-    private static func streamxxMediaURL(from page: String) -> URL? {
-        for key in ["hls_url", "storage_url"] {
-            guard let raw = embedConfigValue(in: page, key: key),
-                  let url = URL(string: raw),
-                  url.scheme == "https",
-                  let host = url.host, host.contains("backblazeb2.com"),
-                  url.path.lowercased().hasSuffix(".mp4") else { continue }
-            return url
+    /// Extracts the playable media URL from the player
+    /// page's inline EMBED_CONFIG. L-T10 hardening (1.3.2):
+    /// the 1.3.0 rule (FIRST occurrence of hls_url/storage_url
+    /// only, https + Backblaze-B2 host + .mp4 suffix or
+    /// nothing) failed on device (log_9: reason=parse) on a
+    /// title whose VM-fetched page had the standard shape —
+    /// the device-served page evidently varies in a dimension
+    /// the old gates rejected, and iOS has no such gates at
+    /// all (it lets the page's own JS read the config). The
+    /// scan now: starts at the EMBED_CONFIG block, walks the
+    /// key ladder hls_url → storage_url → cdn_streaming_url →
+    /// cdn_embed_url, tries EVERY assignment of each key, and
+    /// accepts any https URL whose path ends in .mp4 (first
+    /// preference, the proven B2 shape) or .m3u8 (fallback) —
+    /// the KS surface remains the playback boundary, not a
+    /// host allowlist. On failure the returned diagnostics
+    /// name, per key, what was found (host + suffix class),
+    /// so the next device log convicts the exact gate.
+    private static func streamxxMediaURL(from page: String) -> (url: URL?, diagnostics: String) {
+        let region: String
+        if let cfg = page.range(of: "EMBED_CONFIG") {
+            region = String(page[cfg.lowerBound...])
+        } else {
+            region = page
         }
-        return nil
+        var diag: [String] = []
+        var hlsCandidate: URL?
+        for key in ["hls_url", "storage_url", "cdn_streaming_url", "cdn_embed_url"] {
+            let values = embedConfigValues(in: region, key: key)
+            var found = "absent"
+            for raw in values {
+                guard let url = URL(string: raw), url.scheme == "https",
+                      let host = url.host else { continue }
+                let path = url.path.lowercased()
+                if path.hasSuffix(".mp4") {
+                    return (url, "")
+                }
+                if path.hasSuffix(".m3u8") {
+                    found = "\(host)/m3u8"
+                    if hlsCandidate == nil { hlsCandidate = url }
+                } else {
+                    found = "\(host)/other"
+                }
+            }
+            diag.append("\(key)=\(found)")
+        }
+        if let hlsCandidate {
+            return (hlsCandidate, "")
+        }
+        return (nil, diag.joined(separator: " "))
     }
 
-    /// Reads one `"key": "value"` string out of the page's
-    /// EMBED_CONFIG block (plain string scan — no JS, no JSON
-    /// parse of the whole page, whose other fields are not
-    /// guaranteed JSON-clean). `\/` escapes are unescaped.
-    private static func embedConfigValue(in page: String, key: String) -> String? {
-        guard let keyRange = page.range(of: "\"\(key)\"") else { return nil }
-        let rest = page[keyRange.upperBound...]
-        guard let colon = rest.firstIndex(of: ":") else { return nil }
-        let afterColon = rest[rest.index(after: colon)...]
-        guard let open = afterColon.firstIndex(of: "\"") else { return nil }
-        let valueStart = afterColon.index(after: open)
-        guard let close = afterColon[valueStart...].firstIndex(of: "\"") else { return nil }
-        let raw = String(afterColon[valueStart..<close])
-        let value = raw.replacingOccurrences(of: "\\/", with: "/")
-        return value.isEmpty ? nil : value
+    /// Every string value assigned to `key` in the page, in
+    /// page order (plain string scan — no JS, no JSON parse
+    /// of the whole page, whose other fields are not
+    /// guaranteed JSON-clean). Tolerates quoted or bare keys;
+    /// a null / non-string assignment is skipped rather than
+    /// swallowing the next quoted token (the old single-value
+    /// reader's corruption shape). `\/` escapes are
+    /// unescaped.
+    private static func embedConfigValues(in page: String, key: String) -> [String] {
+        var values: [String] = []
+        var cursor = page.startIndex
+        while let hit = page.range(of: key, range: cursor..<page.endIndex) {
+            cursor = hit.upperBound
+            var i = hit.upperBound
+            while i < page.endIndex, page[i] == "\"" || page[i] == " " || page[i] == "\t" {
+                i = page.index(after: i)
+            }
+            guard i < page.endIndex, page[i] == ":" else { continue }
+            i = page.index(after: i)
+            while i < page.endIndex, page[i] == " " || page[i] == "\t" || page[i] == "\n" || page[i] == "\r" {
+                i = page.index(after: i)
+            }
+            guard i < page.endIndex, page[i] == "\"" else { continue }
+            let start = page.index(after: i)
+            guard let close = page.range(of: "\"", range: start..<page.endIndex) else { break }
+            let raw = String(page[start..<close.lowerBound])
+            let value = raw.replacingOccurrences(of: "\\/", with: "/")
+            if !value.isEmpty { values.append(value) }
+            cursor = close.upperBound
+        }
+        return values
     }
 
     private func resolveFailed(attempt: Int, error: Error) {
