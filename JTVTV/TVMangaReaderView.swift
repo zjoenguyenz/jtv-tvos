@@ -13,13 +13,23 @@ import UIKit
 ///
 /// Reading model (page mode): sayhentai "pages" are intact
 /// long strips (~720×10,000 px). At chapter load each decoded
-/// strip is SLICED into segments whose aspect matches the TV
-/// screen exactly, so every segment is one full-screen PAGE.
+/// strip is planned into PAGES of at most one screen height.
 /// Reading is discrete page turns: one press = one page.
 /// A background indexing pass measures every strip in the
-/// chapter (segment counts only — bitmaps are not retained
+/// chapter (page counts only — bitmaps are not retained
 /// beyond the reading window) so the indicator can show the
 /// page position across the whole chapter.
+///
+/// 1.3.3 (L-T27 / FL-412, owner-approved method A′): WHERE the
+/// cuts land is now content-aware — TVMangaPagePlanner packs
+/// whole inter-gutter segments per page and cuts at panel
+/// gutters, sub-cutting only segments that alone exceed a
+/// screen; discrete images (the misskon shape) stay whole as
+/// one page. The 1.3.2 fixed-ratio cuts guillotined panels
+/// and speech bubbles (owner's device verdict) — the planner
+/// degrades to exactly those fixed cuts when no gutter is
+/// found, never worse. The page-turn frame itself (discrete
+/// turns, Trang X/Y, chapter chaining) is unchanged.
 ///
 /// It is a CHILD of the player session: dependencies arrive
 /// as values (the session itself — no @EnvironmentObject
@@ -61,6 +71,16 @@ struct TVMangaReaderView: View {
     /// loads + the background indexing pass). A failed strip
     /// counts as exactly 1 page (its failure tile).
     @State private var segmentCounts: [Int: Int] = [:]
+    /// The per-strip page plan (crop rects in pixel space)
+    /// behind `segmentCounts` — computed once per strip at
+    /// decode time by TVMangaPagePlanner (1.3.3, L-T27).
+    /// Invariant: wherever a count is recorded from a decoded
+    /// image, the plan is recorded in the same update. Plans
+    /// are a few dozen small integers per strip, so — unlike
+    /// the bitmaps — they are NOT evicted with the ±2 reading
+    /// window; they live and die with `segmentCounts`
+    /// (chapter scope, viewport change).
+    @State private var pagePlans: [Int: [TVMangaPageRect]] = [:]
     /// Cropped page bitmaps near the reading position.
     /// Crops share the source strip's pixel data; the cache
     /// is evicted with the ±2 strip window (NEXT-B R-1
@@ -205,18 +225,27 @@ struct TVMangaReaderView: View {
         return max(1, h)
     }
 
-    /// Pages in one decoded strip: 1 for a screen-fitting
-    /// image, ceil(height / segment height) for a strip.
-    private func segmentCount(for image: UIImage) -> Int {
-        guard let cg = image.cgImage else { return 1 }
-        let segH = segmentPixelHeight(for: image)
-        guard segH > 0 else { return 1 }
-        return max(1, (cg.height + segH - 1) / segH)
+    /// Computes and records a decoded strip's page plan and
+    /// its page count (1.3.3, L-T27): the planner decides the
+    /// cuts by the image's data shape — whole for a discrete
+    /// image, gutter-snapped for a tall strip, fixed cuts as
+    /// the degradation floor. Runs at decode time inside the
+    /// load tasks, never in the view body.
+    private func recordPlan(idx: Int, image: UIImage) {
+        guard let cg = image.cgImage else {
+            pagePlans[idx] = [TVMangaPageRect(y: 0, height: 1)]
+            segmentCounts[idx] = 1
+            return
+        }
+        let plan = TVMangaPagePlanner.plan(
+            cgImage: cg, segmentHeight: segmentPixelHeight(for: image))
+        pagePlans[idx] = plan
+        segmentCounts[idx] = plan.count
     }
 
     /// Known page count of a strip (nil while unmeasured).
     private func knownCount(at idx: Int) -> Int? {
-        if let image = loadedImages[idx] { return segmentCount(for: image) }
+        if let plan = pagePlans[idx] { return plan.count }
         return segmentCounts[idx]
     }
 
@@ -259,11 +288,23 @@ struct TVMangaReaderView: View {
         let key = "\(idx):\(segment)"
         if let hit = pageCache[key] { return hit }
         guard let image = loadedImages[idx], let cg = image.cgImage else { return nil }
-        let segH = segmentPixelHeight(for: image)
-        let y = segment * segH
-        guard y < cg.height else { return nil }
-        let rect = CGRect(x: 0, y: y, width: cg.width,
+        let rect: CGRect
+        if let plan = pagePlans[idx], plan.indices.contains(segment) {
+            // 1.3.3 (L-T27): the planner's crop — a whole
+            // discrete image, a gutter-packed page, or a
+            // sub-cut of an over-tall segment.
+            let page = plan[segment]
+            rect = CGRect(x: 0, y: page.y, width: cg.width, height: page.height)
+        } else {
+            // The plan is recorded with every decode, so this
+            // is a defensive path only: the pre-1.3.3 fixed
+            // geometry.
+            let segH = segmentPixelHeight(for: image)
+            let y = segment * segH
+            guard y < cg.height else { return nil }
+            rect = CGRect(x: 0, y: y, width: cg.width,
                           height: min(segH, cg.height - y))
+        }
         guard let crop = cg.cropping(to: rect) else { return nil }
         return UIImage(cgImage: crop, scale: image.scale,
                        orientation: image.imageOrientation)
@@ -360,15 +401,17 @@ struct TVMangaReaderView: View {
         GeometryReader { geo in
             ZStack {
                 if let page = pageImage(at: imageIndex, segment: segmentIndex) {
-                    // One page, full width. A full segment's
-                    // aspect IS the screen aspect, so it fills
-                    // the screen exactly; the tail segment of a
-                    // strip is shorter and centres on black.
+                    // One page, aspect-fitted to the screen. A
+                    // full strip page's aspect IS the screen
+                    // aspect, so it fills the screen exactly
+                    // (identical to the 1.3.2 rendering); a
+                    // shorter page centres on black; a whole
+                    // DISCRETE image (1.3.3, L-T27) is taller
+                    // than the screen aspect and fits by
+                    // height, whole — it is never sliced.
                     Image(uiImage: page)
                         .resizable()
-                        .frame(width: geo.size.width,
-                               height: geo.size.width * page.size.height
-                                   / max(page.size.width, 1))
+                        .aspectRatio(contentMode: .fit)
                         .frame(width: geo.size.width, height: geo.size.height)
                 } else if failedImages.contains(imageIndex) {
                     // A dead page never traps paging (NEXT-B
@@ -383,14 +426,13 @@ struct TVMangaReaderView: View {
                         }
                 } else if let lastShownPage {
                     // Hold-last-frame: the previous PAGE stays
-                    // up (full width, as a page) while the
-                    // target strip decodes — never a black
-                    // flash, never the whole strip fitted in.
+                    // up (as a page, aspect-fitted like the
+                    // live page) while the target strip decodes
+                    // — never a black flash, never the whole
+                    // strip fitted in.
                     Image(uiImage: lastShownPage)
                         .resizable()
-                        .frame(width: geo.size.width,
-                               height: geo.size.width * lastShownPage.size.height
-                                   / max(lastShownPage.size.width, 1))
+                        .aspectRatio(contentMode: .fit)
                         .frame(width: geo.size.width, height: geo.size.height)
                 } else {
                     ProgressView()
@@ -409,6 +451,7 @@ struct TVMangaReaderView: View {
                    abs(newSize.width / newSize.height
                        - viewportSize.width / max(viewportSize.height, 1)) > 0.001 {
                     segmentCounts = [:]
+                    pagePlans = [:]
                     pageCache = [:]
                     segmentIndex = 0
                     Task { await indexChapterSizes() }
@@ -648,7 +691,7 @@ struct TVMangaReaderView: View {
             guard stillCurrent() else { return }
             if let image {
                 loadedImages[idx] = image
-                segmentCounts[idx] = segmentCount(for: image)
+                recordPlan(idx: idx, image: image)
                 if landOnLastSegment {
                     segmentIndex = (segmentCounts[idx] ?? 1) - 1
                     landOnLastSegment = false
@@ -661,13 +704,21 @@ struct TVMangaReaderView: View {
                 }
             } else {
                 failedImages.insert(idx)
+                // Gate fix (Round 1, Lens B F-B2): the count
+                // and the plan are a pair — a failure that
+                // resets the count to 1 must also drop any
+                // plan recorded earlier for this strip, or
+                // knownCount (plan-preferred) and the
+                // count-based totals disagree and phantom
+                // pages appear on the failure tile.
+                pagePlans[idx] = nil
                 segmentCounts[idx] = 1
                 segmentIndex = 0
                 landOnLastSegment = false
             }
         } else if loadedImages[idx] != nil {
             if segmentCounts[idx] == nil, let image = loadedImages[idx] {
-                segmentCounts[idx] = segmentCount(for: image)
+                recordPlan(idx: idx, image: image)
             }
             if let page = storePage(at: idx, segment: segmentIndex) {
                 lastShownPage = page
@@ -696,7 +747,7 @@ struct TVMangaReaderView: View {
             if let image {
                 loadedImages[next] = image
                 if segmentCounts[next] == nil {
-                    segmentCounts[next] = segmentCount(for: image)
+                    recordPlan(idx: next, image: image)
                 }
             }
         }
@@ -717,11 +768,12 @@ struct TVMangaReaderView: View {
             if Task.isCancelled || !readerAlive || currentEpisode.id != episodeId { return }
             if segmentCounts[idx] != nil { continue }
             if failedImages.contains(idx) {
+                pagePlans[idx] = nil
                 segmentCounts[idx] = 1
                 continue
             }
             if let image = loadedImages[idx] {
-                segmentCounts[idx] = segmentCount(for: image)
+                recordPlan(idx: idx, image: image)
                 continue
             }
             let image = await ImageCacheManager.shared.loadImage(
@@ -729,9 +781,10 @@ struct TVMangaReaderView: View {
             guard !Task.isCancelled, readerAlive, currentEpisode.id == episodeId
             else { return }
             if let image {
-                segmentCounts[idx] = segmentCount(for: image)
+                recordPlan(idx: idx, image: image)
             } else {
                 failedImages.insert(idx)
+                pagePlans[idx] = nil
                 segmentCounts[idx] = 1
             }
         }
@@ -776,6 +829,7 @@ struct TVMangaReaderView: View {
             loadedImages = [:]
             failedImages = []
             segmentCounts = [:]
+            pagePlans = [:]
             pageCache = [:]
             lastShownPage = nil
             chapterError = false

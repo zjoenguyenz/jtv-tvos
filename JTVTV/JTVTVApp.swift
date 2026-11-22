@@ -14,9 +14,14 @@ import SwiftUI
 ///   shows directly.
 /// • The moment the app leaves the active state a cover
 ///   replaces content, so the tvOS app-switcher snapshot never
-///   shows content; on return to the foreground the idle
-///   re-lock rule (15 minutes, see PinSession) is applied
-///   before anything else renders.
+///   shows content; when the app reaches the background the
+///   session locks immediately (L-T28, owner ruling
+///   2026-11-22): on return the gate is shown and waits for
+///   the code — no flash-and-admit. A merely transient
+///   inactive (Control Center, Siri) covers without locking,
+///   so an interruption never kills playback (gate fix,
+///   Round 1, Lens B F-B3). The 15-minute idle rule (see
+///   PinSession) remains as the in-foreground backup layer.
 ///
 /// tvOS is landscape-native: there is deliberately NO
 /// orientation machinery here (the iOS app's orientation lock
@@ -80,8 +85,13 @@ private struct RootContainerView: View {
             switch phase {
             case .active:
                 session.appDidBecomeActive()
-            case .inactive, .background:
+            case .inactive:
+                // Cover only — a transient interruption must
+                // not lock (Lens B F-B3).
                 session.appWillResignActive()
+            case .background:
+                // Truly left the foreground: lock (L-T28).
+                session.appDidEnterBackground()
             @unknown default:
                 break
             }

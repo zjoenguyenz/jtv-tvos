@@ -65,16 +65,30 @@ enum PinVerifier {
 //   keeps touching the clock, so a two-hour film never falls
 //   back to the gate mid-watch. Later phases call `touch()` /
 //   `setPlaybackActive(_:)` from their own surfaces.
-/// • Re-lock rule (owner-set, 15 minutes): on return to the
-///   foreground AND on a repeating 30 s in-foreground check, if
+/// • Re-lock rules (owner-set): (1) ENTERING THE BACKGROUND
+///   locks IMMEDIATELY (L-T28, owner ruling 2026-11-22: this
+///   is an 18+ app — backing out to Home and returning must
+///   meet the gate again, never a panel flash followed by
+///   silent admission, which is what the idle-only rule
+///   produced). The lock is keyed to .background, NOT to
+///   .inactive (gate fix, Round 1, Lens B F-B3): a transient
+///   inactive — Control Center, Siri, a switcher peek —
+///   never reaches .background, so it covers but does NOT
+///   lock and does NOT tear down playback; an exit to Home
+///   always passes through .background, where the lock
+///   engages while the cover is already up, so the return
+///   still meets a locked gate with no flash. (2) the
+///   15-minute idle rule below remains as the in-foreground
+///   backup: on a repeating 30 s check, if
 ///   now − lastActivity ≥ 15 min and nothing is playing, the
 ///   session locks. Cold start is always locked (the initial
 ///   value below), regardless of the clock.
-/// • Snapshot cover: `isCovered` flips the moment the app leaves
-///   the active state, so the tvOS app-switcher snapshot shows
-///   the cover, never content. Covering is NOT locking: on
-///   return, the idle rule decides whether the gate is required
-///   or the shell simply reappears.
+/// • Snapshot cover: `isCovered` flips the moment the app
+///   leaves the active state, so the tvOS app-switcher
+///   snapshot shows the cover, never content — and because
+///   the cover rises at .inactive, before the .background
+///   lock, no frame of any return can show the shell before
+///   the gate.
 /// • When no PIN is configured in the build
 ///   (`BundledSecrets.pinConfigured == false` — the
 ///   secrets-absent build state) the session is permanently
@@ -149,11 +163,11 @@ final class PinSession: ObservableObject {
         startIdleMonitoring()
     }
 
-    func lock() {
+    func lock(reason: String = "idle rule") {
         guard BundledSecrets.pinConfigured else { return }
         guard isUnlocked else { return }
         isUnlocked = false
-        DiagLog.log("gate", "session locked (idle or background rule)")
+        DiagLog.log("gate", "session locked (\(reason))")
     }
 
     // MARK: Idle rule
@@ -184,18 +198,34 @@ final class PinSession: ObservableObject {
 
     // MARK: Scene phase (driven by JTVTVApp's root container)
 
-    /// The app is leaving the active state: cover FIRST, so the
-    /// snapshot tvOS takes can never show content. The activity
-    /// clock is deliberately NOT refreshed here — time away
-    /// counts toward the idle rule on return.
+    /// The app is leaving the active state (.inactive):
+    /// cover ONLY, so the snapshot tvOS takes can never show
+    /// content. No lock here (gate fix, Round 1, Lens B
+    /// F-B3): .inactive also fires for transient interruptions
+    /// (Control Center, Siri, a switcher peek) that never
+    /// leave the foreground — those must not lock the session
+    /// or tear down playback. A real exit continues to
+    /// .background, which locks (below).
     func appWillResignActive() {
         isCovered = true
     }
 
-    /// Back in the foreground: drop the cover, then apply the
-    /// idle re-lock rule before anything else renders. Playback
-    /// still counts as activity, so a return during playback
-    /// just refreshes the clock.
+    /// The app has entered the background: it has truly LEFT
+    /// the foreground (an exit to Home always lands here), so
+    /// LOCK now (L-T28) — the cover is already up from the
+    /// .inactive step, and the session locks while away, so
+    /// the gate on return WAITS for the code; there is no
+    /// flash-and-admit path.
+    func appDidEnterBackground() {
+        isCovered = true
+        lock(reason: "left foreground")
+    }
+
+    /// Back in the foreground: drop the cover. A session that
+    /// reached the background is already locked (the gate
+    /// shows); a session returning from a transient inactive
+    /// was never locked and simply resumes — with the idle
+    /// rule applied before anything else renders.
     func appDidBecomeActive() {
         isCovered = false
         if playbackActive {

@@ -138,6 +138,59 @@ final class TVPlayerSession: ObservableObject {
     private(set) var forcedProvider: DebridResolver.Provider?
     private var providerProbeTask: Task<Void, Never>?
 
+    // MARK: Auto source selection (L-T23, 1.3.3) — javhd
+
+    /// Measured scores from attempt 1's selection pass
+    /// (episode id → resolve + first-byte milliseconds). An
+    /// auto-switch may only ever target a source measured
+    /// here: the owner's rule is "switch to a MEASURED-better
+    /// source", never to an unmeasured guess.
+    private var measuredSourceScores: [String: Int] = [:]
+    /// Auto selection is live for this session: a javhd title
+    /// started on the default pick, measured at attempt 1.
+    private var autoSourceMode = false
+    /// Any manual source/provider pick by the viewer disables
+    /// every automatic source action for the rest of the
+    /// session — the viewer's choice is respected absolutely.
+    private var manualSourceChosen = false
+    /// Episodes that already had an attempt this session; an
+    /// auto-switch never revisits one.
+    private var triedSourceIDs: Set<String> = []
+    /// Set by start() when attempt 1's resolve must run the
+    /// measurement pass; consumed by the first beginAttempt.
+    private var autoMeasurePending = false
+    /// Gate fix (Round 1, Lens C C-1): whether this session
+    /// was started on the detail's DEFAULT pick — decided by
+    /// TVDetailView (the first non-empty server's first
+    /// episode, the Play button's target) and handed over via
+    /// TVAutoMeasureArming + TVPlayerView.init, because
+    /// PlaybackRequest is shared core and must not grow a
+    /// TV-only field. The session itself cannot derive it:
+    /// the request's allEpisodes is the STARTED server's list
+    /// whichever server that was, so an episode-id comparison
+    /// cannot tell a default start from a deliberate pick of
+    /// another server's first episode.
+    private let autoMeasureArmed: Bool
+    /// Auto-switches performed this session (hard cap — no
+    /// ping-ponging between sources).
+    private var autoSwitchCount = 0
+
+    /// Candidates measured per selection pass (serial — the
+    /// plugin engine serialises JS per plugin, so a parallel
+    /// race would measure queue wait, not source speed).
+    private static let autoMeasureCandidateCap = 5
+    /// Wall-clock ceiling for the whole measurement pass,
+    /// checked between candidates; a single candidate is
+    /// bounded by the core chains' own budgets and by the
+    /// session's existing 45 s resolve deadline.
+    private static let autoMeasureTotalBudget: TimeInterval = 10
+    /// Score penalty when a resolved URL refuses the
+    /// first-byte probe (some hosts reject Range requests
+    /// but still play): the candidate stays eligible, ranked
+    /// behind every cleanly probed one at equal resolve time.
+    private static let autoProbePenaltyMs = 3000
+    private static let autoSwitchCap = 2
+
     /// The current title is a torrent hash title (the only
     /// shape a provider switch can steer).
     var isTorrentHashTitle: Bool {
@@ -229,6 +282,7 @@ final class TVPlayerSession: ObservableObject {
          service: MovieService,
          history: WatchHistoryManager,
          pinSession: PinSession,
+         autoMeasureArmed: Bool,
          onDismiss: @escaping () -> Void) {
         // L-T04 probe breadcrumbs P2/P3: bracket session
         // construction (the shared segment's first hand-off).
@@ -237,6 +291,7 @@ final class TVPlayerSession: ObservableObject {
         self.service = service
         self.history = history
         self.pinSession = pinSession
+        self.autoMeasureArmed = autoMeasureArmed
         self.onDismiss = onDismiss
         DiagLog.log("player", "session.init.done")
     }
@@ -256,6 +311,20 @@ final class TVPlayerSession: ObservableObject {
         // L-T13 §5.0 breadcrumb: the counts the next device log
         // needs to convict the switch surfaces' inputs.
         DiagLog.log("player", "switch.targets count=\(switchTargets.count) plugin=\(currentRequest.pluginId) episodes=\(currentRequest.allEpisodes.count) switchList=\(currentRequest.switchList.count) torrentHash=\(isTorrentHashTitle ? 1 : 0)")
+        // L-T23 (1.3.3): measured auto-selection arms for a
+        // javhd session started on the detail's DEFAULT pick
+        // (autoMeasureArmed — Detail arms only the Play
+        // button's target, the first non-empty server's first
+        // episode) when alternative sources exist. A session
+        // started on any other episode — a chip tap on another
+        // server, a history resume on another server — is the
+        // viewer's deliberate pick: never measured, never
+        // overridden (gate Round 1, Lens C C-1).
+        autoMeasurePending = autoMeasureArmed
+            && currentRequest.pluginId == "javhd"
+            && !autoSourceCandidates().isEmpty
+        autoSourceMode = autoMeasurePending
+        triedSourceIDs.insert(currentRequest.episode.id)
         startProviderProbeIfNeeded()
         beginAttempt(resumeTarget: currentRequest.startPosition)
     }
@@ -382,6 +451,13 @@ final class TVPlayerSession: ObservableObject {
         let pinned = forcedProvider
         let pinnedHash: String? = (pinned != nil && request.episode.id.hasPrefix("jtvhash:"))
             ? String(request.episode.id.dropFirst("jtvhash:".count)) : nil
+        // L-T23 (1.3.3): attempt 1 of an auto-selection
+        // session resolves through the measurement pass
+        // instead (its winner's resolution is reused — no
+        // double resolve). Consumed here so retries and
+        // switches always take the plain path.
+        let measure = autoMeasurePending
+        autoMeasurePending = false
         resolveTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -389,6 +465,15 @@ final class TVPlayerSession: ObservableObject {
                 if let pinned, let pinnedHash {
                     DiagLog.log("player", "resolve.provider attempt=\(attempt) provider=\(pinned.logToken)")
                     resolution = .video(try await DebridResolver.resolve(hash: pinnedHash, provider: pinned))
+                } else if measure {
+                    // A nil return means the pass found itself
+                    // superseded mid-measurement (gate Round 1,
+                    // Lens B F-B1): the session has moved on to
+                    // a newer attempt, so this task ends
+                    // silently — no publish, no failure slate.
+                    guard let measured = try await self.resolveWithMeasurement(attempt: attempt)
+                    else { return }
+                    resolution = measured
                 } else {
                     resolution = try await self.service.resolveEpisode(request)
                 }
@@ -425,6 +510,166 @@ final class TVPlayerSession: ObservableObject {
                     errorLabel: "player#timeout"))
             }
         }
+    }
+
+    // MARK: Measured source selection (L-T23, 1.3.3)
+
+    /// The alternative sources for auto selection, in
+    /// measurement-priority order: the request's switchList
+    /// as built by Detail for javhd (other servers' first
+    /// episodes — the family representatives — then the
+    /// current server's other mirrors, then the rest),
+    /// deduped, the started episode excluded.
+    private func autoSourceCandidates() -> [Episode] {
+        var seen: Set<String> = [currentRequest.episode.id]
+        var result: [Episode] = []
+        for episode in currentRequest.switchList
+        where seen.insert(episode.id).inserted {
+            result.append(episode)
+        }
+        return result
+    }
+
+    /// Attempt 1's resolve for an auto-selection session:
+    /// measure the candidates SERIALLY (the plugin engine
+    /// serialises JS per plugin — a parallel race would time
+    /// the queue, not the sources), score each by resolve
+    /// time + first-byte time of its resolved URL, and return
+    /// the best candidate's resolution for the attempt to
+    /// play. The resolve machinery itself is only ever CALLED
+    /// (MovieService.resolveEpisode), never modified. A
+    /// candidate that errors, resolves to a non-video shape
+    /// (an embed cannot be probed and would slate anyway), or
+    /// falls outside the total budget is simply unmeasured —
+    /// and unmeasured sources are never auto-selected. If
+    /// every candidate fails, the started candidate's own
+    /// error is thrown, so the attempt lands on exactly the
+    /// failure path a plain resolve would have produced.
+    ///
+    /// Gate fix (Round 1, Lens B F-B1): the pass QUIESCES
+    /// the moment its attempt is superseded (a switch, retry
+    /// or dismiss bumps attemptID and cancels this task). The
+    /// validity check runs at every candidate boundary, after
+    /// every await, and in the error path; a superseded pass
+    /// returns nil at once — it issues no further resolves
+    /// through the serialised plugin engine (which would
+    /// contend with the live attempt's resolve) and writes no
+    /// scores. The caller treats nil as "the session moved
+    /// on" and ends the task silently.
+    private func resolveWithMeasurement(attempt: Int) async throws -> PlaybackResolution? {
+        let started = currentRequest
+        let candidates = [started.episode] + autoSourceCandidates()
+        let deadline = Date().addingTimeInterval(Self.autoMeasureTotalBudget)
+        var best: (episode: Episode, resolution: PlaybackResolution, score: Int)?
+        var startedError: Error?
+        // F-B1: superseded = this task was cancelled, a newer
+        // attempt owns the session, or the session stopped.
+        func superseded() -> Bool {
+            Task.isCancelled || attempt != attemptID || isStopped
+        }
+        for (index, episode) in candidates.prefix(Self.autoMeasureCandidateCap).enumerated() {
+            if superseded() {
+                DiagLog.log("player", "autosource.measure stop=superseded measured=\(index)")
+                return nil
+            }
+            if index > 0, Date() >= deadline {
+                DiagLog.log("player", "autosource.measure stop=budget measured=\(index)")
+                break
+            }
+            var req = started
+            req.episode = episode
+            if episode.id != started.episode.id {
+                // The fast-resume URL belongs to the started
+                // episode only — never offer it for another
+                // source's resolve.
+                req.knownStreamURL = ""
+            }
+            let host = URL(string: episode.id)?.host ?? "?"
+            let t0 = Date()
+            do {
+                let resolution = try await service.resolveEpisode(req)
+                // F-B1: the resolve could not be cancelled
+                // mid-flight (the plugin bridge has no cancel
+                // seam) — if the attempt died while it ran, its
+                // result is discarded here, unscored.
+                if superseded() {
+                    DiagLog.log("player", "autosource.measure stop=superseded measured=\(index)")
+                    return nil
+                }
+                let resolveMs = Int(Date().timeIntervalSince(t0) * 1000)
+                guard case .video(let stream) = resolution else {
+                    DiagLog.log("player", "autosource.measure name=\(episode.name) host=\(host) outcome=not-video")
+                    continue
+                }
+                var score = resolveMs
+                if let streamURL = URL(string: stream.url),
+                   let ttfb = await TVSourceProbe.timeToFirstByte(
+                    url: streamURL, headers: stream.headers) {
+                    score += ttfb
+                    DiagLog.log("player", "autosource.measure name=\(episode.name) host=\(host) resolve=\(resolveMs) ttfb=\(ttfb) score=\(score)")
+                } else {
+                    score += Self.autoProbePenaltyMs
+                    DiagLog.log("player", "autosource.measure name=\(episode.name) host=\(host) resolve=\(resolveMs) ttfb=-1 score=\(score)")
+                }
+                // F-B1: no score write from a superseded pass —
+                // the table belongs to the live session only.
+                if superseded() {
+                    DiagLog.log("player", "autosource.measure stop=superseded measured=\(index)")
+                    return nil
+                }
+                measuredSourceScores[episode.id] = score
+                if best == nil || score < best!.score {
+                    best = (episode, resolution, score)
+                }
+            } catch {
+                // F-B1: an error landing after supersede is
+                // not evidence about any live source — drop it.
+                if superseded() {
+                    DiagLog.log("player", "autosource.measure stop=superseded measured=\(index)")
+                    return nil
+                }
+                if episode.id == started.episode.id { startedError = error }
+                DiagLog.log("player", "autosource.measure name=\(episode.name) host=\(host) outcome=error kind=\(Self.errorLabel(error))")
+            }
+        }
+        guard let best else {
+            throw startedError ?? MovieServiceError.timedOut
+        }
+        // A superseded attempt publishes nothing and swaps
+        // nothing: nil, and the caller ends the task silently
+        // (resolveSucceeded's own guard is the second layer).
+        if superseded() {
+            DiagLog.log("player", "autosource.measure stop=superseded stage=publish")
+            return nil
+        }
+        if best.episode.id != started.episode.id {
+            DiagLog.log("player", "autosource.pick name=\(best.episode.name) host=\(URL(string: best.episode.id)?.host ?? "?") score=\(best.score) from=\(started.episode.name)")
+            currentRequest.episode = best.episode
+            triedSourceIDs.insert(best.episode.id)
+        } else {
+            DiagLog.log("player", "autosource.pick name=\(best.episode.name) score=\(best.score) kept=1")
+        }
+        return best.resolution
+    }
+
+    /// The best MEASURED source that has not had an attempt
+    /// yet — the only legal auto-switch target. Nil when auto
+    /// selection is off, the viewer has taken manual control,
+    /// the switch cap is reached, or nothing measured
+    /// remains.
+    private func nextAutoSourceCandidate() -> Episode? {
+        guard autoSourceMode, !manualSourceChosen,
+              autoSwitchCount < Self.autoSwitchCap else { return nil }
+        var bestID: String?
+        var bestScore = Int.max
+        for (episodeID, score) in measuredSourceScores
+        where !triedSourceIDs.contains(episodeID) && score < bestScore {
+            bestID = episodeID
+            bestScore = score
+        }
+        guard let bestID else { return nil }
+        return autoSourceCandidates().first { $0.id == bestID }
+            ?? (currentRequest.allEpisodes.first { $0.id == bestID })
     }
 
     private func resolveSucceeded(attempt: Int, resolution: PlaybackResolution) {
@@ -670,10 +915,16 @@ final class TVPlayerSession: ObservableObject {
     /// Switch targets: the torrenthub shortlist when present
     /// (its episodes ARE the cross-server sources), else the
     /// current server's episode list (the iOS rule).
+    /// L-T23 (1.3.3): javhd's switchList carries AUTO-SELECTION
+    /// candidates (see autoSourceCandidates), not panel rows —
+    /// the panel keeps showing the current server's episodes
+    /// for every non-torrent plugin, exactly as before.
     var switchTargets: [Episode] {
-        let list = currentRequest.switchList.isEmpty
-            ? currentRequest.allEpisodes
-            : currentRequest.switchList
+        if currentRequest.pluginId == "torrenthub",
+           !currentRequest.switchList.isEmpty {
+            return currentRequest.switchList
+        }
+        let list = currentRequest.allEpisodes
         return list.isEmpty ? [currentRequest.episode] : list
     }
 
@@ -695,9 +946,14 @@ final class TVPlayerSession: ObservableObject {
         performSwitch(to: episode, captured: captureLivePosition())
     }
 
-    private func performSwitch(to episode: Episode, captured: Double) {
+    /// `auto` marks the L-T23 auto-switch path (1.3.3): every
+    /// OTHER call is a manual viewer pick and permanently
+    /// disables auto selection for the session.
+    private func performSwitch(to episode: Episode, captured: Double, auto: Bool = false) {
         guard !isStopped else { return }
         guard episode.id != currentRequest.episode.id else { return }
+        if !auto { manualSourceChosen = true }
+        triedSourceIDs.insert(episode.id)
         let from = currentRequest.episode.name
         // The switch line names the NEW attempt (beginAttempt
         // increments to exactly this number).
@@ -751,6 +1007,7 @@ final class TVPlayerSession: ObservableObject {
         guard !isStopped else { return }
         guard isTorrentHashTitle else { return }
         guard forcedProvider != provider else { return }
+        manualSourceChosen = true
         // Gate fix pass (C-F4): a row still in .checking state
         // is information, not a command — its probe verdict has
         // not arrived, so pinning it would start the full
@@ -853,8 +1110,23 @@ final class TVPlayerSession: ObservableObject {
     /// The waiting-state watchdog's verdict (§3.3/§3.4): the
     /// surface intended to play but produced nothing for the
     /// continuous-wait ceiling.
+    ///
+    /// L-T23 (1.3.3): this is also the stall signal the L-T21
+    /// fast path exits through, so it is where auto selection
+    /// reacts to a slow source — in an auto session with a
+    /// measured, untried alternative, the attempt switches to
+    /// the best measured source (position preserved) instead
+    /// of dying on the slate. Exhausted candidates, a manual
+    /// viewer pick, or the switch cap all fall through to the
+    /// slate exactly as before.
     func watchdogFailed(attempt: Int, surface: String, waitedSeconds: Int) {
         guard attempt == attemptID, case .playing = phase else { return }
+        if let next = nextAutoSourceCandidate() {
+            DiagLog.log("player", "autosource.switch attempt=\(attempt) surface=\(surface) waited=\(waitedSeconds) from=\(currentRequest.episode.name) to=\(next.name)")
+            autoSwitchCount += 1
+            performSwitch(to: next, captured: captureLivePosition(), auto: true)
+            return
+        }
         DiagLog.log("player", "watchdog.fail attempt=\(attempt) surface=\(surface) waited=\(waitedSeconds)")
         phase = .failed(TVPlayerFailure(
             stage: .watchdog,

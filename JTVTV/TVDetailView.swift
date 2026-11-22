@@ -386,17 +386,49 @@ struct TVDetailView: View {
     /// removes exactly the sprawl and nothing else: clean
     /// values from the other plugins keep rendering exactly
     /// as the approved Phase 2 detail design draws them.
-    private func isRawLinkSprawl(_ value: String) -> Bool {
-        value.contains("](")
+    ///
+    /// L-T25 / FL-411 (1.3.3): the markdown test alone let
+    /// javhd's PLAIN comma-joined category list through (owner
+    /// photo: 18 site/category names, 172 chars, spilling past
+    /// the right screen edge — "Javhd nên xoá bớt giống bên
+    /// missav"). The design pass (DESIGN-133-DETAIL-SPRAWL.md
+    /// §c) swept all 12 plugins — 9 can emit a long
+    /// comma-joined list into a meta field — and fixed the
+    /// rule by VALUE SHAPE, never by plugin id: a value is
+    /// sprawl when it (1) contains markdown link syntax, or
+    /// (2) splits into ≥ 10 comma items, or (3) is > 150
+    /// characters with ≥ 5 comma items. The thresholds sit
+    /// clear of every measured clean value (the approved
+    /// design's Thể loại is 2 items / 16 chars; the largest
+    /// legitimate-by-construction list in the sweep is
+    /// torrenthub's 8-item capped cast) and catch the
+    /// convicted 18-item / 172-char list on both new tests.
+    /// Suppression hides the row (or block) — never truncates:
+    /// the approved design contains no presentation for a
+    /// long raw list.
+    private func isSprawlValue(_ value: String) -> Bool {
+        if value.contains("](") { return true }
+        let items = value.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        if items.count >= 10 { return true }
+        return value.count > 150 && items.count >= 5
     }
 
     private func hasVisibleMeta(_ detail: MovieDetail) -> Bool {
         [detail.episode_current, detail.category, detail.country, detail.director]
-            .contains { !$0.isEmpty && !isRawLinkSprawl($0) }
+            .contains { !$0.isEmpty && !isSprawlValue($0) }
     }
 
     private func visibleCastNames(_ detail: MovieDetail) -> [String] {
-        detail.castNames.filter { !isRawLinkSprawl($0) }
+        // The shape tests must see the RAW casts string
+        // (design pass §c.3): castNames splits it on ",", after
+        // which every chip is a single short item that can
+        // never trip an item-count test. A sprawl raw string
+        // hides the whole Diễn viên block; a clean one keeps
+        // the per-chip markdown filter as the second line.
+        if isSprawlValue(detail.casts) { return [] }
+        return detail.castNames.filter { !isSprawlValue($0) }
     }
 
     private func metaBlock(_ detail: MovieDetail) -> some View {
@@ -410,7 +442,7 @@ struct TVDetailView: View {
 
     @ViewBuilder
     private func metaRow(_ label: String, _ value: String) -> some View {
-        if !value.isEmpty, !isRawLinkSprawl(value) {
+        if !value.isEmpty, !isSprawlValue(value) {
             HStack(alignment: .top, spacing: 20) {
                 Text(label)
                     .font(.system(size: 26))
@@ -929,6 +961,22 @@ struct TVDetailView: View {
         // L-T04 probe breadcrumb P0: the tap reached Detail's
         // play entry — the hand-off to the presenter is next.
         DiagLog.log("player", "tap.received plugin=\(pluginId) episode=\(episode.id)")
+        // L-T23 (1.3.3) gate fix (Round 1, Lens C C-1): arm
+        // measured auto-selection ONLY when the started
+        // episode is this detail's DEFAULT pick — the first
+        // non-empty server's first episode, exactly
+        // playFirstEpisode's target. A chip tap on another
+        // server (even its first episode) and a history
+        // resume on another server are deliberate picks and
+        // are never armed. The bit rides TVAutoMeasureArming
+        // (PlaybackRequest and the presenter are shared core
+        // and grow no TV-only fields), written in this same
+        // update as the presenter hand-off.
+        let defaultEpisodeID = detail.servers
+            .first(where: { !$0.episodes.isEmpty })?.episodes.first?.id
+        TVAutoMeasureArming.arm(requestID: request.id,
+                                armed: defaultEpisodeID != nil
+                                    && defaultEpisodeID == episode.id)
         presenter.request = request
     }
 
@@ -936,6 +984,40 @@ struct TVDetailView: View {
     /// first → "MediaFusion" → rest, episodes flattened, deduped
     /// by episode id, [current] + the next four.
     private func switchShortlist(current: Episode, detail: MovieDetail) -> [Episode] {
+        if pluginId == "javhd" {
+            // L-T23 (1.3.3): AUTO-SELECTION candidates for the
+            // player session's measured pick — every source of
+            // the title across ALL servers, in measurement
+            // priority order: each other server's first
+            // episode (the family representatives — different
+            // CDNs, the diversity that matters), then the
+            // current server's remaining mirrors, then every
+            // other server's remaining episodes. Deduped, the
+            // started episode excluded, capped at 12. The
+            // session measures a prefix of this list serially
+            // at Play and may auto-switch to a measured-better
+            // entry on a stall; the in-player panel is NOT fed
+            // from this list (it keeps the current server's
+            // episodes — see TVPlayerSession.switchTargets).
+            let currentServer = detail.servers.first { server in
+                server.episodes.contains { $0.id == current.id }
+            }
+            var seen: Set<String> = [current.id]
+            var list: [Episode] = []
+            func add(_ episode: Episode) {
+                if seen.insert(episode.id).inserted { list.append(episode) }
+            }
+            for server in detail.servers where server.id != currentServer?.id {
+                if let first = server.episodes.first { add(first) }
+            }
+            if let currentServer {
+                for episode in currentServer.episodes { add(episode) }
+            }
+            for server in detail.servers where server.id != currentServer?.id {
+                for episode in server.episodes { add(episode) }
+            }
+            return Array(list.prefix(12))
+        }
         guard pluginId == "torrenthub" else { return [] }
         let rankedServers = detail.servers.sorted { a, b in
             func rank(_ s: EpisodeServer) -> Int {

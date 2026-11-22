@@ -68,7 +68,9 @@ struct TVPlayerView: View {
             var created: TVPlayerSession!
             let session = TVPlayerSession(
                 request: request, service: service, history: history,
-                pinSession: pinSession, onDismiss: {
+                pinSession: pinSession,
+                autoMeasureArmed: TVAutoMeasureArming.isArmed(requestID: request.id),
+                onDismiss: {
                     // Instance-matched clear (Lens 2 F3): the
                     // dismiss clears the registry ONLY when the
                     // stored entry IS this session — a stale
@@ -90,6 +92,38 @@ struct TVPlayerView: View {
         // reached — init and session construction survived.
         DiagLog.log("player", "cover.view.body")
         return TVPlayerSessionView(session: builtSession)
+    }
+}
+
+// MARK: - Auto-measure arming hand-off (L-T23, gate fix C-1)
+
+/// Carries ONE bit from TVDetailView.play() to the session
+/// built for that play: whether the started episode is the
+/// detail's DEFAULT pick (the Play button's target — the
+/// first non-empty server's first episode). It exists
+/// because the bit cannot ride the PlaybackRequest itself:
+/// the request type is shared core (JTV/Models.swift) and
+/// must not grow a TV-only field, and the presenter is core
+/// too. Single slot, keyed by the request's id (a fresh UUID
+/// per play()): Detail writes it in the same update that
+/// hands the request to the presenter, and TVPlayerView.init
+/// reads it when the cover builds the session. A read for
+/// any other id — a request that never passed through
+/// play() — is false, so auto-selection can never arm by
+/// accident; a stale entry is overwritten by the next play()
+/// and can only ever match its own request's id.
+enum TVAutoMeasureArming {
+    private static let lock = NSLock()
+    // Lock-guarded on every access (the house idiom, same as
+    // TVPlayerSessionReuse below).
+    private nonisolated(unsafe) static var entry: (id: UUID, armed: Bool)?
+
+    static func arm(requestID: UUID, armed: Bool) {
+        lock.withLock { entry = (requestID, armed) }
+    }
+
+    static func isArmed(requestID: UUID) -> Bool {
+        lock.withLock { entry?.id == requestID ? entry?.armed == true : false }
     }
 }
 

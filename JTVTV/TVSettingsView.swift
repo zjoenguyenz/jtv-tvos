@@ -51,12 +51,14 @@ struct TVSettingsView: View {
     @FocusState private var firstRowFocused: Bool
     @FocusState private var pinButtonFocused: Bool
     @FocusState private var logButtonFocused: Bool
+    @FocusState private var netProbeButtonFocused: Bool
 
     /// Cover presentation for the two action rows (Diagnosis
     /// §4.2, JoeSettings.swift:58,314-316 shape): plain Buttons
     /// set these; the pushed NavigationLink shape is gone.
     @State private var showPinChange = false
     @State private var showLogExport = false
+    @State private var showNetProbe = false
 
     private var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
@@ -112,6 +114,9 @@ struct TVSettingsView: View {
         }
         .fullScreenCover(isPresented: $showLogExport) {
             LogExportView()
+        }
+        .fullScreenCover(isPresented: $showNetProbe) {
+            TVNetProbeView()
         }
         .onAppear { session.touch() }
     }
@@ -217,6 +222,18 @@ struct TVSettingsView: View {
             .jtvCardButton()
             .focused($logButtonFocused)
             Text("Khi app gặp lỗi, mở màn hình này và tải file log về iPhone để gửi lại. Log không chứa token hay link đã ký.")
+                .font(.system(size: 23))
+                .foregroundStyle(.secondary)
+            Button {
+                showNetProbe = true
+            } label: {
+                ActionRowLabel {
+                    Label("Đo đường truyền", systemImage: "network")
+                }
+            }
+            .jtvCardButton()
+            .focused($netProbeButtonFocused)
+            Text("Đo thử DNS và kết nối HTTPS tới các máy chủ phim ngay trên TV; kết quả ghi vào log chẩn đoán ở trên.")
                 .font(.system(size: 23))
                 .foregroundStyle(.secondary)
         }
