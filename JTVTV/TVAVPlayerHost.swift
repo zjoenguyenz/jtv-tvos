@@ -513,8 +513,9 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
             guard hostValid, firstFrameReported, !failed, !ended,
                   let player, player.timeControlStatus != .paused else { return }
             stallTask?.cancel()
+            let grace = stallGraceSeconds
             stallTask = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(stallGraceSeconds))
+                try? await Task.sleep(for: .seconds(grace))
                 guard let self, !Task.isCancelled else { return }
                 self.stallGraceExpired()
             }
