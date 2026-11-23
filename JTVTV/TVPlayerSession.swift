@@ -312,6 +312,17 @@ final class TVPlayerSession: ObservableObject {
     /// A2: the streamxx native-lane extraction task for the
     /// current attempt (cancelled with every new attempt).
     private var streamxxLaneTask: Task<Void, Never>?
+    /// L-25 round 3: the vid-snap loopback-lane task for the
+    /// current attempt (cancelled with every new attempt,
+    /// like the streamxx lane's).
+    private var loopbackLaneTask: Task<Void, Never>?
+    /// L-25 round 3: the loopback registrations the current
+    /// attempt's flattened stream depends on (the media tiers
+    /// the flatten registered plus the master the lane
+    /// registered). Released at stop() and at the next
+    /// beginAttempt — never while an attempt is live, because
+    /// AVPlayer may re-read either tier at any point.
+    private var loopbackRegistrations: [URL] = []
     private var started = false
 
     // Instrumentation timestamps (§6).
@@ -467,6 +478,9 @@ final class TVPlayerSession: ObservableObject {
         resolveTimeoutTask = nil
         streamxxLaneTask?.cancel()
         streamxxLaneTask = nil
+        loopbackLaneTask?.cancel()
+        loopbackLaneTask = nil
+        releaseLoopbackRegistrations()
         providerProbeTask?.cancel()
         providerProbeTask = nil
         backgroundMeasureTask?.cancel()
@@ -520,6 +534,12 @@ final class TVPlayerSession: ObservableObject {
         resolveTimeoutTask = nil
         streamxxLaneTask?.cancel()
         streamxxLaneTask = nil
+        loopbackLaneTask?.cancel()
+        loopbackLaneTask = nil
+        // The PREVIOUS attempt's loopback registrations die
+        // with its surface — the same moment the old host is
+        // invalidated (L-25 round 3).
+        releaseLoopbackRegistrations()
         backgroundMeasureTask?.cancel()
         backgroundMeasureTask = nil
         debridWait = nil
@@ -1067,25 +1087,23 @@ final class TVPlayerSession: ObservableObject {
         let ms = Int(done.timeIntervalSince(attemptStartDate ?? done) * 1000)
         switch resolution {
         case .video(let stream):
-            currentStream = stream
-            let route: TVSurfaceRoute
-            let token: String
-            if stream.useCompatEngine {
-                route = .ks
-                token = "ks"
-            } else if stream.requiresProxy {
-                route = .proxy
-                token = "proxy"
-            } else {
-                route = .av
-                token = "av"
+            // L-25 round 3 (FL-468): a vid-snap-family stream
+            // diverts to the loopback lane BEFORE the route
+            // pick — the custom-scheme .proxy transport is the
+            // shape AVPlayer never walked past the master tier
+            // for this family (round-2 conviction). The lane
+            // flattens both playlist tiers to loopback and
+            // lands the session on route .av; on any decline
+            // it performs the route pick below with the
+            // ORIGINAL stream, so the family is never worse
+            // off than today. phase stays .resolving while
+            // the lane works; no host is built yet.
+            if stream.requiresProxy, let streamURL = stream.streamURL,
+               HLSProxyLoader.isVidSnapFamily(streamURL) {
+                startLoopbackLane(attempt: attempt, stream: stream, ms: ms)
+                return
             }
-            // L-T04 probe breadcrumb P7 (extends the §6 line):
-            // route + stream host (host only — redaction-safe)
-            // + proxy flag, so the AV fork is named in the log.
-            let streamHost = URLComponents(string: stream.url)?.host ?? "?"
-            DiagLog.log("player", "resolve.done attempt=\(attempt) ms=\(ms) route=\(token) host=\(streamHost) proxy=\(route == .proxy ? 1 : 0)")
-            phase = .playing(route: route, attempt: attempt)
+            pickVideoRoute(attempt: attempt, stream: stream, ms: ms)
         case .manga(let stream):
             currentStream = stream
             DiagLog.log("player", "resolve.done attempt=\(attempt) ms=\(ms) route=manga")
@@ -1106,6 +1124,138 @@ final class TVPlayerSession: ObservableObject {
                 startStreamxxLane(attempt: attempt, url: url, headers: headers)
             } else {
                 embedSlate(attempt: attempt, ms: ms)
+            }
+        }
+    }
+
+    /// The .video route pick, factored out of resolveSucceeded
+    /// so the loopback lane's fallback performs TODAY's pick
+    /// verbatim — the same code, not a copy — with the original
+    /// stream. Callers hold resolveSucceeded's guard context
+    /// (attempt current, phase .resolving).
+    private func pickVideoRoute(attempt: Int, stream: StreamInfo, ms: Int) {
+        currentStream = stream
+        let route: TVSurfaceRoute
+        let token: String
+        if stream.useCompatEngine {
+            route = .ks
+            token = "ks"
+        } else if stream.requiresProxy {
+            route = .proxy
+            token = "proxy"
+        } else {
+            route = .av
+            token = "av"
+        }
+        // L-T04 probe breadcrumb P7 (extends the §6 line):
+        // route + stream host (host only — redaction-safe)
+        // + proxy flag, so the AV fork is named in the log.
+        let streamHost = URLComponents(string: stream.url)?.host ?? "?"
+        DiagLog.log("player", "resolve.done attempt=\(attempt) ms=\(ms) route=\(token) host=\(streamHost) proxy=\(route == .proxy ? 1 : 0)")
+        phase = .playing(route: route, attempt: attempt)
+    }
+
+    // MARK: L-25 round 3 — vid-snap loopback lane
+
+    /// One two-tier flatten attempt for a vid-snap-family
+    /// stream, modelled on the A2 streamxx lane: its own task,
+    /// its own budget, re-entry into the session's own state.
+    /// The lane calls the shared core flatten
+    /// (HLSProxyLoader.materializedPlaylist), registers the
+    /// flattened master with LocalHLSServer, and lands the
+    /// session in .playing(route: .av) with a copy of the
+    /// stream whose url is the loopback master URL and whose
+    /// requiresProxy is false — TVPlayerView then starts the
+    /// host with useProxy: false, a plain AVURLAsset of the
+    /// loopback URL (TVAVPlayerHost is not modified). Headers
+    /// carry over untouched: the host's plain fork adds them
+    /// plus its desktop-UA default, and LocalHLSServer ignores
+    /// request headers, so this is inert.
+    ///
+    /// Budget: resolveSucceeded has already cancelled the
+    /// resolve deadline, so the lane races its work against a
+    /// 20 s watchdog (the A2 lane's ~10 s precedent, widened —
+    /// the flatten performs two sequential policy fetches).
+    /// The watchdog cancels the lane task; the lane checks
+    /// cancellation after each awaited step, so an expired
+    /// budget declines with its registrations released, exactly
+    /// like a nil from materialize or register.
+    ///
+    /// Fallback (never worse): ANY decline — nil materialize,
+    /// nil register, watchdog expiry — deregisters anything
+    /// the lane registered, logs the fallback line, and
+    /// performs today's route pick with the original stream
+    /// (route .proxy for this family), so the custom-scheme
+    /// asset carries the play exactly as in 1.3.10. A
+    /// superseded lane (attempt guard failed) deregisters its
+    /// registrations and publishes nothing.
+    private func startLoopbackLane(attempt: Int, stream: StreamInfo, ms: Int) {
+        loopbackLaneTask?.cancel()
+        loopbackLaneTask = Task { [weak self] in
+            guard let self else { return }
+            let watchdog = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(20))
+                guard let self, self.attemptID == attempt else { return }
+                self.loopbackLaneTask?.cancel()
+            }
+            var registrations: [URL] = []
+            var flattened: StreamInfo?
+            if let url = stream.streamURL,
+               let prepared = await HLSProxyLoader.materializedPlaylist(url: url, headers: stream.headers) {
+                registrations = prepared.loopbackURLs
+                if !Task.isCancelled,
+                   let masterURL = await LocalHLSServer.shared.register(prepared.data) {
+                    registrations.append(masterURL)
+                    if !Task.isCancelled {
+                        var copy = stream
+                        copy.url = masterURL.absoluteString
+                        copy.requiresProxy = false
+                        flattened = copy
+                    }
+                }
+            }
+            watchdog.cancel()
+            guard attempt == self.attemptID, case .resolving = self.phase else {
+                // Superseded or stopped while the lane worked:
+                // release what it registered, publish nothing.
+                for url in registrations {
+                    await LocalHLSServer.shared.deregister(url)
+                }
+                return
+            }
+            guard let flattened else {
+                for url in registrations {
+                    await LocalHLSServer.shared.deregister(url)
+                }
+                self.loopbackLaneFailed(attempt: attempt, stream: stream, ms: ms)
+                return
+            }
+            self.loopbackRegistrations = registrations
+            self.currentStream = flattened
+            let streamHost = URLComponents(string: flattened.url)?.host ?? "?"
+            DiagLog.log("player", "resolve.done attempt=\(attempt) ms=\(ms) route=av host=\(streamHost) proxy=0 via=loopback-lane")
+            DiagLog.log("player", "loopback.lane outcome=flattened attempt=\(attempt)")
+            self.phase = .playing(route: .av, attempt: attempt)
+        }
+    }
+
+    private func loopbackLaneFailed(attempt: Int, stream: StreamInfo, ms: Int) {
+        guard attempt == attemptID, case .resolving = phase else { return }
+        DiagLog.log("player", "loopback.lane outcome=fallback-proxy attempt=\(attempt)")
+        pickVideoRoute(attempt: attempt, stream: stream, ms: ms)
+    }
+
+    /// Fire-and-forget release of the stored loopback
+    /// registrations (deregister is async; the teardown paths
+    /// — stop(), beginAttempt — are synchronous). The store
+    /// is cleared synchronously, so a second call is a no-op.
+    private func releaseLoopbackRegistrations() {
+        let urls = loopbackRegistrations
+        loopbackRegistrations = []
+        guard !urls.isEmpty else { return }
+        Task {
+            for url in urls {
+                await LocalHLSServer.shared.deregister(url)
             }
         }
     }

@@ -24,7 +24,7 @@ final class LocalHLSServer: @unchecked Sendable {
 
     private let queue = DispatchQueue(label: "jtv.localhls.server")
     private var listener: NWListener?
-    private var bodies: [String: Data] = [:]
+    private var bodies: [String: (data: Data, refs: Int)] = [:]
     private var connections: [ObjectIdentifier: NWConnection] = [:]
     private var port: UInt16 = 0
     private var startWaiters: [(UInt16?) -> Void] = []
@@ -39,14 +39,44 @@ final class LocalHLSServer: @unchecked Sendable {
         return await withCheckedContinuation { (cont: CheckedContinuation<URL?, Never>) in
             queue.async {
                 // Content-addressed name (FNV-1a over the
-                // bytes): re-registering the same playlist is a
-                // no-op, and different playlists never collide
-                // in practice.
+                // bytes): re-registering the same playlist
+                // returns the same URL and adds a reference
+                // (see deregister), and different playlists
+                // never collide in practice.
                 var hash: UInt64 = 1469598103934665603
                 for byte in data { hash = (hash ^ UInt64(byte)) &* 1099511628211 }
                 let name = "pl-\(hash).m3u8"
-                self.bodies[name] = data
+                if var entry = self.bodies[name] {
+                    entry.refs += 1
+                    self.bodies[name] = entry
+                } else {
+                    self.bodies[name] = (data: data, refs: 1)
+                }
                 cont.resume(returning: URL(string: "http://127.0.0.1:\(port)/\(name)"))
+            }
+        }
+    }
+
+    /// Releases one registration taken by register(_:): the
+    /// body's reference count drops, and at zero the body is
+    /// removed, so a loopback URL outlives neither its surface
+    /// nor its session attempt. An unknown name is a no-op.
+    /// Runs on the server's serial queue through the same
+    /// continuation shape as register; callers fire-and-forget
+    /// from teardown paths.
+    func deregister(_ url: URL) async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            queue.async {
+                let name = url.lastPathComponent
+                if var entry = self.bodies[name] {
+                    entry.refs -= 1
+                    if entry.refs <= 0 {
+                        self.bodies[name] = nil
+                    } else {
+                        self.bodies[name] = entry
+                    }
+                }
+                cont.resume()
             }
         }
     }
@@ -126,13 +156,22 @@ final class LocalHLSServer: @unchecked Sendable {
         let parts = firstLine.components(separatedBy: " ")
         let path = parts.count >= 2 ? parts[1] : ""
         let name = path.hasPrefix("/") ? String(path.dropFirst()) : path
-        if let data = bodies[name] {
+        if let entry = bodies[name] {
+            let data = entry.data
+            // Serve witness (L-25 round 3): this server only
+            // ever serves playlists — a handful of reads per
+            // play — so a success line is a rare event, not
+            // per-segment traffic. The ordered serve lines
+            // (master, then media) are the device test's proof
+            // AVPlayer walked both tiers over loopback.
+            DiagLog.log("hls", "phase=loopback outcome=serve bytes=\(data.count)")
             let head = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: \(data.count)\r\nConnection: close\r\n\r\n"
             connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in })
             connection.send(content: data, completion: .contentProcessed { _ in
                 connection.cancel()
             })
         } else {
+            DiagLog.log("hls", "phase=loopback outcome=miss")
             let head = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in
                 connection.cancel()

@@ -93,36 +93,42 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
     /// the shape Safari played). Returns nil whenever anything
     /// still needs the loader (variant playlists, disguised
     /// segments), so the caller keeps the proxied asset.
-    static func materializedPlaylist(url: URL, headers: [String: String]) async -> (fileURL: URL, data: Data)? {
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 30
-        for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
-        // Same retry policy as the loader: the origins behind
-        // these playlists drop response bodies mid-transfer, and
-        // one dropped fetch used to abandon the whole ladder.
-        var fetched: (data: Data, http: HTTPURLResponse)?
-        for attempt in 1...3 {
-            if let (data, response) = try? await URLSession.shared.data(for: request),
-               let http = response as? HTTPURLResponse {
-                if (200..<300).contains(http.statusCode) {
-                    fetched = (data, http)
-                    break
-                }
-                if http.statusCode < 500 {
-                    // v1.22.15 (B-2, H-1): failure line only —
-                    // status class, never the URL (DiagLog law).
-                    DiagLog.log("hls", "phase=materialize outcome=http-error status=\(http.statusCode)")
-                    return nil // dead/geo: fail fast
-                }
-            }
-            if attempt < 3 { try? await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000) }
-        }
-        guard let (data, http) = fetched else {
-            DiagLog.log("hls", "phase=materialize outcome=fetch-failed")
+    ///
+    /// The vid-snap family is the one exception, and it is not
+    /// an exemption: its master is flattened two-tier to the
+    /// loopback server BEFORE the acceptance guard below runs
+    /// (see flattenVidSnapMaster), so what passes the guard has
+    /// honestly had the scheme removed from its bytes. The
+    /// media-tier loopback URLs that flatten registered ride
+    /// back in `loopbackURLs` for the caller's teardown
+    /// bookkeeping ([] on every other path, the master itself
+    /// excluded — the caller registers that from `data`).
+    static func materializedPlaylist(url: URL, headers: [String: String]) async -> (fileURL: URL, data: Data, loopbackURLs: [URL])? {
+        guard let (data, finalURL) = await fetchWithPolicy(url: url, headers: headers, logFailures: true) else {
             return nil
         }
         let scratch = HLSProxyLoader(headers: headers)
-        let prepared = scratch.prepare(data: data, finalURL: http.url ?? url)
+        var prepared = scratch.prepare(data: data, finalURL: finalURL)
+        var loopbackURLs: [URL] = []
+        // L-25 round 3 (FL-468): the vid-snap two-tier flatten.
+        // Entry — ALL must hold, else control falls to the
+        // guard below with `prepared` untouched: the prepared
+        // body is a playlist, the fetch's FINAL (post-redirect)
+        // host is the vid-snap family (the same predicate
+        // markProxyIfNeeded marks by), and the body is a
+        // master. On success `prepared` becomes the flattened
+        // master and flows into the guard and the file write
+        // exactly as a classic body does; on any decline the
+        // flatten has already deregistered whatever it
+        // registered and `prepared` is still today's bytes.
+        if prepared.contentType == "com.apple.mpegurl",
+           Self.isVidSnapFamily(finalURL),
+           let masterText = String(data: prepared.data, encoding: .utf8),
+           masterText.contains("#EXT-X-STREAM-INF"),
+           let flattened = await flattenVidSnapMaster(masterText, headers: headers) {
+            prepared = (data: Data(flattened.text.utf8), contentType: "com.apple.mpegurl")
+            loopbackURLs = flattened.registered
+        }
         guard prepared.contentType == "com.apple.mpegurl",
               let text = String(data: prepared.data, encoding: .utf8),
               !text.contains("\(scheme)://"),
@@ -140,10 +146,215 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
         for byte in url.absoluteString.utf8 { hash = (hash ^ UInt64(byte)) &* 1099511628211 }
         let file = dir.appendingPathComponent("pl-\(hash).m3u8")
         guard (try? prepared.data.write(to: file, options: .atomic)) != nil else {
+            // G1-1: a write failure AFTER a successful flatten
+            // must not strand the flatten's registrations — a
+            // nil return hands the caller nothing to release,
+            // so deregister them here (the F7 cleanup,
+            // mirrored) before declining.
+            for loopbackURL in loopbackURLs {
+                await LocalHLSServer.shared.deregister(loopbackURL)
+            }
             DiagLog.log("hls", "phase=materialize outcome=write-failed")
             return nil
         }
-        return (fileURL: file, data: prepared.data)
+        return (fileURL: file, data: prepared.data, loopbackURLs: loopbackURLs)
+    }
+
+    /// The fetch policy materializedPlaylist has always used,
+    /// factored out so the vid-snap flatten's variant fetches
+    /// ride the exact same policy: 3 attempts, fail-fast on a
+    /// status below 500, 1 s / 2 s backoff. (Same retry policy
+    /// as the loader: the origins behind these playlists drop
+    /// response bodies mid-transfer, and one dropped fetch
+    /// used to abandon the whole ladder.) `logFailures` keeps
+    /// the two failure lines attached to the master call only,
+    /// as before — variant failures surface as the flatten's
+    /// own decline line instead.
+    private static func fetchWithPolicy(url: URL, headers: [String: String],
+                                        logFailures: Bool) async -> (data: Data, finalURL: URL)? {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 30
+        for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
+        for attempt in 1...3 {
+            if let (data, response) = try? await URLSession.shared.data(for: request),
+               let http = response as? HTTPURLResponse {
+                if (200..<300).contains(http.statusCode) {
+                    return (data, http.url ?? url)
+                }
+                if http.statusCode < 500 {
+                    // v1.22.15 (B-2, H-1): failure line only —
+                    // status class, never the URL (DiagLog law).
+                    if logFailures {
+                        DiagLog.log("hls", "phase=materialize outcome=http-error status=\(http.statusCode)")
+                    }
+                    return nil // dead/geo: fail fast
+                }
+            }
+            if attempt < 3 { try? await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000) }
+        }
+        if logFailures {
+            DiagLog.log("hls", "phase=materialize outcome=fetch-failed")
+        }
+        return nil
+    }
+
+    /// L-25 round 3 (FL-468): the two-tier loopback flatten of
+    /// a PREPARED vid-snap master. The round-2 conviction: the
+    /// loader's rewritten master is valid HLS whose only
+    /// variant line points at a jtvhls:// URL, and AVPlayer
+    /// never issues the playlist-internal variant request to
+    /// the resource-loader delegate — it dies with -11850 one
+    /// tier above the media playlist round 2 fixed. So both
+    /// tiers are flattened to the loopback server here, before
+    /// AVPlayer ever sees them: each referenced sub-playlist
+    /// is fetched and prepared by the same machinery (the
+    /// media tier rewritten by the round-2 rules, its segments
+    /// staying direct), registered with LocalHLSServer, and
+    /// the master's references are repointed at the loopback
+    /// URLs. Both tiers then arrive as ordinary network
+    /// resources — the only shape this app has ever played.
+    ///
+    /// Any failure declines: ONE flatten-declined line naming
+    /// the stage, everything this call registered is
+    /// deregistered (no partial flatten ever escapes), and the
+    /// caller falls through to the acceptance guard with the
+    /// original prepared master — today's exact behaviour.
+    private static func flattenVidSnapMaster(_ masterText: String,
+                                             headers: [String: String]) async -> (text: String, registered: [URL])? {
+        var registered: [URL] = []
+        // F7: a decline after ≥1 registration deregisters
+        // everything this call registered before returning.
+        func decline(_ stage: String) async -> (text: String, registered: [URL])? {
+            for url in registered {
+                await LocalHLSServer.shared.deregister(url)
+            }
+            DiagLog.log("hls", "phase=materialize outcome=flatten-declined stage=\(stage)")
+            return nil
+        }
+
+        // F1 — collect the sub-playlist references from the
+        // PREPARED master text, in document order: bare URI
+        // lines (each a jtvhls:// URL produced by wrap) and
+        // URI="…" attribute values on tag lines (the
+        // #EXT-X-MEDIA rendition case, wrapped by
+        // rewriteTagLine). Each is decoded with
+        // originalURL(from:) back to its origin URL — the
+        // exact wrap encoding is reused; no second parser of
+        // the origin master exists. Zero references, or any
+        // reference that is not a decodable jtvhls:// URL (a
+        // direct URL left by decodeProxyWrapped, a malformed
+        // line), declines: shapes this flatten does not take.
+        struct Ref { let line: Int; let value: String; let origin: URL }
+        var refs: [Ref] = []
+        var lines = masterText.components(separatedBy: "\n")
+        let uriRegex = try? NSRegularExpression(pattern: "URI=\"([^\"]*)\"")
+        for (index, line) in lines.enumerated() {
+            if line.hasPrefix("#") {
+                guard line.contains("URI=\""), let uriRegex else { continue }
+                let ns = line as NSString
+                let matches = uriRegex.matches(in: line, range: NSRange(location: 0, length: ns.length))
+                for match in matches where match.numberOfRanges > 1 {
+                    let value = ns.substring(with: match.range(at: 1))
+                    guard let wrapped = URL(string: value), wrapped.scheme == scheme,
+                          let origin = Self.originalURL(from: wrapped) else {
+                        return await decline("master-parse")
+                    }
+                    refs.append(Ref(line: index, value: value, origin: origin))
+                }
+            } else if !line.trimmingCharacters(in: .whitespaces).isEmpty {
+                guard let wrapped = URL(string: line), wrapped.scheme == scheme,
+                      let origin = Self.originalURL(from: wrapped) else {
+                    return await decline("master-parse")
+                }
+                refs.append(Ref(line: index, value: line, origin: origin))
+            }
+        }
+        guard !refs.isEmpty else {
+            return await decline("master-parse")
+        }
+
+        // F2–F4 — for each distinct referenced playlist, in
+        // document order: fetch it through the shared policy,
+        // prepare it through a scratch loader (the same
+        // classification + rewritePlaylist path the delegate
+        // uses, so the media tier is rewritten by the round-2
+        // rules and the direct-segments witness fires there),
+        // shape-check it as a MEDIA playlist, apply the
+        // guard's own acceptance test per tier, and register
+        // it. F3 is where round 2's tag rule bites by design:
+        // rewriteTagLine never forwards directSegments, so a
+        // #EXT-X-KEY / #EXT-X-MAP / #EXT-X-MEDIA URI inside a
+        // variant stays jtvhls://-wrapped, leaves the scheme
+        // in the text, and declines the whole flatten — an
+        // encrypted or mapped variant stays on today's path
+        // instead of being handed a third transport.
+        let scratch = HLSProxyLoader(headers: headers)
+        var loopbackByOrigin: [URL: URL] = [:]
+        var variantCount = 0
+        for ref in refs where loopbackByOrigin[ref.origin] == nil {
+            guard let (tierData, tierFinalURL) = await fetchWithPolicy(url: ref.origin, headers: headers, logFailures: false) else {
+                return await decline("variant-fetch")
+            }
+            let tier = scratch.prepare(data: tierData, finalURL: tierFinalURL)
+            guard tier.contentType == "com.apple.mpegurl",
+                  let tierText = String(data: tier.data, encoding: .utf8),
+                  tierText.contains("#EXTINF:"),
+                  !tierText.contains("#EXT-X-STREAM-INF") else {
+                return await decline("variant-shape")
+            }
+            guard !tierText.contains("\(scheme)://"),
+                  !tierText.contains("__hls_proxy/") else {
+                return await decline("variant-wrapped")
+            }
+            guard let loopback = await LocalHLSServer.shared.register(tier.data) else {
+                return await decline("register")
+            }
+            registered.append(loopback)
+            loopbackByOrigin[ref.origin] = loopback
+            variantCount += 1
+        }
+
+        // F5 — substitute each reference with its loopback
+        // URL: bare lines whole-line, URI="…" values in
+        // place at the captured match range — the same
+        // regex shape rewriteTagLine uses (§3.1 F5), never
+        // a first-occurrence search on the raw value, so a
+        // value that also appears elsewhere in its line
+        // cannot be substituted at the wrong occurrence.
+        // References are processed in reverse document
+        // order (rewriteTagLine's order) so a substitution
+        // can never shift the range of one still pending.
+        // Every other master byte passes through
+        // untouched — in particular the #EXT-X-STREAM-INF
+        // attribute line is never modified (the conviction
+        // verified that line's integrity is load-bearing).
+        for ref in refs.reversed() {
+            guard let loopback = loopbackByOrigin[ref.origin] else { continue }
+            if lines[ref.line] == ref.value {
+                lines[ref.line] = loopback.absoluteString
+            } else if let uriRegex {
+                let ns = lines[ref.line] as NSString
+                let matches = uriRegex.matches(in: lines[ref.line], range: NSRange(location: 0, length: ns.length))
+                for match in matches.reversed() where match.numberOfRanges > 1 {
+                    guard ns.substring(with: match.range(at: 1)) == ref.value else { continue }
+                    lines[ref.line] = ns.replacingCharacters(in: match.range(at: 1), with: loopback.absoluteString)
+                    break
+                }
+            }
+        }
+
+        // F6 — final acceptance: the flattened master must
+        // itself pass the guard's own test before it may flow
+        // into the code below the guard. A residue means the
+        // master held a wrapped reference F1 did not collect.
+        let flattenedText = lines.joined(separator: "\n")
+        guard !flattenedText.contains("\(scheme)://"),
+              !flattenedText.contains("__hls_proxy/") else {
+            return await decline("master-parse")
+        }
+        let flattenedData = Data(flattenedText.utf8)
+        DiagLog.log("hls", "phase=materialize outcome=loopback-flatten variants=\(variantCount) bytes=\(flattenedData.count)")
+        return (text: flattenedText, registered: registered)
     }
 
     // MARK: - AVAssetResourceLoaderDelegate

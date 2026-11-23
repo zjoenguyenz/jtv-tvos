@@ -133,15 +133,15 @@ targets:
         # with the old version because only one pair was bumped.
         # The delivered IPA's Info.plist is read back before
         # every delivery.
-        MARKETING_VERSION: "1.3.10"
-        CURRENT_PROJECT_VERSION: "18"
+        MARKETING_VERSION: "1.3.11"
+        CURRENT_PROJECT_VERSION: "19"
     info:
       path: Info.plist
       properties:
         CFBundleDisplayName: "Media Service"
         CFBundleName: "Media Service"
-        CFBundleShortVersionString: "1.3.10"
-        CFBundleVersion: "18"
+        CFBundleShortVersionString: "1.3.11"
+        CFBundleVersion: "19"
         CFBundleIconName: "AppIcon"
         UILaunchScreen: {}
         UIBackgroundModes:
