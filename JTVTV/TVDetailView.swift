@@ -452,7 +452,11 @@ struct TVDetailView: View {
     }
 
     private func hasVisibleMeta(_ detail: MovieDetail) -> Bool {
-        [detail.episode_current, detail.category, detail.country, detail.director]
+        // 1.22.19 (L-20): category/director are judged in
+        // their sanitized display form (Models.plainDisplayText)
+        // — the raw plugin markdown always tripped the "]("
+        // sprawl test below and hid the rows entirely.
+        [detail.episode_current, detail.categoryDisplay, detail.country, detail.directorDisplay]
             .contains { !$0.isEmpty && !isSprawlValue($0) }
     }
 
@@ -478,9 +482,9 @@ struct TVDetailView: View {
     private func metaBlock(_ detail: MovieDetail) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             metaRow("Tiến độ", detail.episode_current)
-            metaRow("Thể loại", detail.category)
+            metaRow("Thể loại", detail.categoryDisplay)
             metaRow("Quốc gia", detail.country)
-            metaRow("Đạo diễn", detail.director)
+            metaRow("Đạo diễn", detail.directorDisplay)
         }
     }
 

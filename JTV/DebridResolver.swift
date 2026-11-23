@@ -185,7 +185,11 @@ enum DebridResolver {
         // whose cached flow still fails) keeps its phase-2 turn.
         if !tb.isEmpty, await torboxIsCached(hash: clean, token: tb) {
             attempted.insert("tb")
-            do { return try await resolveTorBox(hash: clean, token: tb) }
+            do {
+                let stream = try await resolveTorBox(hash: clean, token: tb)
+                logServed(provider: "torbox", stream: stream)
+                return stream
+            }
             catch {
                 DiagLog.log("debrid", "provider=torbox phase=resolve-cached outcome=error kind=\((error as NSError).domain)#\((error as NSError).code)")
                 lastError = error
@@ -201,6 +205,7 @@ enum DebridResolver {
             // `try?` did.
             do {
                 let hit = try await premiumizeDirectDL(hash: clean, token: pm)
+                logServed(provider: "premiumize", stream: hit)
                 return hit
             } catch {
                 if let debridError = error as? DebridError,
@@ -239,12 +244,30 @@ enum DebridResolver {
         }
         if phase2Tokens.count == 2 {
             let box = DebridPhase2RaceBox(providers: phase2Tokens)
+            // 1.22.19 (L-21): heartbeat — a race whose legs
+            // are both still polling used to leave NO trace
+            // between its start lines and its end (the
+            // 2026-11-22 23:43 session shows a both-uncached
+            // race silent for 52 s, indistinguishable from a
+            // hang). Every ~10 s the race now states who is
+            // still pending and for how long. The task is
+            // cancelled when the race resolves and self-exits
+            // once the box reports itself resolved.
+            let heartbeat = Task {
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 10_000_000_000)
+                    if Task.isCancelled { return }
+                    guard let pending = box.pendingProviders() else { return }
+                    DiagLog.log("debrid", "provider=all phase=phase2 outcome=heartbeat pending=\(pending.joined(separator: ",")) elapsed_ms=\(Int(Date().timeIntervalSince(phase2Start) * 1000))")
+                }
+            }
             let outcome = await withTaskCancellationHandler {
                 await withCheckedContinuation { (continuation: CheckedContinuation<DebridPhase2RaceBox.Outcome, Never>) in
                     box.arm(continuation)
                     let torboxTask = Task {
                         do {
                             let stream = try await resolveTorBox(hash: clean, token: tb)
+                            logServed(provider: "torbox", stream: stream)
                             box.succeed(stream)
                         } catch {
                             DiagLog.log("debrid", "provider=torbox phase=resolve outcome=error kind=\((error as NSError).domain)#\((error as NSError).code)")
@@ -257,6 +280,7 @@ enum DebridResolver {
                         do {
                             let stream = try await resolvePremiumize(hash: clean, token: pm,
                                                                       deadline: phase2Start.addingTimeInterval(budget))
+                            logServed(provider: "premiumize", stream: stream)
                             box.succeed(stream)
                         } catch {
                             DiagLog.log("debrid", "provider=premiumize phase=resolve outcome=error kind=\((error as NSError).domain)#\((error as NSError).code)")
@@ -270,24 +294,43 @@ enum DebridResolver {
             } onCancel: {
                 box.cancel()
             }
+            heartbeat.cancel()
+            // 1.22.19 (L-21, F-B1): join the heartbeat before
+            // the terminal line — a cancelled-but-unawaited
+            // heartbeat could otherwise log after it.
+            await heartbeat.value
+            // 1.22.19 (L-21): the race's terminal line —
+            // EVERY exit is on the record (won / both-failed
+            // / cancelled), so a superseded attempt can no
+            // longer vanish mid-flight the way the
+            // 2026-11-22 23:01 attempt did.
             switch outcome {
             case .success(let stream):
+                DiagLog.log("debrid", "provider=all phase=phase2 outcome=won")
                 return stream
             case .failed(let failures):
+                DiagLog.log("debrid", "provider=all phase=phase2 outcome=both-failed")
                 lastError = failures["premiumize"] ?? lastError
             case .cancelled:
+                DiagLog.log("debrid", "provider=all phase=phase2 outcome=cancelled")
                 throw CancellationError()
             }
         } else if phase2Tokens == ["torbox"] {
-            do { return try await resolveTorBox(hash: clean, token: tb) }
+            do {
+                let stream = try await resolveTorBox(hash: clean, token: tb)
+                logServed(provider: "torbox", stream: stream)
+                return stream
+            }
             catch {
                 DiagLog.log("debrid", "provider=torbox phase=resolve outcome=error kind=\((error as NSError).domain)#\((error as NSError).code)")
                 lastError = error
             }
         } else if phase2Tokens == ["premiumize"] {
             do {
-                return try await resolvePremiumize(hash: clean, token: pm,
-                                                    deadline: phase2Start.addingTimeInterval(budget))
+                let stream = try await resolvePremiumize(hash: clean, token: pm,
+                                                          deadline: phase2Start.addingTimeInterval(budget))
+                logServed(provider: "premiumize", stream: stream)
+                return stream
             } catch {
                 DiagLog.log("debrid", "provider=premiumize phase=resolve outcome=error kind=\((error as NSError).domain)#\((error as NSError).code)")
                 lastError = error
@@ -295,6 +338,19 @@ enum DebridResolver {
         }
         DiagLog.log("debrid", "provider=all phase=resolve outcome=failed kind=\((lastError as NSError).domain)#\((lastError as NSError).code)")
         throw lastError
+    }
+
+    /// 1.22.19 (L-21): the served-stream accountability
+    /// line — provider + URL scheme/host ONLY (DiagLog
+    /// law: never the full signed URL, never a token), so
+    /// a future player-side URL failure can be attributed
+    /// to the leg that produced the stream. Called at
+    /// every success exit of `resolve(hash:onPhase:)` and
+    /// inside the race legs just before they hand their
+    /// stream to the box.
+    private static func logServed(provider: String, stream: StreamInfo) {
+        let url = URL(string: stream.url)
+        DiagLog.log("debrid", "provider=\(provider) phase=resolve outcome=served scheme=\(url?.scheme ?? "?") host=\(url?.host ?? "?")")
     }
 
     /// NEXT-D D5 (tvOS-only divergence, 1.3.0): PROBE-ONLY
@@ -764,18 +820,25 @@ enum DebridResolver {
             request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
             request.httpBody = formBody(form)
         }
+        // 1.22.19 (L-21): the endpoint (path only — the
+        // query carries the torrent hash, which DiagLog
+        // law keeps off the record) rides the failure
+        // lines so a torbox HTTP error names the call
+        // that failed (createtorrent vs the mylist poll
+        // were indistinguishable in the 2026-11-22 log).
+        let endpoint = String(path.prefix(while: { $0 != "?" }))
         let data: Data
         let response: URLResponse
         do {
             (data, response) = try await URLSession.shared.data(for: request)
         } catch let error as URLError {
             // v1.22.15 (B-2): log line only; the throw is unchanged.
-            DiagLog.log("debrid", "provider=torbox phase=request outcome=network-error kind=\((error as NSError).domain)#\((error as NSError).code)")
+            DiagLog.log("debrid", "provider=torbox phase=request outcome=network-error kind=\((error as NSError).domain)#\((error as NSError).code) endpoint=\(endpoint)")
             throw DebridError.message("TorBox: lỗi kết nối (mã \(error.code.rawValue))")
         }
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(code) else {
-            DiagLog.log("debrid", "provider=torbox phase=request outcome=http-error status=\(code)")
+            DiagLog.log("debrid", "provider=torbox phase=request outcome=http-error status=\(code) endpoint=\(endpoint)")
             throw DebridError.http(code, String(data: data, encoding: .utf8)?.prefix(160).description ?? "")
         }
         if data.isEmpty { return [:] }
@@ -1078,5 +1141,17 @@ private final class DebridPhase2RaceBox: @unchecked Sendable {
         lock.unlock()
         tasks.forEach { $0.cancel() }
         continuation?.resume(returning: .cancelled)
+    }
+
+    /// 1.22.19 (L-21): read-only snapshot for the race
+    /// heartbeat — the providers that have neither
+    /// succeeded nor failed yet, in race order; nil once
+    /// the box has resolved (success, both-failed or
+    /// cancelled), so the heartbeat stops with the race.
+    func pendingProviders() -> [String]? {
+        lock.lock()
+        defer { lock.unlock() }
+        if resumed { return nil }
+        return providers.filter { failures[$0] == nil }
     }
 }

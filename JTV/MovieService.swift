@@ -1070,14 +1070,35 @@ final class MovieService: ObservableObject {
 
     /// Terminal-error rule (§2.5): a primary pre-flight refusal
     /// names the origin source; a primary throw is rethrown
-    /// unchanged; every other primary failure keeps the
-    /// existing unresolved-episode copy.
+    /// unchanged (1.22.19 amendment below aside); every other
+    /// primary failure keeps the existing unresolved-episode
+    /// copy.
     private func fallbackTerminalError(for failure: PrimaryFailure, origin: String, request: PlaybackRequest) async -> Error {
         switch failure {
         case .refused(let status):
             let name = await manifest(for: origin)?.name ?? request.pluginName
             return MovieServiceError.sourceRefused(pluginName: name, status: status)
         case .thrown(let error):
+            // 1.22.19 (L-18, §2.5 amendment): a primary that
+            // died on a SERVER-SIDE error — the transport's
+            // badServerResponse shape (NSURLError -1011, an
+            // HTTP error status surfaced as a thrown error;
+            // the 123av hop server's 404 is the convicted
+            // case) — takes the §1B refused copy once the
+            // chain is exhausted, instead of Apple's raw
+            // error text reaching the user. The thrown error
+            // carries no HTTP status, so the refusal status
+            // is nil; the technical detail stays on the log
+            // line (§2.7 unchanged). Every other thrown
+            // error keeps §2.5's rethrow-unchanged. The
+            // detection idiom is the one PluginManager
+            // already ships for the same error shape.
+            if (error as? URLError)?.code == .badServerResponse {
+                let name = await manifest(for: origin)?.name ?? request.pluginName
+                let nsError = error as NSError
+                DiagLog.log("fallback", "terminal outcome=source-refused reason=primary-server-error kind=\(nsError.domain)#\(nsError.code)")
+                return MovieServiceError.sourceRefused(pluginName: name, status: nil)
+            }
             return error
         case .notFound, .unreachable, .emptyURL:
             return MovieServiceError.unresolvedEpisode

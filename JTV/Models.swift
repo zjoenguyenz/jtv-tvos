@@ -435,6 +435,57 @@ struct MovieDetail: Codable {
         castEntries.map(\.name)
     }
 
+    /// Display projections of `category` / `director`
+    /// with the plugin markdown convention reduced to
+    /// plain text (1.22.19, L-20): a plugin that routes
+    /// its single-value fields the way casts are routed
+    /// (missav's getField/getMultiField emit
+    /// `[name](route)` for the director and the genres)
+    /// handed the shells raw markdown, which the detail
+    /// screens rendered verbatim — the owner's
+    /// 2026-11-22 SNOS-422 photo shows the category and
+    /// director rows as raw `[text](/dm3/vi/…)` links.
+    /// The stored fields keep the plugin's raw value;
+    /// only the display projection is reduced, mirroring
+    /// `castNames` above. Casts are NOT passed through
+    /// this — their routes drive the actor screens.
+    var categoryDisplay: String { Self.plainDisplayText(category) }
+    var directorDisplay: String { Self.plainDisplayText(director) }
+
+    /// Hand scanner (no regex, same two-delimiter shape
+    /// as parseCastEntries): a completed `[text](route)`
+    /// reduces to `text`; an orphaned `](route)` fragment
+    /// (a link truncated mid-join) is dropped; every
+    /// other character passes through unchanged, so
+    /// plain-text values display byte-identically.
+    static func plainDisplayText(_ raw: String) -> String {
+        var out = ""
+        var index = raw.startIndex
+        while index < raw.endIndex {
+            if raw[index] == "[",
+               let closeBracket = raw[index...].firstIndex(of: "]") {
+                let afterBracket = raw.index(after: closeBracket)
+                if afterBracket < raw.endIndex, raw[afterBracket] == "(",
+                   let closeParen = raw[afterBracket...].firstIndex(of: ")") {
+                    out.append(contentsOf: raw[raw.index(after: index)..<closeBracket])
+                    index = raw.index(after: closeParen)
+                    continue
+                }
+            }
+            if raw[index] == "]" {
+                let afterBracket = raw.index(after: index)
+                if afterBracket < raw.endIndex, raw[afterBracket] == "(",
+                   let closeParen = raw[afterBracket...].firstIndex(of: ")") {
+                    index = raw.index(after: closeParen)
+                    continue
+                }
+            }
+            out.append(raw[index])
+            index = raw.index(after: index)
+        }
+        return out
+    }
+
     /// Hand parser for the `[name](route)` convention — no
     /// regex (the house avoids per-call regex compilation, and
     /// this shape is a simple two-delimiter scan). A `[` that
