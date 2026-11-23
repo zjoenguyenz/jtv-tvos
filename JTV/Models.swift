@@ -768,16 +768,22 @@ enum FallbackCatalog {
     /// failure mode is a playlist-level refusal. 123av is excluded — its
     /// failure is page-level transport, and its resolved streams come from
     /// embed wrappers where a playlist pre-flight is meaningless.
-    static let preflightSet: Set<String> = ["missav", "njav", "avdbapi"]
+    static let preflightSet: Set<String> = ["missav", "njav", "avdbapi", "javguru"]
     /// Ordered fallback targets per origin (health order per
     /// RESEARCH-SOURCE-HEALTH: the sources most likely to actually play
     /// first). JavGuru joined this table in 1.22.21/1.3.9 (its plugin
     /// shipped and its playback is device-proven): appended LAST in
     /// every row so the proven hop order among the existing three is
-    /// preserved, and deliberately NOT in `preflightSet` — its
-    /// per-title hls3-domain refusal class needs device evidence from
-    /// real fallback logs before preflight can score it (treated
-    /// like 123av this round). jav.spa is excluded permanently
+    /// preserved. JavGuru joined `preflightSet` in 1.22.22/1.3.10
+    /// (L-26): the device evidence the 1.22.21 note waited for
+    /// arrived in the 2026-11-23 session log — 3 titles whose
+    /// primary was returned as "played" with no walk ever run,
+    /// then died in the player ([hls] fetch 403 → error -1011);
+    /// its per-title playlist-level refusal is exactly
+    /// `preflightSet`'s membership criterion. Admission required
+    /// the companion gate widening in StreamPreflight (MovieService):
+    /// without it every StreamHG candidate verdicts `.skipped` on
+    /// its `.txt` suffix. jav.spa is excluded permanently
     /// (helvid-walled playback — RESEARCH-NJAV addendum).
     static func targets(for origin: String) -> [String] {
         switch origin {

@@ -238,6 +238,19 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
             if served.contentType == "com.apple.mpegurl", finalURL.host != original.host {
                 DiagLog.log("hls", "phase=fetch outcome=playlist-redirect host=\(finalURL.host ?? "?")")
             }
+            // L-25 witness (FL-468): for the vid-snap family only,
+            // log WHICH playlist tier was just served — in 1.22.21
+            // the failure sat past the master tier, which was
+            // invisible because successes are otherwise silent.
+            // kind is read from the served (rewritten) body: a
+            // master carries EXT-X-STREAM-INF, a media playlist
+            // does not.
+            if served.contentType == "com.apple.mpegurl",
+               Self.isVidSnapFamily(original) || Self.isVidSnapFamily(finalURL) {
+                let servedText = String(data: served.data, encoding: .utf8) ?? ""
+                let kind = servedText.contains("#EXT-X-STREAM-INF") ? "master" : "media"
+                DiagLog.log("hls", "phase=fetch outcome=playlist-served kind=\(kind) bytes=\(served.data.count)")
+            }
             // Cache only complete VOD playlists; live playlists must
             // be re-fetched on every pass, segments are never kept.
             let isPlaylist = served.contentType == "com.apple.mpegurl"
@@ -358,6 +371,21 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
     }
 
     static func rewritePlaylist(_ text: String, base: URL) -> String {
+        // Playlist class, from the tags themselves: a master carries
+        // EXT-X-STREAM-INF variant references; a media playlist carries
+        // EXTINF segment entries. The two never mix in one document.
+        let isMaster = text.contains("#EXT-X-STREAM-INF")
+        let isMedia  = text.contains("#EXTINF:")
+        // L-25: for the vid-snap family the loader serves PLAYLISTS
+        // only (their served MIME is the lie AVPlayer rejects); the
+        // segments are bare TS that need no stripping, so a MEDIA
+        // playlist's segment URIs stay DIRECT absolute URLs and
+        // AVPlayer fetches them itself — the topxx lesson recorded
+        // in wrap(). A MASTER playlist is rewritten exactly as
+        // before (its variant URI stays wrapped, so the variant is
+        // fetched through the loader and lands here as media).
+        let directSegments = isVidSnapFamily(base) && isMedia && !isMaster
+        var segmentCount = 0
         var out: [String] = []
         out.reserveCapacity(1024)
         var maxInf: Double = 0
@@ -375,11 +403,12 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
                 targetVal = Double(String(num).trimmingCharacters(in: .whitespaces)) ?? 0
             }
             if line.hasPrefix("#") {
-                out.append(rewriteTagLine(line, base: base))
+                out.append(rewriteTagLine(line, base: base, directSegments: directSegments))
             } else if line.isEmpty {
                 out.append(rawLine)
             } else {
-                out.append(wrap(line, base: base))
+                if directSegments { segmentCount += 1 }
+                out.append(wrap(line, base: base, directSegments: directSegments))
             }
         }
         // Some origins ship EXTINF values above their own
@@ -391,10 +420,23 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
         if let idx = targetIdx, maxInf > targetVal {
             out[idx] = "#EXT-X-TARGETDURATION:\(Int(maxInf.rounded(.up)))"
         }
+        if directSegments {
+            DiagLog.log("hls", "phase=rewrite outcome=direct-segments segments=\(segmentCount)")
+        }
         return out.joined(separator: "\n")
     }
 
-    private static func wrap(_ uri: String, base: URL) -> String {
+    /// The vid-snap family (L-25/FL-468): the ONLY family whose media
+    /// playlists are rewritten with DIRECT segment URIs (see
+    /// rewritePlaylist). Same predicate markProxyIfNeeded uses to
+    /// route this family into the loader (MovieService) — the apex
+    /// host or any subdomain, nothing else.
+    static func isVidSnapFamily(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        return host == "vid-snap-player.com" || host.hasSuffix(".vid-snap-player.com")
+    }
+
+    private static func wrap(_ uri: String, base: URL, directSegments: Bool) -> String {
         guard var absolute = URL(string: uri, relativeTo: base)?.absoluteURL,
               absolute.scheme == "http" || absolute.scheme == "https" else { return uri }
         // streamxx-style HLS proxies wrap the real file URL as
@@ -413,6 +455,11 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
         // disguise-stripping, and plain public files take the
         // plain path.
         if let decoded = decodeProxyWrapped(absolute) { return decoded.absoluteString }
+        // L-25: in direct mode (vid-snap media playlists) the
+        // segment goes to AVPlayer as a plain public URL — no
+        // loader wrap, no app-attached headers (the topxx direct
+        // shape recorded above).
+        if directSegments { return absolute.absoluteString }
         guard let proxied = proxiedURL(for: absolute) else { return uri }
         return proxied.absoluteString
     }
@@ -433,7 +480,7 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
 
     /// Rewrites every URI="..." attribute on a tag line (EXT-X-MAP,
     /// EXT-X-KEY, EXT-X-MEDIA, EXT-X-STREAM-INF companions...).
-    private static func rewriteTagLine(_ line: String, base: URL) -> String {
+    private static func rewriteTagLine(_ line: String, base: URL, directSegments: Bool) -> String {
         guard line.contains("URI=\""),
               let regex = try? NSRegularExpression(pattern: "URI=\"([^\"]*)\"") else { return line }
         let ns = line as NSString
@@ -442,7 +489,13 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
         for match in matches.reversed() where match.numberOfRanges > 1 {
             let range = match.range(at: 1)
             let uri = ns.substring(with: range)
-            let wrapped = wrap(uri, base: base)
+            // Tag URIs (EXT-X-KEY / EXT-X-MAP / EXT-X-MEDIA) ALWAYS
+            // stay wrapped, even in direct mode (L-25): key bytes
+            // and init segments genuinely need the loader if they
+            // ever appear — the direct treatment is for media
+            // segment lines only, so directSegments is deliberately
+            // NOT forwarded here.
+            let wrapped = wrap(uri, base: base, directSegments: false)
             result = (result as NSString).replacingCharacters(in: range, with: wrapped)
         }
         return result

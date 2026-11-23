@@ -968,6 +968,12 @@ final class MovieService: ObservableObject {
         }
         var lastVerdict: PreflightVerdict = .skipped
         for (index, candidate) in candidates.enumerated() {
+            // Cancellation (gate fix, L-26 round): a superseded
+            // walk stops between candidates instead of spending
+            // the remaining checks against a dead budget; the
+            // in-flight check stays bounded by StreamPreflight's
+            // own 4 s expire.
+            if Task.isCancelled { break }
             let checkStart = Date()
             let verdict = await StreamPreflight.check(url: candidate, headers: stream.headers)
             let ms = Self.fallbackMs(since: checkStart)
@@ -985,7 +991,7 @@ final class MovieService: ObservableObject {
             case .skipped:
                 outcomeLabel = "skipped"; statusLabel = "-"
             }
-            if pluginId == "missav", candidates.count > 1 {
+            if candidates.count > 1 {
                 DiagLog.log("preflight", "candidate=\(index + 1)/\(candidates.count) plugin=\(pluginId) host=\(URL(string: candidate)?.host ?? "?") outcome=\(outcomeLabel) status=\(statusLabel) ms=\(ms)")
             } else {
                 DiagLog.log("preflight", "plugin=\(pluginId) host=\(URL(string: candidate)?.host ?? "?") outcome=\(outcomeLabel) status=\(statusLabel) ms=\(ms)")
@@ -1467,8 +1473,36 @@ enum PreflightVerdict: Equatable {
 /// and the tvOS measurement pass — never inside
 /// `resolveEpisode` itself.
 enum StreamPreflight {
+    /// Pre-flightable playlist candidates (§3.1): direct-media
+    /// URLs, plus disguised playlist suffixes — the StreamHG
+    /// family's terminal is literally named master.txt (L-26).
+    /// This widening lives HERE, not in MediaURL.isDirectMedia:
+    /// that predicate routes the resolve chain itself (direct
+    /// vs embed classification), and a .txt URL must not become
+    /// "direct media" there. StreamPreflight is used only by
+    /// the fallback engine and the tvOS measurement pass, so
+    /// the wider gate reaches nothing else.
+    private static func isPreflightable(_ url: String) -> Bool {
+        if MediaURL.isDirectMedia(url) { return true }
+        // The same scheme guard MediaURL.isDirectMedia
+        // applies (gate fix, round 3): only http(s)
+        // candidates are pre-flightable — a scheme-less or
+        // foreign-scheme string that merely ends in .txt
+        // must verdict .skipped (fail-open), never a
+        // decided .unreachable.
+        let lower = url.lowercased()
+        guard lower.hasPrefix("http") else { return false }
+        let path = lower.split(separator: "?").first.map(String.init) ?? ""
+        // Strip any fragment as well (gate fix): the suffix
+        // test must judge the path — a ".txt" living only in
+        // the fragment must not admit a candidate, and a
+        // fragment must not hide a real master.txt terminal.
+        let cleanPath = path.split(separator: "#").first.map(String.init) ?? ""
+        return cleanPath.hasSuffix(".txt")
+    }
+
     static func check(url: String, headers: [String: String]) async -> PreflightVerdict {
-        guard MediaURL.isDirectMedia(url), let target = URL(string: url) else { return .skipped }
+        guard Self.isPreflightable(url), let target = URL(string: url) else { return .skipped }
         var request = URLRequest(url: target)
         for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
         request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
