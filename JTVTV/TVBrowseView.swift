@@ -206,6 +206,11 @@ struct TVPosterGrid: View {
     let isLoadingMore: Bool
     var onSelect: ((Movie) -> Void)? = nil
     let onLoadMore: () -> Void
+    /// A-6 (1.3.9): an optional entry-focus binding handed
+    /// to the FIRST cell only, so a screen whose landing
+    /// focus should be its first card can declare it (the
+    /// Browse screen does; other grid users pass nothing).
+    var firstCellEntryFocus: FocusState<Bool>.Binding? = nil
 
     @EnvironmentObject private var favorites: FavoritesManager
     @Environment(TVNavPath.self) private var nav
@@ -239,7 +244,8 @@ struct TVPosterGrid: View {
                         },
                         onLongPress: {
                             favorites.toggle(pluginId: pluginId, movie: movie)
-                        }
+                        },
+                        entryFocus: movie.id == items.first?.id ? firstCellEntryFocus : nil
                     )
                 }
             }
@@ -321,6 +327,9 @@ struct TVBrowseView: View {
     @State private var showFilters = false
     @State private var loadGeneration = 0
     @FocusState private var filterFocused: Bool
+    /// A-6 (1.3.9): the first card's entry focus — the
+    /// screen's landing focus whenever items exist.
+    @FocusState private var firstCardFocused: Bool
 
     init(pluginId: String, slug: String, title: String, initialFilters: ListFilters) {
         self.pluginId = pluginId
@@ -341,7 +350,26 @@ struct TVBrowseView: View {
             .padding(.vertical, 36)
         }
         .tvThemedBackground()
-        .defaultFocus($filterFocused, true)
+        // A-6 (1.3.9, F-06): the landing focus is the FIRST
+        // CARD whenever the grid has items — the filter
+        // button is one ↑ away — and falls back to the
+        // filter button while the grid is empty/loading
+        // (Detail's conditional-binding precedent).
+        .defaultFocus(items.isEmpty ? $filterFocused : $firstCardFocused, true)
+        // A-6 gate fix: a defaultFocus declaration does
+        // not move focus that was ALREADY assigned — on a
+        // fresh open the engine can land on the filter
+        // button during the load window, before the first
+        // card exists. When the first items land and
+        // focus still sits on that fallback, hand it to
+        // the first card explicitly. If the user has
+        // moved focus anywhere else, filterFocused is
+        // false and nothing is stolen.
+        .onChange(of: items.isEmpty) { wasEmpty, isEmpty in
+            if wasEmpty, !isEmpty, filterFocused {
+                firstCardFocused = true
+            }
+        }
         .onAppear { session.touch() }
         .task { if !didLoad { await reload() } }
         .onChange(of: filters) { _, _ in Task { await reload() } }
@@ -395,7 +423,11 @@ struct TVBrowseView: View {
                 .tint(.white)
                 .frame(maxWidth: .infinity, minHeight: 300)
         } else if let loadError, items.isEmpty {
-            TVErrorState(message: loadError) { Task { await reload() } }
+            // A-9 (1.3.9): the error state's retry button
+            // is a declared landing, as on Detail and the
+            // search-results surface (F-09's three screens).
+            TVErrorState(message: loadError, onRetry: { Task { await reload() } },
+                         retryIsDefaultFocus: true)
                 .frame(minHeight: 300)
                 .focusSection()
         } else if didLoad && items.isEmpty {
@@ -404,7 +436,8 @@ struct TVBrowseView: View {
         } else {
             TVPosterGrid(items: items, pluginId: pluginId,
                          isLoadingMore: isLoadingMore,
-                         onLoadMore: { Task { await loadMore() } })
+                         onLoadMore: { Task { await loadMore() } },
+                         firstCellEntryFocus: $firstCardFocused)
                 .browseFocusSection(if: !items.isEmpty)
         }
     }
@@ -471,6 +504,25 @@ struct TVFilterSheet: View {
     @State private var years: [NameValue] = []
     @State private var didLoad = false
     @FocusState private var applyFocused: Bool
+    /// Gate fix (A-4 hand-off): Đặt lại's focus binding —
+    /// before the groups load, the two action buttons are
+    /// the sheet's only focusables, so the load-time
+    /// hand-off below keys on both of them.
+    @FocusState private var resetFocused: Bool
+    /// A-4 (1.3.9): the landing focus — the "Tất cả" chip of
+    /// the first group that renders. Áp dụng sits at the
+    /// END of the natural top-down path now, not the start.
+    @FocusState private var firstChipFocused: Bool
+
+    /// The first group with options, in sheet order; groups
+    /// render only when non-empty, so this is the group the
+    /// user actually sees first.
+    private var firstGroupKey: String? {
+        if !categories.isEmpty { return "category" }
+        if !countries.isEmpty { return "country" }
+        if !years.isEmpty { return "year" }
+        return config.orderedKeys.first { !config.options(for: $0).isEmpty }
+    }
 
     init(pluginId: String, filters: Binding<ListFilters>) {
         self.pluginId = pluginId
@@ -498,7 +550,7 @@ struct TVFilterSheet: View {
                 }
 
                 HStack(spacing: 24) {
-                    TVSheetActionButton(title: "Đặt lại", primary: false) {
+                    TVSheetActionButton(title: "Đặt lại", primary: false, focusBinding: $resetFocused) {
                         draft = ListFilters()
                     }
                     TVSheetActionButton(title: "Áp dụng", primary: true, focusBinding: $applyFocused) {
@@ -512,7 +564,22 @@ struct TVFilterSheet: View {
             .padding(.vertical, 40)
         }
         .tvThemedBackground()
-        .defaultFocus($applyFocused, true)
+        .defaultFocus($firstChipFocused, true)
+        // A-4 gate fix: the groups (and their chips) load
+        // in .task, so at appear time the declared landing
+        // has no view to land on and the engine can assign
+        // focus to an action button instead; a declaration
+        // never moves already-assigned focus. When the
+        // first group arrives and focus still sits on one
+        // of the action buttons (the only focusables that
+        // existed during the load), hand it to the first
+        // chip explicitly. Focus anywhere else is the
+        // user's and is never stolen.
+        .onChange(of: firstGroupKey) { _, newKey in
+            if newKey != nil, applyFocused || resetFocused {
+                firstChipFocused = true
+            }
+        }
         // L-T31 (1.3.4): the sheet owns its Menu press —
         // Menu closes the sheet and discards the draft (the
         // filters binding is only ever written by Áp dụng);
@@ -539,7 +606,8 @@ struct TVFilterSheet: View {
             VStack(alignment: .leading, spacing: 18) {
                 TVSectionHeader(title: title)
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 240), spacing: 16)], spacing: 16) {
-                    chip(title: "Tất cả", selected: draft.value(for: key).isEmpty) {
+                    chip(title: "Tất cả", selected: draft.value(for: key).isEmpty,
+                         entryFocus: key == firstGroupKey ? $firstChipFocused : nil) {
                         draft.set(key, value: "")
                     }
                     ForEach(options) { option in
@@ -553,8 +621,10 @@ struct TVFilterSheet: View {
         }
     }
 
-    private func chip(title: String, selected: Bool, onTap: @escaping () -> Void) -> some View {
-        TVChip(title: title, selected: selected, onSelect: onTap)
+    private func chip(title: String, selected: Bool,
+                      entryFocus: FocusState<Bool>.Binding? = nil,
+                      onTap: @escaping () -> Void) -> some View {
+        TVChip(title: title, selected: selected, entryFocus: entryFocus, onSelect: onTap)
     }
 
     // Action buttons are built by TVSheetActionButton below

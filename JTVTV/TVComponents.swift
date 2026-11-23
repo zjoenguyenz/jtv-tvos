@@ -159,8 +159,12 @@ private struct TVBadge: View {
 /// (JoeTV Ultra precedent, study §1.5); the WHOLE card — art +
 /// title/meta block — is one Button.
 ///
-/// Select behaviour: if the image failed, the tap retries the
-/// image (internal retryToken bump) and does NOT select.
+/// Select behaviour: if the image failed, the FIRST tap
+/// retries the image (internal retryToken bump) and does NOT
+/// select; a SECOND tap on a still-failed image selects
+/// anyway (A-3, 1.3.9 — a dead image host must not turn the
+/// card into a dead button; the detail screen can still
+/// load from its own host).
 struct TVPosterCard: View {
     let movie: Movie
     var width: CGFloat = 240
@@ -173,16 +177,35 @@ struct TVPosterCard: View {
     ///   focus counter need to know WHICH card holds focus;
     ///   the card's focus state itself stays internal.
     /// - `selectOnImageFailure`: the flow audit's A-3 rule
-    ///   (a card whose image failed still opens its film),
-    ///   adopted by the actor screen from its drawing (audit
-    ///   P-4). Elsewhere the tap keeps retrying the image.
+    ///   for a card whose image failed. The DEFAULT (flag
+    ///   off) is two-tap everywhere: tap 1 retries the
+    ///   image, and tap 2 — the failure still standing —
+    ///   opens the film, so the card never reads as a dead
+    ///   button. The flag opts a surface OUT of the retry
+    ///   tap: the actor screen (audit P-4's drawing rule)
+    ///   selects on the FIRST tap even when the image
+    ///   failed.
     var onFocusChange: ((Bool) -> Void)? = nil
     var selectOnImageFailure: Bool = false
+    /// A-6 (1.3.9): an optional EXTERNAL entry-focus binding
+    /// (a grid's first cell as its screen's landing focus).
+    /// Same contract as TVChip's: when handed in it replaces
+    /// the card's own focus binding — exactly one binding is
+    /// ever attached — and drawing reads `focusActive`.
+    var entryFocus: FocusState<Bool>.Binding? = nil
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var isFocused: Bool
     @State private var imageFailed = false
     @State private var retryToken = 0
+    /// A-3: the current failure has already had its one
+    /// retry tap; the next tap selects. Reset whenever the
+    /// image state clears or the movie changes.
+    @State private var retriedSinceFailure = false
+
+    private var focusActive: Bool {
+        entryFocus?.wrappedValue ?? isFocused
+    }
 
     init(movie: Movie,
          width: CGFloat = 240,
@@ -190,7 +213,8 @@ struct TVPosterCard: View {
          onSelect: @escaping () -> Void,
          onLongPress: @escaping () -> Void,
          onFocusChange: ((Bool) -> Void)? = nil,
-         selectOnImageFailure: Bool = false) {
+         selectOnImageFailure: Bool = false,
+         entryFocus: FocusState<Bool>.Binding? = nil) {
         self.movie = movie
         self.width = width
         self.isFavorite = isFavorite
@@ -198,11 +222,13 @@ struct TVPosterCard: View {
         self.onLongPress = onLongPress
         self.onFocusChange = onFocusChange
         self.selectOnImageFailure = selectOnImageFailure
+        self.entryFocus = entryFocus
     }
 
     var body: some View {
         Button {
-            if imageFailed && !selectOnImageFailure {
+            if imageFailed && !selectOnImageFailure && !retriedSinceFailure {
+                retriedSinceFailure = true
                 retryToken += 1
             } else {
                 // L-T04 breadcrumb D0 (card form): the tap is
@@ -217,7 +243,7 @@ struct TVPosterCard: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(movie.title)
                         .font(.system(size: 25, weight: .semibold))
-                        .foregroundStyle(isFocused && theme.isUltra ? theme.focusRing : theme.textPrimary)
+                        .foregroundStyle(focusActive && theme.isUltra ? theme.focusRing : theme.textPrimary)
                         .lineLimit(2)
                         .frame(width: width, alignment: .leading)
                     HStack(spacing: 8) {
@@ -237,9 +263,12 @@ struct TVPosterCard: View {
             .contentShape(Rectangle())
         }
         .tvCardButton()
-        .focused($isFocused)
-        .onChange(of: movie.id) { imageFailed = false; retryToken = 0 }
-        .onChange(of: isFocused) { _, focused in onFocusChange?(focused) }
+        .focused(entryFocus ?? $isFocused)
+        .onChange(of: movie.id) { imageFailed = false; retryToken = 0; retriedSinceFailure = false }
+        .onChange(of: imageFailed) { _, failed in
+            if !failed { retriedSinceFailure = false }
+        }
+        .onChange(of: focusActive) { _, focused in onFocusChange?(focused) }
         .onLongPressGesture(minimumDuration: 0.5) {
             onLongPress()
         }
@@ -289,12 +318,12 @@ struct TVPosterCard: View {
         // subtle focused fill lift. No second frame.
         .overlay {
             RoundedRectangle(cornerRadius: theme.posterRadius, style: .continuous)
-                .fill(Color.white.opacity(isFocused ? 0.08 : 0))
+                .fill(Color.white.opacity(focusActive ? 0.08 : 0))
         }
         .overlay {
             RoundedRectangle(cornerRadius: theme.posterRadius, style: .continuous)
-                .strokeBorder(isFocused ? theme.focusRing : .clear,
-                              lineWidth: isFocused ? theme.ringWidth : 0)
+                .strokeBorder(focusActive ? theme.focusRing : .clear,
+                              lineWidth: focusActive ? theme.ringWidth : 0)
         }
     }
 }
@@ -313,6 +342,7 @@ struct TVGridPosterCell: View {
     let onLongPress: () -> Void
     var onFocusChange: ((Bool) -> Void)? = nil
     var selectOnImageFailure: Bool = false
+    var entryFocus: FocusState<Bool>.Binding? = nil
 
     init(movie: Movie,
          width: CGFloat = 240,
@@ -320,7 +350,8 @@ struct TVGridPosterCell: View {
          onSelect: @escaping () -> Void,
          onLongPress: @escaping () -> Void,
          onFocusChange: ((Bool) -> Void)? = nil,
-         selectOnImageFailure: Bool = false) {
+         selectOnImageFailure: Bool = false,
+         entryFocus: FocusState<Bool>.Binding? = nil) {
         self.movie = movie
         self.width = width
         self.isFavorite = isFavorite
@@ -328,13 +359,15 @@ struct TVGridPosterCell: View {
         self.onLongPress = onLongPress
         self.onFocusChange = onFocusChange
         self.selectOnImageFailure = selectOnImageFailure
+        self.entryFocus = entryFocus
     }
 
     var body: some View {
         TVPosterCard(movie: movie, width: width, isFavorite: isFavorite,
                      onSelect: onSelect, onLongPress: onLongPress,
                      onFocusChange: onFocusChange,
-                     selectOnImageFailure: selectOnImageFailure)
+                     selectOnImageFailure: selectOnImageFailure,
+                     entryFocus: entryFocus)
     }
 }
 
@@ -469,6 +502,13 @@ struct TVChip: View {
     var badge18: Bool = false
     let selected: Bool
     let onSelect: () -> Void
+    /// A-7 (1.3.9): an optional EXTERNAL entry-focus binding
+    /// (the Settings screen's landing focus). When handed in
+    /// it replaces the chip's own focus binding — exactly one
+    /// binding is ever attached — and the ring reads both
+    /// states, so the chip that carries a screen's entry
+    /// focus still draws its ring.
+    var entryFocus: FocusState<Bool>.Binding? = nil
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var isFocused: Bool
@@ -477,12 +517,18 @@ struct TVChip: View {
          iconURL: String? = nil,
          badge18: Bool = false,
          selected: Bool,
+         entryFocus: FocusState<Bool>.Binding? = nil,
          onSelect: @escaping () -> Void) {
         self.title = title
         self.iconURL = iconURL
         self.badge18 = badge18
         self.selected = selected
+        self.entryFocus = entryFocus
         self.onSelect = onSelect
+    }
+
+    private var focusActive: Bool {
+        isFocused || (entryFocus?.wrappedValue ?? false)
     }
 
     var body: some View {
@@ -509,12 +555,12 @@ struct TVChip: View {
             .padding(.vertical, 13)
             .background(Capsule().fill(selected ? theme.accent : theme.cardFill))
             .overlay(Capsule().strokeBorder(
-                isFocused ? theme.focusRing : (selected ? Color.clear : theme.cardStroke),
-                lineWidth: isFocused ? theme.ringWidth : 1.5))
+                focusActive ? theme.focusRing : (selected ? Color.clear : theme.cardStroke),
+                lineWidth: focusActive ? theme.ringWidth : 1.5))
             .contentShape(Capsule())
         }
         .tvCardButton()
-        .focused($isFocused)
+        .focused(entryFocus ?? $isFocused)
     }
 }
 

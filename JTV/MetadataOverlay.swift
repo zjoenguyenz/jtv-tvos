@@ -246,6 +246,19 @@ enum MetadataOverlay {
 
     private static func mergedCasts(actresses: [String], pluginCasts: String) -> String {
         let pluginEntries = MovieDetail.parseCastEntries(pluginCasts)
+        // 1==1 positional pairing (1.22.21): a single-cast
+        // film has ONE actress — when both lists hold exactly
+        // one entry, the two names are forms of the same
+        // person (the translated-form case: the plugin's
+        // locale name vs the overlay's romaji canonical
+        // name), so the overlay name keeps the plugin entry's
+        // route instead of landing bare and degrading the
+        // chip to keyword search. Multi-cast films keep the
+        // normalize-equal gate below, unchanged.
+        if actresses.count == 1, pluginEntries.count == 1,
+           let route = pluginEntries[0].route {
+            return "[\(actresses[0])](\(route))"
+        }
         return actresses.map { name in
             if let match = pluginEntries.first(where: { ActorName.matches($0.name, name) }),
                let route = match.route {

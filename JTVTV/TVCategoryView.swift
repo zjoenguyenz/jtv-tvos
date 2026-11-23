@@ -35,7 +35,11 @@ struct TVCategoryView: View {
     }
 
     var body: some View {
-        ScrollView {
+        VStack(spacing: 0) {
+            if !plugins.visiblePlugins.isEmpty {
+                chipRail
+            }
+            ScrollView {
             LazyVStack(alignment: .leading, spacing: 40) {
                 if plugins.visiblePlugins.isEmpty {
                     TVEmptyState(icon: "puzzlepiece.extension",
@@ -105,10 +109,37 @@ struct TVCategoryView: View {
             .padding(.horizontal, 80)
             .padding(.vertical, 36)
             .focusScope(focusNS)
+            }
         }
         .tvThemedBackground()
         .onAppear { session.touch() }
         .task(id: plugins.activePluginId) { await load() }
+    }
+
+    /// A-5 (1.3.9, F-05): the plugin switch rail, pinned
+    /// above the scroll region exactly as on Home — switching
+    /// plugin reloads this tab's lists in place (the .task
+    /// above keys on activePluginId) instead of routing the
+    /// user through Home. Unlike Home's rail the chips claim
+    /// no default focus here: the first block's existing
+    /// prefersDefaultFocus stays this screen's single
+    /// landing claim.
+    private var chipRail: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(spacing: 16) {
+                ForEach(plugins.visiblePlugins) { plugin in
+                    TVChip(title: plugin.manifest.name,
+                           iconURL: plugin.manifest.iconUrl,
+                           badge18: plugins.isAdult(plugin.id),
+                           selected: plugin.id == plugins.activePluginId) {
+                        plugins.activePluginId = plugin.id
+                    }
+                }
+            }
+            .padding(.horizontal, 80)
+            .padding(.vertical, 18)
+        }
+        .focusSection()
     }
 
     private var activeId: String { plugins.activePlugin?.id ?? "" }

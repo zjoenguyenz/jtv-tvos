@@ -229,6 +229,15 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
             }
             let finalURL = http.url ?? original
             let served = self.prepare(data: data, finalURL: finalURL)
+            // L-24 witness (instrumentation only): a playlist served
+            // from a DIFFERENT host than requested means the loader
+            // followed a redirect (the vid-snap /v/<token> → o-*
+            // shape). Successes are otherwise deliberately silent
+            // (ring volume) — this one line is the device test's
+            // positive proof the re-serve chain engaged.
+            if served.contentType == "com.apple.mpegurl", finalURL.host != original.host {
+                DiagLog.log("hls", "phase=fetch outcome=playlist-redirect host=\(finalURL.host ?? "?")")
+            }
             // Cache only complete VOD playlists; live playlists must
             // be re-fetched on every pass, segments are never kept.
             let isPlaylist = served.contentType == "com.apple.mpegurl"

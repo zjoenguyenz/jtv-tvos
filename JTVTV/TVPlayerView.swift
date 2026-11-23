@@ -220,6 +220,16 @@ private struct TVPlayerSessionView: View {
             } else if session.presentedPanel == .sources {
                 TVSourcePanelView(session: session)
             }
+            // A-2 (1.3.9): the episode-end action row, shown
+            // when an item ended and auto-advance (B-2) did
+            // not fire. Not a session panel — Menu keeps its
+            // single-arbiter meaning (dismiss the player).
+            // Gate fix: never render it over a session
+            // panel — the two would compete for the
+            // screen's default focus.
+            if session.itemDidEnd, session.presentedPanel == nil {
+                TVEpisodeEndView(session: session)
+            }
         }
         .onExitCommand {
             // THE single Menu arbiter for this cover — the
@@ -499,6 +509,24 @@ private struct TVSourcePanelView: View {
                 }
                 ScrollView {
                     VStack(spacing: 12) {
+                        // A-2 (1.3.9): episode step rows head
+                        // the panel — the adjacent episodes of
+                        // the current server's list, each
+                        // starting from its beginning.
+                        if let previous = session.previousEpisode {
+                            row(id: "__ep_prev", title: "Tập trước · \(previous.name)", checked: false,
+                                disabled: false) {
+                                session.playPreviousEpisode()
+                                session.presentedPanel = nil
+                            }
+                        }
+                        if let next = session.nextEpisode {
+                            row(id: "__ep_next", title: "Tập tiếp theo · \(next.name)", checked: false,
+                                disabled: false) {
+                                session.playNextEpisode()
+                                session.presentedPanel = nil
+                            }
+                        }
                         ForEach(session.switchTargets) { episode in
                             let isCurrent = episode.id == session.currentRequest.episode.id
                             row(id: episode.id, title: episode.name, checked: isCurrent,
@@ -567,6 +595,14 @@ private struct TVSourcePanelView: View {
     /// episode target exists, the first unpinned provider row
     /// (L-T13) takes it; last resort is the current episode.
     private var defaultTargetID: String {
+        // A-2 (1.3.9) + gate fix: the episode step rows
+        // head the panel and are always enabled — the
+        // first of them in visual order is the panel's
+        // first switchable row, so it takes the landing
+        // (the settled panel standard: default focus =
+        // first switchable row).
+        if session.previousEpisode != nil { return "__ep_prev" }
+        if session.nextEpisode != nil { return "__ep_next" }
         if let episode = session.switchTargets.first(where: {
             $0.id != session.currentRequest.episode.id
         }) { return episode.id }
@@ -613,5 +649,83 @@ private struct TVSourcePanelView: View {
             .strokeBorder(isFocused ? theme.focusRing : .clear,
                           lineWidth: isFocused ? theme.ringWidth : 0))
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+}
+
+// MARK: - Episode end (A-2, 1.3.9)
+
+/// The end-of-episode action row: shown when an item ends
+/// and auto-advance (B-2) did not fire (the toggle is off,
+/// or there is no next episode). "Tập tiếp theo" takes
+/// default focus when it exists, else "Xem lại". The row is
+/// an overlay, not a session panel — the cover's single
+/// Menu arbiter keeps its meaning (FL-048).
+private struct TVEpisodeEndView: View {
+    @ObservedObject var session: TVPlayerSession
+
+    @Environment(\.tvTheme) private var theme
+    @FocusState private var focusedAction: Action?
+
+    private enum Action: Hashable {
+        case previous
+        case replay
+        case next
+    }
+
+    var body: some View {
+        VStack {
+            Spacer()
+            VStack(spacing: 20) {
+                Text("Hết tập · \(session.currentRequest.episode.name)")
+                    .font(.system(size: 30, weight: .bold))
+                    .foregroundStyle(theme.textPrimary)
+                    .lineLimit(1)
+                HStack(spacing: 18) {
+                    if session.previousEpisode != nil {
+                        actionButton(.previous, title: "Tập trước", filled: false) {
+                            session.playPreviousEpisode()
+                        }
+                    }
+                    actionButton(.replay, title: "Xem lại", filled: false) {
+                        session.replayCurrentEpisode()
+                    }
+                    if session.nextEpisode != nil {
+                        actionButton(.next, title: "Tập tiếp theo", filled: true) {
+                            session.playNextEpisode()
+                        }
+                    }
+                }
+            }
+            .padding(36)
+            .background(RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .fill(theme.surfaceGradient))
+            .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .strokeBorder(theme.cardStroke, lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .padding(.bottom, 90)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .defaultFocus($focusedAction, session.nextEpisode != nil ? .next : .replay)
+    }
+
+    private func actionButton(_ action: Action, title: String, filled: Bool,
+                              handler: @escaping () -> Void) -> some View {
+        let isFocused = focusedAction == action
+        return Button {
+            handler()
+        } label: {
+            Text(title)
+                .font(.system(size: 27, weight: .bold))
+                .foregroundStyle(filled ? theme.onAccent : theme.textPrimary)
+                .padding(.horizontal, 42)
+                .padding(.vertical, 16)
+                .background(Capsule().fill(filled ? theme.accent : theme.cardFill))
+                .overlay(Capsule().strokeBorder(
+                    isFocused ? theme.focusRing : (filled ? Color.clear : theme.cardStroke),
+                    lineWidth: isFocused ? theme.ringWidth : 1))
+                .contentShape(Capsule())
+        }
+        .tvCardButton()
+        .focused($focusedAction, equals: action)
     }
 }

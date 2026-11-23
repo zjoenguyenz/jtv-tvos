@@ -1297,6 +1297,19 @@ final class MovieService: ObservableObject {
         if let url = URL(string: stream.url), PlaylistSynthesizer.streamxxID(from: url) != nil {
             return stream
         }
+        // JavSnap (L-24/FL-465): the resolve terminal is
+        // https://vid-snap-player.com/v/<token> — no .m3u8 in the URL,
+        // and the playlist behind its 302 is served as text/plain +
+        // nosniff under a .sb name, which AVPlayer refuses outright
+        // (-11828). The disguise is the HLS rescue loader's exact
+        // disease class: start through it on the first attempt.
+        if let host = URL(string: stream.url)?.host?.lowercased(),
+           host == "vid-snap-player.com" || host.hasSuffix(".vid-snap-player.com") {
+            DiagLog.log("resolve", "proxy-mark reason=vidsnap host=\(host)")
+            var marked = stream
+            marked.requiresProxy = true
+            return marked
+        }
         guard stream.url.lowercased().contains(".m3u8") else { return stream }
         let host = URL(string: stream.url)?.host ?? ""
         if !host.isEmpty {
@@ -1589,6 +1602,98 @@ struct ActorContribution {
                              // resolved, zero rows — §13.1a applies)
 }
 
+/// The resolution half of a §13.4 actor resolution: the
+/// route a source assigns the name, reached WITHOUT the
+/// filmography fetch — except where the fetch IS the proof
+/// (njav construction, the javguru construction fallback),
+/// in which case `firstPage` carries the page already
+/// fetched so the merge never pays for it twice.
+struct ActorResolution {
+    let route: String?
+    let avatarUrl: String?   // topxx index resolution only; else nil
+    let outcome: String      // the §13.9 outcome label
+    let firstPage: ListPage?
+}
+
+/// The search probe's verdict (§13.13 amendment): the
+/// winning source (first canonical resolver), its verified
+/// actor route, and how many sources resolved the name.
+struct ActorProbeResult {
+    let pluginId: String
+    let route: String
+    /// Every source that resolved the name, in canonical
+    /// order; the winner (`pluginId`) is the first of these.
+    let resolverIds: [String]
+    var resolverCount: Int { resolverIds.count }
+}
+
+/// Resume-once race box for `actorProbe` — the house race
+/// idiom (DebridPhase2RaceBox / PrefetchJoinBox). The
+/// probe's 6 s deadline must bound the function's RETURN,
+/// which a task group cannot promise: its scope exit waits
+/// for every child, and a child stuck in a long fetch may
+/// not unwind on cancellation. One unstructured task per
+/// source races a deadline task; whichever finishes the
+/// box first — every source recorded, or the deadline —
+/// resumes the continuation and cancels the rest. The
+/// NSLock is the whole confinement story, hence
+/// @unchecked Sendable.
+private final class ActorProbeRaceBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private let total: Int
+    private var continuation: CheckedContinuation<[(pluginId: String, route: String)], Never>?
+    private var resumed = false
+    private var found: [(pluginId: String, route: String)] = []
+    private var completed = 0
+    private var tasks: [Task<Void, Never>] = []
+
+    init(total: Int) { self.total = total }
+
+    func arm(_ continuation: CheckedContinuation<[(pluginId: String, route: String)], Never>) {
+        lock.lock()
+        if resumed {
+            lock.unlock()
+            continuation.resume(returning: [])
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func attach(tasks: [Task<Void, Never>]) {
+        lock.lock()
+        self.tasks = tasks
+        let alreadyResumed = resumed
+        lock.unlock()
+        if alreadyResumed { tasks.forEach { $0.cancel() } }
+    }
+
+    func record(pluginId: String, route: String?) {
+        lock.lock()
+        guard !resumed else { lock.unlock(); return }
+        completed += 1
+        if let route { found.append((pluginId, route)) }
+        let done = completed >= total
+        lock.unlock()
+        if done { finish() }
+    }
+
+    func deadline() { finish() }
+
+    private func finish() {
+        lock.lock()
+        guard !resumed else { lock.unlock(); return }
+        resumed = true
+        let continuation = self.continuation
+        self.continuation = nil
+        let hits = found
+        let tasks = self.tasks
+        lock.unlock()
+        tasks.forEach { $0.cancel() }
+        continuation?.resume(returning: hits)
+    }
+}
+
 extension MovieService {
     /// §13.4: resolves one source's actor filmography for the
     /// cross-source actor page. `nil` means "no contribution"
@@ -1608,9 +1713,40 @@ extension MovieService {
     /// line. Never throws — every failure is an outcome.
     func actorContributionDetailed(pluginId: String, name: String) async
         -> (contribution: ActorContribution?, outcome: String, hits: Int) {
+        let resolution = await resolveActorRoute(pluginId: pluginId, name: name)
+        guard let route = resolution.route else {
+            return (nil, resolution.outcome, 0)
+        }
+        do {
+            let page: ListPage
+            if let carried = resolution.firstPage {
+                page = carried
+            } else {
+                page = try await list(pluginId: pluginId, slug: route, filters: ListFilters(), page: 1)
+            }
+            return (ActorContribution(pluginId: pluginId, route: route,
+                                      avatarUrl: resolution.avatarUrl, firstPage: page),
+                    resolution.outcome, page.items.count)
+        } catch {
+            let nsError = error as NSError
+            return (nil, "error \(nsError.domain)#\(nsError.code)", 0)
+        }
+    }
+
+    /// The resolution half of §13.4: name → the source's OWN
+    /// actor route, WITHOUT fetching the filmography — except
+    /// where the fetch IS the proof (njav construction, the
+    /// javguru construction fallback), in which case the
+    /// resolution carries the page it already fetched so the
+    /// merge never pays for it twice. Shared by
+    /// `actorContributionDetailed` (the merge) and
+    /// `actorProbe` (the search row) so the two can never
+    /// drift: a source resolves under exactly one discipline.
+    /// Never throws — every failure is an outcome label.
+    private func resolveActorRoute(pluginId: String, name: String) async -> ActorResolution {
         guard await manager.installedPlugin(id: pluginId) != nil,
               await manager.isPluginEnabled(pluginId) else {
-            return (nil, "not-installed", 0)
+            return ActorResolution(route: nil, avatarUrl: nil, outcome: "not-installed", firstPage: nil)
         }
         do {
             switch pluginId {
@@ -1624,39 +1760,53 @@ extension MovieService {
                 // njav's own resolution of that exact string.
                 let route = "/en/actor/" + name.replacingOccurrences(of: " ", with: "%20")
                 let page = try await list(pluginId: pluginId, slug: route, filters: ListFilters(), page: 1)
-                guard !page.items.isEmpty else { return (nil, "no-match", 0) }
-                return (ActorContribution(pluginId: pluginId, route: route, avatarUrl: nil, firstPage: page),
-                        "resolved", page.items.count)
-            case "missav", "123av":
+                guard !page.items.isEmpty else {
+                    return ActorResolution(route: nil, avatarUrl: nil, outcome: "no-match", firstPage: nil)
+                }
+                return ActorResolution(route: route, avatarUrl: nil, outcome: "resolved", firstPage: page)
+            case "missav", "123av", "javguru", "javsnap":
                 // Search harvest (§13.4): walk page 1 of the
                 // plugin's own search IN ORDER, at most 3
-                // detail fetches total. An actress-index item
-                // whose title normalize-equals the query
-                // resolves the source with NO detail fetch
-                // spent; otherwise the first detail whose
-                // castEntries carry a routed entry whose name
-                // normalize-equals the query resolves it, and
-                // the route is that entry's route verbatim.
-                let results = try await search(pluginId: pluginId, keyword: name, page: 1)
-                var route: String?
-                var detailBudget = 3
-                for item in results.items {
-                    if item.quality == "ACTRESS", ActorName.matches(item.title, name) {
-                        route = item.id
-                        break
+                // detail fetches total (see harvestActorRoute).
+                let harvest = try await harvestActorRoute(pluginId: pluginId, name: name)
+                if let route = harvest.route {
+                    return ActorResolution(route: route, avatarUrl: nil, outcome: "resolved", firstPage: nil)
+                }
+                if pluginId == "javguru" {
+                    // Bounded secondary (§13.4, 1.22.21): ONE
+                    // construction attempt. jav.guru is
+                    // WordPress — its cast entries prove routes
+                    // are /actress/<slug>/ and WP slugs are the
+                    // sanitized name, so this is the njav
+                    // pattern: the listing itself is the
+                    // source's verdict (non-empty = resolved,
+                    // logged distinctly as resolved-constructed).
+                    let slug = "actress/" + ActorName.normalize(name)
+                        .replacingOccurrences(of: " ", with: "-")
+                    let page = try await list(pluginId: pluginId, slug: slug, filters: ListFilters(), page: 1)
+                    guard !page.items.isEmpty else {
+                        return ActorResolution(route: nil, avatarUrl: nil, outcome: "no-match", firstPage: nil)
                     }
-                    guard detailBudget > 0 else { continue }
-                    detailBudget -= 1
-                    guard let bundle = try? await detailMeta(pluginId: pluginId, movieId: item.id) else { continue }
-                    if let entry = bundle.detail.castEntries.first(where: { $0.route != nil && ActorName.matches($0.name, name) }) {
-                        route = entry.route
-                        break
+                    return ActorResolution(route: slug, avatarUrl: nil, outcome: "resolved-constructed", firstPage: page)
+                }
+                if pluginId == "javsnap", harvest.searchedItems == 0 {
+                    // Zero-harvest fallback (§13.4, 1.22.21):
+                    // javsnap's search is code/title-oriented —
+                    // a name may return nothing at all. Scan
+                    // its actors index (the single page the
+                    // plugin serves) for an ACTRESS item whose
+                    // title normalize-equals the query (the
+                    // topxx shape, capped at that one page).
+                    // Avatar stays nil this round: javsnap's
+                    // index image has not passed the §13.1e
+                    // portrait audit (topxx remains the only
+                    // avatar source).
+                    let page = try await list(pluginId: pluginId, slug: "actors", filters: ListFilters(), page: 1)
+                    if let hit = page.items.first(where: { $0.quality == "ACTRESS" && ActorName.matches($0.title, name) }) {
+                        return ActorResolution(route: hit.id, avatarUrl: nil, outcome: "resolved", firstPage: nil)
                     }
                 }
-                guard let resolvedRoute = route else { return (nil, "no-match", 0) }
-                let page = try await list(pluginId: pluginId, slug: resolvedRoute, filters: ListFilters(), page: 1)
-                return (ActorContribution(pluginId: pluginId, route: resolvedRoute, avatarUrl: nil, firstPage: page),
-                        "resolved", page.items.count)
+                return ActorResolution(route: nil, avatarUrl: nil, outcome: "no-match", firstPage: nil)
             case "topxx":
                 // Bounded index scan (§13.4): the route needs
                 // an `actor-<code>` the app cannot construct
@@ -1671,6 +1821,7 @@ extension MovieService {
                 var route: String?
                 var avatarUrl: String?
                 for indexPage in 1...8 {
+                    try Task.checkCancellation()
                     let page = try await list(pluginId: pluginId, slug: "actors", filters: ListFilters(), page: indexPage)
                     if let hit = page.items.first(where: { $0.quality == "ACTRESS" && ActorName.matches($0.title, name) }) {
                         route = hit.id
@@ -1678,17 +1829,89 @@ extension MovieService {
                         break
                     }
                 }
-                guard let resolvedRoute = route else { return (nil, "unresolved-cap", 0) }
-                let page = try await list(pluginId: pluginId, slug: resolvedRoute, filters: ListFilters(), page: 1)
-                return (ActorContribution(pluginId: pluginId, route: resolvedRoute, avatarUrl: avatarUrl, firstPage: page),
-                        "resolved", page.items.count)
+                guard let resolvedRoute = route else {
+                    return ActorResolution(route: nil, avatarUrl: nil, outcome: "unresolved-cap", firstPage: nil)
+                }
+                return ActorResolution(route: resolvedRoute, avatarUrl: avatarUrl, outcome: "resolved", firstPage: nil)
             default:
-                return (nil, "no-match", 0)
+                return ActorResolution(route: nil, avatarUrl: nil, outcome: "no-match", firstPage: nil)
             }
+        } catch is CancellationError {
+            return ActorResolution(route: nil, avatarUrl: nil, outcome: "cancelled", firstPage: nil)
         } catch {
             let nsError = error as NSError
-            return (nil, "error \(nsError.domain)#\(nsError.code)", 0)
+            return ActorResolution(route: nil, avatarUrl: nil, outcome: "error \(nsError.domain)#\(nsError.code)", firstPage: nil)
         }
+    }
+
+    /// The §13.4 search harvest, shared by every
+    /// search-backed source: walk page 1 of the plugin's own
+    /// search IN ORDER, at most 3 detail fetches total. An
+    /// actress-index item whose title normalize-equals the
+    /// query resolves the source with NO detail fetch spent;
+    /// otherwise the first detail whose castEntries carry a
+    /// routed entry whose name normalize-equals the query
+    /// resolves it, and the route is that entry's route
+    /// verbatim. `searchedItems` is the raw page-1 count —
+    /// the javsnap zero-harvest fallback keys on it.
+    private func harvestActorRoute(pluginId: String, name: String) async throws
+        -> (route: String?, searchedItems: Int) {
+        let results = try await search(pluginId: pluginId, keyword: name, page: 1)
+        var detailBudget = 3
+        for item in results.items {
+            try Task.checkCancellation()
+            if item.quality == "ACTRESS", ActorName.matches(item.title, name) {
+                return (item.id, results.items.count)
+            }
+            guard detailBudget > 0 else { continue }
+            detailBudget -= 1
+            guard let bundle = try? await detailMeta(pluginId: pluginId, movieId: item.id) else { continue }
+            if let entry = bundle.detail.castEntries.first(where: { $0.route != nil && ActorName.matches($0.name, name) }) {
+                return (entry.route, results.items.count)
+            }
+        }
+        return (nil, results.items.count)
+    }
+
+    /// §13.13 amendment (1.22.21): the search-box actress
+    /// probe. Runs the RESOLUTION half of §13.4 — the shared
+    /// `resolveActorRoute`, so probe and merge can never
+    /// drift — for every canonical source in parallel under
+    /// a 6 s soft deadline, and reports the first canonical
+    /// resolver. A hit requires the source's own exact §13.4
+    /// gate; the typed text alone is never trusted as an
+    /// actress name, and the probe never blocks or delays
+    /// the film results it rides alongside. Sources that
+    /// miss the deadline simply don't count. avdbapi is NOT
+    /// a signal (§13.13: its `wd=` search returns films, not
+    /// an actor entity); vlxx keyword search likewise.
+    func actorProbe(name: String) async -> ActorProbeResult? {
+        guard !ActorName.normalize(name).isEmpty else { return nil }
+        let started = Date()
+        let sources = ActorMerge.canonicalOrder
+        let box = ActorProbeRaceBox(total: sources.count)
+        let hits: [(pluginId: String, route: String)] = await withCheckedContinuation { continuation in
+            box.arm(continuation)
+            var tasks: [Task<Void, Never>] = sources.map { pluginId in
+                Task {
+                    let resolution = await self.resolveActorRoute(pluginId: pluginId, name: name)
+                    box.record(pluginId: pluginId, route: resolution.route)
+                }
+            }
+            tasks.append(Task {
+                try? await Task.sleep(for: .seconds(6))
+                box.deadline()
+            })
+            box.attach(tasks: tasks)
+        }
+        let resolverIds = sources.filter { id in hits.contains { $0.pluginId == id } }
+        guard let winner = resolverIds.first,
+              let winningRoute = hits.first(where: { $0.pluginId == winner })?.route else {
+            DiagLog.log("actor", "actor-probe outcome=miss sources=none ms=\(Self.fallbackMs(since: started))")
+            return nil
+        }
+        DiagLog.log("actor", "actor-probe outcome=hit sources=\(resolverIds.joined(separator: ",")) ms=\(Self.fallbackMs(since: started))")
+        return ActorProbeResult(pluginId: winner, route: winningRoute, resolverIds: resolverIds)
     }
 }
 
@@ -1740,12 +1963,21 @@ final class ActorMergeCoordinator {
 
     private enum TargetState {
         case pending
+        /// Past the 8 s soft deadline (§13.5 amendment): the
+        /// page has visibly settled without this target, but
+        /// it keeps resolving under the 20 s ceiling and its
+        /// block appends at the END when it lands.
+        case deferred
         case settled(ActorContribution?)
     }
     private var targetStates: [String: TargetState] = [:]
     private var releaseIndex = 0
+    private var releasedTargets: Set<String> = []
+    private var softFired = false
+    private(set) var fullySettled = false
     private var targetTasks: [String: Task<Void, Never>] = [:]
     private var budgetTask: Task<Void, Never>?
+    private var softTask: Task<Void, Never>?
     private var isLoadingMore = false
 
     init(service: MovieService, originPluginId: String, name: String) {
@@ -1777,6 +2009,7 @@ final class ActorMergeCoordinator {
         // merge at all — the page is exactly today's.
         guard !ActorName.normalize(name).isEmpty else {
             settled = true
+            fullySettled = true
             logSettled()
             onChange?()
             return
@@ -1792,6 +2025,11 @@ final class ActorMergeCoordinator {
             try? await Task.sleep(for: .seconds(45))
             guard let self, !Task.isCancelled else { return }
             self.enforceTotalBudget()
+        }
+        softTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            guard let self, !Task.isCancelled else { return }
+            self.applySoftDeadline()
         }
         onChange?()
     }
@@ -1815,12 +2053,15 @@ final class ActorMergeCoordinator {
         // could land ahead of that block, or dedupe against a
         // seen-set missing the block's codes and invert the
         // first-occurrence winner rule (the page-2 copy would
-        // survive and the page-1 copy drop). Once settled,
-        // every block is released by construction
-        // (finishIfSettled requires releaseIndex ==
-        // targets.count), so pagination proceeds under the
-        // complete seen-set and the winner rule holds across
-        // pages.
+        // survive and the page-1 copy drop).
+        // §13.5 amendment (soft deadline): `settled` now also
+        // flips at the 8 s soft deadline with some targets
+        // DEFERRED. Pagination then proceeds over INSTALLED
+        // cursors only — a deferred source has no cursor yet,
+        // so its own page-N can never precede its page-1 block
+        // (F-A5 holds for it), and when its page-1 lands it
+        // appends at the end under the same dedupe rules,
+        // the on-screen copy winning any shared code.
         guard began, !frozen, !isLoadingMore, settled else { return }
         let orderedIds = [originPluginId] + targets
         var fetchList: [(pluginId: String, route: String, page: Int)] = []
@@ -1866,6 +2107,7 @@ final class ActorMergeCoordinator {
         frozen = true
         for task in targetTasks.values { task.cancel() }
         budgetTask?.cancel()
+        softTask?.cancel()
     }
 
     // MARK: Target resolution
@@ -1880,7 +2122,14 @@ final class ActorMergeCoordinator {
         let started = Date()
         let result = await runTargetWithCeiling(pluginId)
         guard !frozen else { return }
-        guard let state = targetStates[pluginId], case .pending = state else { return }
+        // A deferred target's late landing is processed exactly
+        // like an on-time one; only an already-settled state
+        // (the 45 s budget forced it empty) drops the result.
+        guard let state = targetStates[pluginId] else { return }
+        switch state {
+        case .settled: return
+        case .pending, .deferred: break
+        }
         DiagLog.log("actor", "merge source=\(pluginId) outcome=\(result.outcome) hits=\(result.hits) ms=\(Self.ms(since: started))")
         targetStates[pluginId] = .settled(result.contribution)
         if let contribution = result.contribution {
@@ -1948,10 +2197,14 @@ final class ActorMergeCoordinator {
     /// is already settled when the completion lands, so the
     /// completion drops it without a second log line).
     private func enforceTotalBudget() {
-        guard !frozen, !settled else { return }
+        guard !frozen, !fullySettled else { return }
         var forced = false
         for target in targets {
-            guard let state = targetStates[target], case .pending = state else { continue }
+            guard let state = targetStates[target] else { continue }
+            switch state {
+            case .settled: continue
+            case .pending, .deferred: break
+            }
             DiagLog.log("actor", "merge source=\(target) outcome=timeout hits=0 ms=\(Self.ms(since: beginDate ?? Date()))")
             targetStates[target] = .settled(nil)
             targetTasks[target]?.cancel()
@@ -1964,6 +2217,38 @@ final class ActorMergeCoordinator {
         }
     }
 
+    /// The 8 s soft deadline (§13.5 amendment): the merge's
+    /// visible settle must not wait on the slowest source —
+    /// the device evidence (2026-11-23) showed every healthy
+    /// answer in by 3.3 s while one 20 s ceiling held the
+    /// page's header and pagination hostage. When the deadline
+    /// fires, every still-pending target becomes DEFERRED:
+    /// settled blocks release in canonical order (skipping
+    /// deferred), `settled` flips (header settles, pagination
+    /// unlocks), and each deferred target keeps resolving
+    /// under the existing 20 s ceiling — when it lands, its
+    /// block appends at the END via the normal release path
+    /// (§13.1 append invariants preserved in full). The
+    /// `merge settled` log line still fires only at true
+    /// full settle (finishIfSettled).
+    private func applySoftDeadline() {
+        guard began, !frozen, !fullySettled else { return }
+        var pending: [String] = []
+        for target in targets {
+            guard let state = targetStates[target], case .pending = state else { continue }
+            targetStates[target] = .deferred
+            pending.append(target)
+        }
+        softFired = true
+        if !pending.isEmpty {
+            DiagLog.log("actor", "merge soft-settled pending=\(pending.joined(separator: ",")) ms=\(Self.ms(since: beginDate ?? Date()))")
+        }
+        releaseReadyBlocks()
+        if !settled { settled = true }
+        finishIfSettled()
+        onChange?()
+    }
+
     // MARK: Ordered release + dedupe
 
     /// Ordered release (§13.1g): target blocks append whole,
@@ -1971,11 +2256,32 @@ final class ActorMergeCoordinator {
     /// every earlier target block have settled (resolved,
     /// failed, or timed out). The origin's rows published in
     /// `begin`, the moment the origin settled.
+    /// Post-soft-deadline (§13.5 amendment): ordered release
+    /// is relaxed for DEFERRED blocks only — settled blocks
+    /// release in canonical scan order skipping deferred
+    /// ones, and a deferred block appends at the end when it
+    /// lands. The §13.1 append invariants (never insert
+    /// above/between on-screen rows, never reorder on-screen
+    /// rows) hold in both modes.
     private func releaseReadyBlocks() {
+        if softFired {
+            for target in targets where !releasedTargets.contains(target) {
+                guard let state = targetStates[target],
+                      case .settled(let contribution) = state else { continue }
+                releasedTargets.insert(target)
+                guard let contribution else { continue }
+                if target == "topxx", let avatar = contribution.avatarUrl {
+                    avatarUrl = avatar
+                }
+                appendBlock(pluginId: target, movies: contribution.firstPage.items, isOrigin: false)
+            }
+            return
+        }
         while releaseIndex < targets.count {
             let target = targets[releaseIndex]
             guard let state = targetStates[target], case .settled(let contribution) = state else { return }
             releaseIndex += 1
+            releasedTargets.insert(target)
             guard let contribution else { continue }
             if target == "topxx", let avatar = contribution.avatarUrl {
                 avatarUrl = avatar
@@ -2032,9 +2338,21 @@ final class ActorMergeCoordinator {
         contributors = ordered
     }
 
+    /// True full settle: every target reached a final state.
+    /// The visible `settled` flag may already be up (soft
+    /// deadline), but the `merge settled` log line fires
+    /// exactly once — here, when the merge is genuinely
+    /// complete (or in `begin`'s empty-name early exit).
     private func finishIfSettled() {
-        guard !settled, releaseIndex >= targets.count else { return }
+        guard !fullySettled else { return }
+        let allSettled = targets.allSatisfy { target in
+            guard let state = targetStates[target], case .settled = state else { return false }
+            return true
+        }
+        guard allSettled else { return }
+        fullySettled = true
         settled = true
+        softTask?.cancel()
         budgetTask?.cancel()
         logSettled()
     }

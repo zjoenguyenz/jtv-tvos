@@ -74,6 +74,12 @@ struct TVActorView: View {
     @State private var contributors: [String] = []
     @State private var mergedAvatarUrl: String?
     @State private var mergeSettled = false
+    /// Gate fix G-14: the coordinator's FULL settle (soft
+    /// deadline + every deferred source resolved) — the
+    /// §13.1f FINALITY branches key on this, exactly as the
+    /// iOS ActorView does; the header/running states keep
+    /// the soft `mergeSettled` (§14.2).
+    @State private var mergeFullySettled = false
     @State private var originFailed = false
 
     // §13.1e borrowed-avatar state (TopXX only).
@@ -120,7 +126,7 @@ struct TVActorView: View {
     /// landed yet (any loadError state — contributed rows, not
     /// the error surface, are this state's resolution).
     private var isRunningAtZero: Bool {
-        didLoad && !mergeSettled && rows.isEmpty
+        didLoad && !mergeFullySettled && rows.isEmpty
     }
 
     var body: some View {
@@ -315,7 +321,7 @@ struct TVActorView: View {
     @ViewBuilder
     private var metaLine: some View {
         if didLoad {
-            if originFailed && mergeSettled && rows.isEmpty {
+            if originFailed && mergeFullySettled && rows.isEmpty {
                 // §13.1f: the merge settled empty over a
                 // failed origin — today's failure copy (the
                 // grid zone shows the error surface itself).
@@ -403,7 +409,7 @@ struct TVActorView: View {
     /// has SETTLED with zero rows and no origin failure —
     /// while the merge runs at zero rows the page waits
     /// (isRunningAtZero), it does not declare itself empty.
-    private var isEmptyResult: Bool { didLoad && loadError == nil && rows.isEmpty && mergeSettled }
+    private var isEmptyResult: Bool { didLoad && loadError == nil && rows.isEmpty && mergeFullySettled }
 
     private var leftColumn: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -457,7 +463,7 @@ struct TVActorView: View {
             ProgressView()
                 .tint(.white)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let loadError, rows.isEmpty && mergeSettled {
+        } else if let loadError, rows.isEmpty && mergeFullySettled {
             // Audit P-4: the actor grid's failure uses the
             // shared error surface with the A-9 default-focus
             // opt-in, so the retry is the landing focus.
@@ -762,12 +768,14 @@ struct TVActorView: View {
         coordinator.originRoute = route
         coordinator.onChange = { [weak coordinator, rowsBox = _rows, contributorsBox = _contributors,
                                   avatarBox = _mergedAvatarUrl, settledBox = _mergeSettled,
+                                  fullySettledBox = _mergeFullySettled,
                                   failedBox = _originFailed] in
             guard let coordinator else { return }
             rowsBox.wrappedValue = coordinator.rows
             contributorsBox.wrappedValue = coordinator.contributors
             avatarBox.wrappedValue = coordinator.avatarUrl
             settledBox.wrappedValue = coordinator.settled
+            fullySettledBox.wrappedValue = coordinator.fullySettled
             failedBox.wrappedValue = coordinator.originFailed
         }
         mergeCoordinator = coordinator
@@ -775,6 +783,7 @@ struct TVActorView: View {
         contributors = []
         mergedAvatarUrl = nil
         mergeSettled = false
+        mergeFullySettled = false
         originFailed = false
         focusedRow = nil
         do {

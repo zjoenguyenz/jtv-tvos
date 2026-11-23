@@ -26,6 +26,23 @@ final class TVHomeStore {
     private var loadedAt: Date?
     private var generation = 0
 
+    /// A-14 (1.3.9): per-plugin snapshots of a completed
+    /// load. Switching A→B→A inside the freshness window
+    /// restores A's snapshot instead of refetching every
+    /// section (the pre-A-14 store cleared items on any
+    /// plugin change, so the 600 s freshness only ever
+    /// helped a same-plugin revisit).
+    private struct PluginSnapshot {
+        var sections: [HomeSection]
+        var items: [String: [Movie]]
+        var sectionErrors: [String: String]
+        var heroMovie: Movie?
+        var loadedAt: Date
+    }
+    private var snapshots: [String: PluginSnapshot] = [:]
+
+    private static let freshnessWindow: TimeInterval = 600
+
     /// Every loaded movie for the currently loaded plugin,
     /// deduped by id — Search's on-device pool (JoeTV mechanism:
     /// paint instantly from what the device already holds).
@@ -55,11 +72,34 @@ final class TVHomeStore {
             return
         }
         if !force, !isLoading, loadedPluginId == pid, let loadedAt,
-           Date().timeIntervalSince(loadedAt) < 600 {
+           Date().timeIntervalSince(loadedAt) < Self.freshnessWindow {
+            isLoading = false
+            return
+        }
+        // A-14: a fresh snapshot of the TARGET plugin
+        // restores instantly — no section refetch.
+        if !force, let snapshot = snapshots[pid],
+           Date().timeIntervalSince(snapshot.loadedAt) < Self.freshnessWindow {
+            sections = snapshot.sections
+            items = snapshot.items
+            sectionErrors = snapshot.sectionErrors
+            heroMovie = snapshot.heroMovie
+            loadedPluginId = pid
+            loadedAt = snapshot.loadedAt
+            didLoad = true
             isLoading = false
             return
         }
         if loadedPluginId != pid {
+            // A-14: stash the outgoing plugin's published
+            // state before clearing, so coming back to it
+            // inside the window is a restore, not a reload.
+            if let outgoing = loadedPluginId, didLoad, let outAt = loadedAt {
+                snapshots[outgoing] = PluginSnapshot(
+                    sections: sections, items: items,
+                    sectionErrors: sectionErrors,
+                    heroMovie: heroMovie, loadedAt: outAt)
+            }
             heroMovie = nil
             items = [:]
             sectionErrors = [:]
@@ -74,6 +114,9 @@ final class TVHomeStore {
             didLoad = true
             isLoading = false
             loadedAt = Date()
+            snapshots[pid] = PluginSnapshot(
+                sections: secs, items: items, sectionErrors: sectionErrors,
+                heroMovie: nil, loadedAt: Date())
             return
         }
         // Per-section page-1 fetches in parallel; each row
@@ -121,6 +164,9 @@ final class TVHomeStore {
             didLoad = true
             isLoading = false
             loadedAt = Date()
+            snapshots[pid] = PluginSnapshot(
+                sections: sections, items: items, sectionErrors: sectionErrors,
+                heroMovie: hero, loadedAt: Date())
         }
     }
 }
@@ -203,6 +249,18 @@ struct TVHomeView: View {
                     continueWatchingBand
                         .focusSection()
                 }
+                // A-10 (1.3.9) + design pass D-5: the poster
+                // bands' long-press favourite toggle gets its
+                // ONE hint line here — every rail card and
+                // every grid cell below toggles favourite on
+                // long press, and the line is stated once for
+                // the whole screen, not repeated per band.
+                if plugins.activePlugin != nil,
+                   store.sections.contains(where: { !(store.items[$0.id] ?? []).isEmpty }) {
+                    Text("Giữ lâu một thẻ để ghim / bỏ ghim yêu thích")
+                        .font(.system(size: 23))
+                        .foregroundStyle(theme.textDim)
+                }
                 ForEach(store.sections) { section in
                     if let error = store.sectionErrors[section.id], (store.items[section.id] ?? []).isEmpty {
                         sectionBand(section)
@@ -238,6 +296,11 @@ struct TVHomeView: View {
     private var continueWatchingBand: some View {
         VStack(alignment: .leading, spacing: 18) {
             TVSectionHeader(title: "Đang xem tiếp")
+            // A-10 (1.3.9): the long-press gesture gets a
+            // discoverable hint line.
+            Text("Giữ lâu một thẻ để xoá khỏi Đang xem tiếp")
+                .font(.system(size: 23))
+                .foregroundStyle(theme.textDim)
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(spacing: 24) {
                     ForEach(history.continueWatching) { record in
@@ -347,12 +410,17 @@ private struct TVHeroCard: View {
     @FocusState private var isFocused: Bool
     @State private var imageFailed = false
     @State private var retryToken = 0
+    /// A-3 (1.3.9): the current failure has had its one
+    /// retry tap; the next tap selects (the poster card's
+    /// two-tap rule, hero form).
+    @State private var retriedSinceFailure = false
 
     private let radius: CGFloat = 22
 
     var body: some View {
         Button {
-            if imageFailed {
+            if imageFailed && !retriedSinceFailure {
+                retriedSinceFailure = true
                 retryToken += 1
             } else {
                 onSelect()
@@ -426,6 +494,9 @@ private struct TVHeroCard: View {
         }
         .tvCardButton()
         .focused($isFocused)
-        .onChange(of: movie.id) { imageFailed = false; retryToken = 0 }
+        .onChange(of: movie.id) { imageFailed = false; retryToken = 0; retriedSinceFailure = false }
+        .onChange(of: imageFailed) { _, failed in
+            if !failed { retriedSinceFailure = false }
+        }
     }
 }

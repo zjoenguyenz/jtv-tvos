@@ -1,6 +1,44 @@
 import SwiftUI
 import UIKit
 
+// MARK: - In-strip resume store (A-12, 1.3.9)
+
+/// tvOS-side auxiliary manga resume store. The shared
+/// history record (the iOS shape, unchanged) carries only
+/// the STRIP index; the page WITHIN the strip
+/// (segmentIndex) lives here, keyed by plugin|movie and
+/// holding the (episode, strip, segment) triple it was
+/// written for. A stored segment applies only when the
+/// resume point matches its episode AND strip exactly —
+/// anything else degrades to the strip's first page, as
+/// before. Values are pipe-joined with the episode id
+/// FIRST and the two integers LAST, so an episode id that
+/// itself contains "|" still parses (the integers are read
+/// from the tail).
+enum TVMangaPositionStore {
+    private static let prefix = "jtv_manga_pos|"
+
+    static func save(pluginId: String, movieId: String,
+                     episodeId: String, imageIndex: Int, segmentIndex: Int) {
+        UserDefaults.standard.set("\(episodeId)|\(imageIndex)|\(segmentIndex)",
+                                  forKey: prefix + pluginId + "|" + movieId)
+    }
+
+    static func segment(pluginId: String, movieId: String,
+                        episodeId: String, imageIndex: Int) -> Int? {
+        guard let raw = UserDefaults.standard.string(forKey: prefix + pluginId + "|" + movieId)
+        else { return nil }
+        let parts = raw.split(separator: "|")
+        guard parts.count >= 3,
+              let storedImage = Int(parts[parts.count - 2]),
+              let storedSegment = Int(parts[parts.count - 1]),
+              storedImage == imageIndex,
+              parts.dropLast(2).joined(separator: "|") == episodeId
+        else { return nil }
+        return storedSegment
+    }
+}
+
 /// JTV tvOS manga reader — PAGE MODE (1.3.2 staging, L-T18 /
 /// FL-394). Rebuilt from the 1.3.0 stepped-window reader after
 /// the owner's device verdict: "Nó hiện là hiển thị dạng cột
@@ -130,6 +168,10 @@ struct TVMangaReaderView: View {
     @State private var viewportSize: CGSize = CGSize(width: 1920, height: 1080)
     @FocusState private var surfaceFocused: Bool
     @FocusState private var barFocus: BarButton?
+    /// A-1 (1.3.9): the "Đi tới trang" panel's digit entry
+    /// and focus (string ids — the TVSourcePanelView pattern).
+    @State private var goToDigits = ""
+    @FocusState private var goToFocus: String?
 
     private enum BarButton: Hashable {
         case prev, next, retry, close, loading
@@ -147,8 +189,18 @@ struct TVMangaReaderView: View {
         // clamped into the chapter (iOS MangaReaderView:134-139);
         // page mode lands on that strip's first page.
         let start = Int(request.startPosition)
-        _imageIndex = State(initialValue: initialStream.images.isEmpty
-                            ? 0 : min(max(0, start), initialStream.images.count - 1))
+        let startIndex = initialStream.images.isEmpty
+            ? 0 : min(max(0, start), initialStream.images.count - 1)
+        _imageIndex = State(initialValue: startIndex)
+        // A-12 (1.3.9): when the tvOS aux store holds an
+        // in-strip page for exactly this episode + strip,
+        // resume lands on THAT page instead of the strip's
+        // first; the load completion clamps it against the
+        // strip's real page count.
+        let storedSegment = TVMangaPositionStore.segment(
+            pluginId: request.pluginId, movieId: request.movie.id,
+            episodeId: request.episode.id, imageIndex: startIndex) ?? 0
+        _segmentIndex = State(initialValue: storedSegment)
     }
 
     private var request: PlaybackRequest { session.currentRequest }
@@ -347,9 +399,16 @@ struct TVMangaReaderView: View {
             // nothing interactive: while the chapter-end bar is
             // presented it is removed so focus lands on the
             // bar's buttons.
+            if session.presentedPanel == .mangaGoToPage {
+                goToPagePanel
+            }
             if session.presentedPanel == nil {
                 TVMangaPressSurface(onForward: { stepForward() },
-                                    onBack: { stepBack() })
+                                    onBack: { stepBack() },
+                                    onGoToPage: {
+                                        goToDigits = ""
+                                        session.presentedPanel = .mangaGoToPage
+                                    })
                     .focused($surfaceFocused)
                     .ignoresSafeArea()
             }
@@ -382,6 +441,9 @@ struct TVMangaReaderView: View {
         }
         .onChange(of: imageIndex) { _, _ in
             saveProgress()
+        }
+        .onChange(of: segmentIndex) { _, _ in
+            saveAuxPosition()
         }
         .onChange(of: session.presentedPanel) { _, panel in
             if panel == nil {
@@ -471,7 +533,7 @@ struct TVMangaReaderView: View {
                     .font(.system(size: 28, weight: .bold))
                     .foregroundStyle(theme.textPrimary)
                     .lineLimit(1)
-                Text("Chap \(chapterDisplayName) • \(pageIndicatorText) • ◂ ▸ để lật trang")
+                Text("Chap \(chapterDisplayName) • \(pageIndicatorText) • ◂ ▸ lật trang • giữ ◂ ▸ để lướt • giữ OK: Đi tới trang")
                     .font(.system(size: 22))
                     .foregroundStyle(theme.textDim)
             }
@@ -604,6 +666,143 @@ struct TVMangaReaderView: View {
         .tvCardButton()
         .focused($barFocus, equals: id)
         .disabled(!enabled || isLoadingChapter)
+    }
+
+    // MARK: Go-to-page panel (A-1, 1.3.9)
+
+    /// The jump panel (opened by holding OK on the press
+    /// surface): a digit pad over the chapter's FLAT page
+    /// numbering — the same "Trang X/Y" the indicator shows.
+    /// A jump needs every strip measured (the background
+    /// indexer provides the counts); until then "Đi tới"
+    /// stays disabled and the panel says why.
+    private var goToPagePanel: some View {
+        ZStack {
+            Color.black.opacity(0.55).ignoresSafeArea()
+            VStack(spacing: 22) {
+                Text("Đi tới trang")
+                    .font(.system(size: 32, weight: .bold))
+                    .foregroundStyle(theme.textPrimary)
+                Text(goToStatusText)
+                    .font(.system(size: 24))
+                    .foregroundStyle(theme.textDim)
+                Text(goToDigits.isEmpty ? "––––" : goToDigits)
+                    .font(.system(size: 46, weight: .bold))
+                    .foregroundStyle(theme.textPrimary)
+                VStack(spacing: 12) {
+                    HStack(spacing: 12) {
+                        goToDigitButton(1)
+                        goToDigitButton(2)
+                        goToDigitButton(3)
+                    }
+                    HStack(spacing: 12) {
+                        goToDigitButton(4)
+                        goToDigitButton(5)
+                        goToDigitButton(6)
+                    }
+                    HStack(spacing: 12) {
+                        goToDigitButton(7)
+                        goToDigitButton(8)
+                        goToDigitButton(9)
+                    }
+                    HStack(spacing: 12) {
+                        goToButton(id: "clear", title: "Xoá", enabled: !goToDigits.isEmpty) {
+                            goToDigits = ""
+                        }
+                        goToDigitButton(0)
+                        goToButton(id: "go", title: "Đi tới", enabled: goToTarget != nil) {
+                            if let target = goToTarget {
+                                jumpToFlatPage(target)
+                            }
+                        }
+                    }
+                }
+                goToButton(id: "close", title: "Đóng", enabled: true) {
+                    session.presentedPanel = nil
+                }
+            }
+            .padding(44)
+            .frame(width: 720)
+            .background(RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .fill(theme.surfaceGradient))
+            .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .strokeBorder(theme.cardStroke, lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+        }
+        .defaultFocus($goToFocus, "d5")
+    }
+
+    private var goToStatusText: String {
+        // Out-of-range entry: say so, with the valid
+        // range — the disabled "Đi tới" must never be a
+        // silent gate (D-2).
+        if let total = totalPages, let value = Int(goToDigits),
+           !goToDigits.isEmpty, value < 1 || value > total {
+            return "Chương có \(total) trang — nhập số từ 1 đến \(total)"
+        }
+        if let flat = flatPageNumber, let total = totalPages {
+            return "Trang hiện tại \(flat)/\(total) — nhập số trang rồi bấm Đi tới"
+        }
+        return "Đang đo số trang của chương…"
+    }
+
+    /// The entered page as a jumpable target: non-empty, in
+    /// range, and the chapter fully measured.
+    private var goToTarget: Int? {
+        guard let total = totalPages, let value = Int(goToDigits),
+              value >= 1, value <= total else { return nil }
+        return value
+    }
+
+    private func goToDigitButton(_ digit: Int) -> some View {
+        goToButton(id: "d\(digit)", title: "\(digit)", enabled: true) {
+            guard goToDigits.count < 4 else { return }
+            goToDigits += "\(digit)"
+        }
+    }
+
+    private func goToButton(id: String, title: String, enabled: Bool,
+                            action: @escaping () -> Void) -> some View {
+        let isFocused = goToFocus == id
+        return Button {
+            action()
+        } label: {
+            Text(title)
+                .font(.system(size: 27, weight: .bold))
+                .foregroundStyle(enabled ? theme.textPrimary : theme.textFaint)
+                .frame(minWidth: 92)
+                .padding(.horizontal, 26)
+                .padding(.vertical, 14)
+                .background(Capsule().fill(enabled ? theme.cardFill : Color.white.opacity(0.06)))
+                .overlay(Capsule().strokeBorder(
+                    isFocused && enabled ? theme.focusRing : .clear,
+                    lineWidth: isFocused && enabled ? theme.ringWidth : 0))
+                .contentShape(Capsule())
+        }
+        .tvCardButton()
+        .focused($goToFocus, equals: id)
+        .disabled(!enabled)
+    }
+
+    /// Maps a flat 1-based page number to (strip, segment)
+    /// through the measured counts and lands there. Only
+    /// reachable with a complete measurement (goToTarget),
+    /// so every count exists.
+    private func jumpToFlatPage(_ target: Int) {
+        var remaining = target
+        for idx in stream.images.indices {
+            let count = segmentCounts[idx] ?? 1
+            if remaining <= count {
+                imageIndex = idx
+                segmentIndex = remaining - 1
+                landOnLastSegment = false
+                break
+            }
+            remaining -= count
+        }
+        goToDigits = ""
+        session.presentedPanel = nil
+        DiagLog.log("manga", "goto page=\(target)")
     }
 
     // MARK: Paging
@@ -921,6 +1120,20 @@ struct TVMangaReaderView: View {
             duration: Double(max(stream.images.count, 1)),
             updatedAt: Date())
         session.mangaHistory.upsert(record, force: force)
+        saveAuxPosition()
+    }
+
+    /// A-12 (1.3.9): the in-strip page, written to the tvOS
+    /// aux store on every progress save AND on every page
+    /// turn within a strip (a segment change alone does not
+    /// upsert the shared record — its shape and cadence stay
+    /// the iOS ones).
+    private func saveAuxPosition() {
+        TVMangaPositionStore.save(pluginId: request.pluginId,
+                                  movieId: request.movie.id,
+                                  episodeId: currentEpisode.id,
+                                  imageIndex: imageIndex,
+                                  segmentIndex: segmentIndex)
     }
 }
 
@@ -933,46 +1146,215 @@ struct TVMangaReaderView: View {
 private struct TVMangaPressSurface: UIViewRepresentable {
     let onForward: () -> Void
     let onBack: () -> Void
+    let onGoToPage: () -> Void
 
     func makeUIView(context: Context) -> TVMangaPressView {
         let view = TVMangaPressView()
         view.onForward = onForward
         view.onBack = onBack
+        view.onGoToPage = onGoToPage
         return view
     }
 
     func updateUIView(_ uiView: TVMangaPressView, context: Context) {
         uiView.onForward = onForward
         uiView.onBack = onBack
+        uiView.onGoToPage = onGoToPage
     }
 }
 
 private final class TVMangaPressView: UIView {
     var onForward: (() -> Void)?
     var onBack: (() -> Void)?
+    var onGoToPage: (() -> Void)?
 
     override var canBecomeFocused: Bool { true }
 
-    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        var handled = false
+    // MARK: Hold-repeat (A-1, 1.3.9)
+    //
+    // A held ▸/◂ repeats the page step with acceleration
+    // (the F-01 fix: reaching a far page drops from hundreds
+    // of presses to a short hold). A tap still steps exactly
+    // once, in pressesEnded as always — the repeat's first
+    // tick waits 0.45 s, past any tap. Holding OK (select)
+    // for 0.6 s opens the "Đi tới trang" panel instead of
+    // stepping; the consumed press's step is suppressed in
+    // pressesEnded. The hold TIMERS reset when the view
+    // leaves the window (a presented panel removes this
+    // surface — a hold must not outlive it), but
+    // `selectConsumed` deliberately survives removal: the
+    // hold that opened the panel is what removed the
+    // surface, and the marker must live until the press
+    // resolves (pressesEnded / pressesCancelled / the
+    // next pressesBegan), or the release would step a
+    // page behind the panel it opened (gate fix).
+
+    private var holdTimer: Timer?
+    private var holdDirection = 0
+    private var holdTicks = 0
+    private var selectHoldTimer: Timer?
+    private var selectConsumed = false
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        // Gate fix: press delivery is per-press, not
+        // per-set — a set carrying ANY type this view does
+        // not consume is forwarded to super, so an
+        // unhandled press's began-phase is never dropped
+        // for the rest of the responder chain.
+        var sawUnhandled = false
         for press in presses {
             switch press.type {
-            case .rightArrow, .downArrow, .select, .playPause:
-                onForward?()
+            case .rightArrow:
+                startHold(direction: 1)
+            case .leftArrow:
+                startHold(direction: -1)
+            case .select:
+                startSelectHold()
+            default:
+                sawUnhandled = true
+            }
+        }
+        if sawUnhandled {
+            super.pressesBegan(presses, with: event)
+        }
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var handled = false
+        // Gate fix (round 2): the same per-press rule as
+        // pressesBegan/pressesCancelled — a set carrying
+        // ANY type this view does not handle is forwarded
+        // to super even when a sibling press was handled,
+        // so the unhandled press's ended-phase is never
+        // swallowed by the aggregate gate.
+        var sawUnhandled = false
+        for press in presses {
+            switch press.type {
+            case .rightArrow, .downArrow, .playPause:
+                // Gate fix (A-1): if the hold-repeat
+                // already ticked, the release is not
+                // another step — a hold lands exactly on
+                // the page the user held to. A plain tap
+                // (no tick yet) still steps once, here.
+                var step = true
+                if press.type == .rightArrow {
+                    step = holdTicks == 0
+                    stopHold()
+                }
+                if step { onForward?() }
                 handled = true
+            case .select:
+                cancelSelectHold()
+                if selectConsumed {
+                    // The hold opened the go-to panel; this
+                    // release is not a page step.
+                    selectConsumed = false
+                    handled = true
+                } else {
+                    onForward?()
+                    handled = true
+                }
             case .leftArrow, .upArrow:
-                onBack?()
+                // Same hold-release rule as ▸ above.
+                var step = true
+                if press.type == .leftArrow {
+                    step = holdTicks == 0
+                    stopHold()
+                }
+                if step { onBack?() }
                 handled = true
             case .menu:
                 // Never handled here — Menu propagates to the
                 // shell's Menu arbitration (FL-048).
-                break
+                sawUnhandled = true
             default:
-                break
+                sawUnhandled = true
             }
         }
-        if !handled {
+        if !handled || sawUnhandled {
             super.pressesEnded(presses, with: event)
         }
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        // Gate fix: cancellation is scoped to the press
+        // types actually cancelled — a cancelled select
+        // must not kill an in-flight arrow hold, and the
+        // reverse. Cancellation RESOLVES the select
+        // press, so it is one of the two places
+        // `selectConsumed` is legitimately cleared.
+        var sawUnhandled = false
+        for press in presses {
+            switch press.type {
+            case .rightArrow, .leftArrow:
+                stopHold()
+            case .select:
+                cancelSelectHold()
+                selectConsumed = false
+            default:
+                sawUnhandled = true
+            }
+        }
+        if sawUnhandled {
+            super.pressesCancelled(presses, with: event)
+        }
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            // Timers only — `selectConsumed` must NOT
+            // reset here (see the hold-state note above):
+            // the panel the select-hold opened is what
+            // removed this surface, and clearing the
+            // marker would re-arm the very release step
+            // it exists to suppress.
+            stopHold()
+            cancelSelectHold()
+        }
+    }
+
+    private func startHold(direction: Int) {
+        stopHold()
+        holdDirection = direction
+        holdTicks = 0
+        holdTimer = Timer.scheduledTimer(withTimeInterval: 0.45, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.holdTick() }
+        }
+    }
+
+    private func holdTick() {
+        guard holdDirection != 0 else { return }
+        if holdDirection > 0 { onForward?() } else { onBack?() }
+        holdTicks += 1
+        let interval: TimeInterval = holdTicks < 6 ? 0.22 : (holdTicks < 16 ? 0.12 : 0.06)
+        holdTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.holdTick() }
+        }
+    }
+
+    private func stopHold() {
+        holdTimer?.invalidate()
+        holdTimer = nil
+        holdDirection = 0
+        holdTicks = 0
+    }
+
+    private func startSelectHold() {
+        cancelSelectHold()
+        selectConsumed = false
+        selectHoldTimer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.selectHoldTimer = nil
+                self.selectConsumed = true
+                self.onGoToPage?()
+            }
+        }
+    }
+
+    private func cancelSelectHold() {
+        selectHoldTimer?.invalidate()
+        selectHoldTimer = nil
     }
 }

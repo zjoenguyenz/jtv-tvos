@@ -104,6 +104,11 @@ struct TVLibraryView: View {
         } else {
             VStack(alignment: .leading, spacing: 20) {
                 HStack {
+                    // A-10 (1.3.9): the long-press gesture
+                    // gets a discoverable hint line.
+                    Text("Giữ lâu một mục để xoá khỏi lịch sử")
+                        .font(.system(size: 23))
+                        .foregroundStyle(theme.textDim)
                     Spacer()
                     TVLibraryClearButton(title: "Xoá tất cả") {
                         history.clearAll()
@@ -141,6 +146,11 @@ struct TVLibraryView: View {
             TVEmptyState(icon: "heart", title: "Chưa có mục yêu thích")
                 .frame(minHeight: 300)
         } else {
+            VStack(alignment: .leading, spacing: 20) {
+                // A-10 (1.3.9): long-press hint, favourites form.
+                Text("Giữ lâu một thẻ để bỏ yêu thích")
+                    .font(.system(size: 23))
+                    .foregroundStyle(theme.textDim)
             LazyVGrid(columns: favoritesColumns,
                       spacing: 30) {
                 ForEach(favorites.records) { record in
@@ -163,6 +173,7 @@ struct TVLibraryView: View {
                 }
             }
             .onPreferenceChange(TVWidthKey.self) { [binding = $measuredWidth] in binding.wrappedValue = $0 }
+            }
         }
     }
 }
@@ -252,12 +263,31 @@ private struct TVLibraryClearButton: View {
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var isFocused: Bool
+    /// A-10 (1.3.9): two-tap confirm — the first tap arms
+    /// (the label becomes the confirm prompt), a second tap
+    /// inside the window executes; the window lapsing or
+    /// focus leaving disarms. A destructive clear-all must
+    /// never fire on a single inertial tap.
+    @State private var armed = false
+    @State private var disarmTask: Task<Void, Never>?
 
     var body: some View {
         Button {
-            onTap()
+            if armed {
+                disarmTask?.cancel()
+                armed = false
+                onTap()
+            } else {
+                armed = true
+                disarmTask?.cancel()
+                disarmTask = Task {
+                    try? await Task.sleep(for: .seconds(4))
+                    guard !Task.isCancelled else { return }
+                    armed = false
+                }
+            }
         } label: {
-            Text(title)
+            Text(armed ? "Bấm lần nữa để xoá hết" : title)
                 .font(.system(size: 24, weight: .semibold))
                 .foregroundStyle(theme.accent)
                 .padding(.horizontal, 26)
@@ -267,5 +297,11 @@ private struct TVLibraryClearButton: View {
         }
         .tvCardButton()
         .focused($isFocused)
+        .onChange(of: isFocused) { _, focused in
+            if !focused {
+                armed = false
+                disarmTask?.cancel()
+            }
+        }
     }
 }

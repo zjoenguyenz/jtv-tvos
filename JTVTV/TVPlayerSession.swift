@@ -44,6 +44,14 @@ enum TVResumeRule {
     }
 }
 
+/// B-2 (1.3.9, owner ruling 2026-11-23): auto-advance to
+/// the next episode when one ends — default ON, with a
+/// Settings toggle. The key is shared between the Settings
+/// toggle (@AppStorage) and the session's read at item-end.
+enum TVAutoAdvance {
+    static let defaultsKey = "jtv_auto_advance_episode"
+}
+
 // MARK: - Routing (§3.2)
 
 enum TVSurfaceRoute: Equatable {
@@ -96,6 +104,9 @@ enum TVPlayerPanel: Equatable {
     /// a session panel so the cover's single Menu arbiter closes
     /// it first, exactly like the other panels (FL-048).
     case mangaChapterEnd
+    /// A-1 (1.3.9): the manga reader's "Đi tới trang" panel —
+    /// a session panel for the same FL-048 reason.
+    case mangaGoToPage
 }
 
 /// §4.2 step 4 signal: the measurement pass's started
@@ -261,6 +272,11 @@ final class TVPlayerSession: ObservableObject {
     // stored properties stay private.
     var mangaService: MovieService { service }
     var mangaHistory: WatchHistoryManager { history }
+    /// A-2 (1.3.9): the current item ended and neither
+    /// auto-advance nor a step is in flight — TVPlayerView
+    /// shows the episode-end action row while this is set.
+    /// Cleared at the head of every beginAttempt.
+    @Published private(set) var itemDidEnd = false
     /// The stream the current attempt resolved to (video only).
     @Published private(set) var currentStream: StreamInfo?
     @Published private(set) var phase: TVPlayerPhase = .resolving
@@ -486,6 +502,7 @@ final class TVPlayerSession: ObservableObject {
         effectiveChoice = .off
         livePosition = 0
         liveDuration = 0
+        itemDidEnd = false
         phase = .resolving
         // A new attempt supersedes the old host entirely; its
         // registrations die with it (the new host re-registers).
@@ -1524,11 +1541,70 @@ final class TVPlayerSession: ObservableObject {
     /// The phase guard matters: a watchdog-killed attempt's
     /// layer stop can also produce an end event, and a killed
     /// attempt is not a finished title.
+    /// B-2 (1.3.9, owner ruling 2026-11-23): with auto-advance
+    /// ON (the default; Settings toggle) and a next episode in
+    /// the current server's list, the next episode starts at
+    /// once, from its beginning, through the auto path (not a
+    /// manual source pick). Otherwise the ended state
+    /// publishes and TVPlayerView shows the A-2 action row.
     func itemEnded(attempt: Int) {
         guard attempt == attemptID, case .playing = phase else { return }
         if let record = history.record(for: originRequest.pluginId, movieId: originRequest.movie.id) {
             history.remove(record)
         }
+        if autoAdvanceEnabled, let next = nextEpisode {
+            DiagLog.log("player", "advance.auto from=\(currentRequest.episode.name) to=\(next.name)")
+            performSwitch(to: next, captured: 0, auto: true)
+        } else {
+            itemDidEnd = true
+        }
+    }
+
+    /// The B-2 toggle, read fresh at every item end: an
+    /// unset key is the default (ON).
+    private var autoAdvanceEnabled: Bool {
+        UserDefaults.standard.object(forKey: TVAutoAdvance.defaultsKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: TVAutoAdvance.defaultsKey)
+    }
+
+    // MARK: Episode navigation (A-2 / B-2, 1.3.9)
+
+    /// Adjacent episodes within the CURRENT server's list
+    /// (the allEpisodes Detail handed over). The torrent
+    /// switchList is a SOURCE list, not episodes — episode
+    /// navigation never reads it.
+    var nextEpisode: Episode? {
+        let list = currentRequest.allEpisodes
+        guard let index = list.firstIndex(where: { $0.id == currentRequest.episode.id }),
+              index + 1 < list.count else { return nil }
+        return list[index + 1]
+    }
+
+    var previousEpisode: Episode? {
+        let list = currentRequest.allEpisodes
+        guard let index = list.firstIndex(where: { $0.id == currentRequest.episode.id }),
+              index > 0 else { return nil }
+        return list[index - 1]
+    }
+
+    /// Manual episode steps (the A-2 end-state row, the
+    /// source panel's episode rows): the adjacent episode
+    /// starts from its beginning — a different episode never
+    /// inherits the playhead.
+    func playNextEpisode() {
+        guard let next = nextEpisode else { return }
+        performSwitch(to: next, captured: 0)
+    }
+
+    func playPreviousEpisode() {
+        guard let previous = previousEpisode else { return }
+        performSwitch(to: previous, captured: 0)
+    }
+
+    /// "Xem lại": the current episode again, from 0.
+    func replayCurrentEpisode() {
+        beginAttempt(resumeTarget: 0)
     }
 
     // MARK: Position & history

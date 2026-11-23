@@ -81,6 +81,7 @@ struct TVSearchView: View {
     @EnvironmentObject private var history: WatchHistoryManager
     @EnvironmentObject private var session: PinSession
     @Environment(TVHomeStore.self) private var store
+    @Environment(TVNavPath.self) private var nav
     @Environment(\.tvTheme) private var theme
 
     @State private var query = ""
@@ -89,6 +90,13 @@ struct TVSearchView: View {
     @State private var isSearching = false
     @State private var searchError: String?
     @State private var didSearch = false
+    /// §13.13 amendment: the cross-source actress probe's
+    /// verdict for the current term — when set, the pinned
+    /// actor row renders above the film grid. Written only
+    /// by the generation-guarded probe task; the row NEVER
+    /// requests focus (see TVActorProbeRow).
+    @State private var actorMatch: ActorProbeResult?
+    @State private var probeTask: Task<Void, Never>?
     @State private var serverPage = 0
     @State private var serverTotalPages = 1
     @State private var isLoadingMore = false
@@ -104,6 +112,10 @@ struct TVSearchView: View {
     @State private var stripSymbols = false
     @FocusState private var keyFocus: TVSearchKeyFocus?
     @FocusState private var clearHistoryFocused: Bool
+    /// A-10 (1.3.9): two-tap confirm for clearing the search
+    /// history (the TVLibraryClearButton discipline).
+    @State private var clearHistoryArmed = false
+    @State private var clearHistoryDisarmTask: Task<Void, Never>?
 
     private var activeId: String { plugins.activePlugin?.id ?? "" }
     private var trimmedQuery: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -260,13 +272,20 @@ struct TVSearchView: View {
     private var content: some View {
         if trimmedQuery.isEmpty {
             suggestions
-        } else if let searchError, results.isEmpty {
+        } else if let searchError, results.isEmpty, actorMatch == nil {
             TVErrorState(message: searchError) { scheduleSearch() }
-        } else if didSearch && results.isEmpty && !isSearching {
+        } else if didSearch && results.isEmpty && !isSearching && actorMatch == nil {
             TVEmptyState(icon: "magnifyingglass", title: "Không tìm thấy kết quả")
         } else {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 30) {
+                    if let actorMatch {
+                        TVActorProbeRow(name: trimmedQuery, match: actorMatch) {
+                            TVSearchText.recordRecent(trimmedQuery)
+                            recents = TVSearchText.loadRecents()
+                            nav.push(.actor(ActorRoute(pluginId: actorMatch.pluginId, name: trimmedQuery, route: actorMatch.route)))
+                        }
+                    }
                     TVPosterGrid(items: results, pluginId: activeId,
                                  isLoadingMore: isLoadingMore,
                                  onSelect: { _ in
@@ -300,12 +319,24 @@ struct TVSearchView: View {
                         }
                     }
                     Button {
-                        TVSearchText.clearRecents()
-                        recents = []
+                        if clearHistoryArmed {
+                            clearHistoryDisarmTask?.cancel()
+                            clearHistoryArmed = false
+                            TVSearchText.clearRecents()
+                            recents = []
+                        } else {
+                            clearHistoryArmed = true
+                            clearHistoryDisarmTask?.cancel()
+                            clearHistoryDisarmTask = Task {
+                                try? await Task.sleep(for: .seconds(4))
+                                guard !Task.isCancelled else { return }
+                                clearHistoryArmed = false
+                            }
+                        }
                     } label: {
                         HStack(spacing: 10) {
                             Image(systemName: "trash")
-                            Text("Xoá lịch sử tìm kiếm")
+                            Text(clearHistoryArmed ? "Bấm lần nữa để xoá hết" : "Xoá lịch sử tìm kiếm")
                         }
                         .font(.system(size: 24, weight: .semibold))
                         .foregroundStyle(theme.accent)
@@ -316,6 +347,12 @@ struct TVSearchView: View {
                     }
                     .tvCardButton()
                     .focused($clearHistoryFocused)
+                    .onChange(of: clearHistoryFocused) { _, focused in
+                        if !focused {
+                            clearHistoryArmed = false
+                            clearHistoryDisarmTask?.cancel()
+                        }
+                    }
                 }
             }
             .padding(.horizontal, 80)
@@ -335,8 +372,19 @@ struct TVSearchView: View {
             didSearch = false
             searchError = nil
             isSearching = false
+            probeTask?.cancel()
+            actorMatch = nil
             return
         }
+        // Gate fix G-15: the probe verdict belongs to the
+        // term it probed — invalidate it the moment the term
+        // changes, not 300 ms later in runSearch. Otherwise
+        // the pinned row (whose label and tap payload read
+        // the LIVE trimmedQuery) could pair the new name
+        // with the previous term's unverified route during
+        // the debounce window (SPEC §14.3).
+        probeTask?.cancel()
+        actorMatch = nil
         debounceTask = Task {
             try? await Task.sleep(nanoseconds: 300_000_000)
             if Task.isCancelled { return }
@@ -351,6 +399,19 @@ struct TVSearchView: View {
         let gen = generation
         let pid = activeId
         guard !pid.isEmpty else { return }
+
+        // §13.13 amendment: the actress probe rides the same
+        // generation as the film search — a stale generation's
+        // verdict is dropped, exactly like the server merge's.
+        // It runs parallel to (never ahead of) the film
+        // results and makes NO focus requests, ever.
+        actorMatch = nil
+        probeTask?.cancel()
+        probeTask = Task {
+            let probe = await service.actorProbe(name: term)
+            guard gen == generation, !Task.isCancelled else { return }
+            actorMatch = probe
+        }
 
         // 1. Local paint — instant, from what the device holds.
         let needle = TVSearchText.normalise(term)
@@ -506,6 +567,59 @@ private struct TVKeyCap: View {
     }
 }
 
+/// The pinned actress row (§13.13 amendment), shared by
+/// the search tab and the pushed search-results surface:
+/// renders when the cross-source probe verified the term
+/// as an actress with actor pages. FOCUS DISCIPLINE: the
+/// row is focusable and appears asynchronously, but it
+/// NEVER steals or relocates focus — nothing in the probe
+/// path assigns focus; the letter strip keeps focus while
+/// typing, and entering the results reaches this row
+/// first, then the grid.
+private struct TVActorProbeRow: View {
+    let name: String
+    let match: ActorProbeResult
+    let onSelect: () -> Void
+
+    @Environment(\.tvTheme) private var theme
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button {
+            onSelect()
+        } label: {
+            HStack(spacing: 14) {
+                Image(systemName: "person.crop.rectangle.stack")
+                    .font(.system(size: 28))
+                    .foregroundStyle(isFocused ? .black : theme.accent)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Diễn viên: \(name)")
+                        .font(.system(size: 28, weight: .semibold))
+                        .foregroundStyle(isFocused ? .black : theme.textPrimary)
+                        .lineLimit(1)
+                    Text("\(match.resolverCount) nguồn có trang diễn viên")
+                        .font(.system(size: 22))
+                        .foregroundStyle(isFocused ? .black : theme.textDim)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(isFocused ? .black : theme.textDim)
+            }
+            .padding(.horizontal, 26)
+            .padding(.vertical, 16)
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(isFocused ? theme.focusRing : theme.cardFill))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(isFocused ? theme.focusRing : theme.cardStroke,
+                              lineWidth: isFocused ? theme.ringWidth : 1.5))
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .tvCardButton()
+        .focused($isFocused)
+    }
+}
+
 // MARK: - Search results (cast destination)
 
 /// The AppRoute.search destination (Detail cast chips) — the
@@ -528,6 +642,10 @@ struct TVSearchResultsView: View {
     @State private var loadError: String?
     @State private var didLoad = false
     @State private var loadGeneration = 0
+    /// §13.13 amendment: the actress probe's verdict for
+    /// this surface's fixed query (a route-less cast chip's
+    /// keyword search now also offers the merged page).
+    @State private var actorMatch: ActorProbeResult?
 
     var body: some View {
         ScrollView {
@@ -535,6 +653,11 @@ struct TVSearchResultsView: View {
                 Text(query)
                     .font(.system(size: 40, weight: .bold))
                     .foregroundStyle(theme.textPrimary)
+                if let actorMatch {
+                    TVActorProbeRow(name: query, match: actorMatch) {
+                        nav.push(.actor(ActorRoute(pluginId: actorMatch.pluginId, name: query, route: actorMatch.route)))
+                    }
+                }
                 contentBand
                     .focusSection()
             }
@@ -553,7 +676,15 @@ struct TVSearchResultsView: View {
         .task(id: query + pluginId) {
             items = []
             didLoad = false
+            actorMatch = nil
             await reload()
+            // §13.13 amendment: probe after the film results
+            // land (never delays them); a torn-down instance
+            // drops the verdict silently (L-15).
+            let probe = await service.actorProbe(name: query)
+            if !Task.isCancelled {
+                actorMatch = probe
+            }
         }
     }
 
@@ -564,7 +695,12 @@ struct TVSearchResultsView: View {
                          isLoadingMore: isLoadingMore,
                          onLoadMore: { Task { await loadMore() } })
         } else if loadError != nil {
-            TVErrorState(message: "Tìm kiếm thất bại") { Task { await reload() } }
+            // A-9 (1.3.9): with no results on screen the
+            // retry button is the landing focus (the actor
+            // probe row, when present, declares no default
+            // of its own).
+            TVErrorState(message: "Tìm kiếm thất bại", onRetry: { Task { await reload() } },
+                         retryIsDefaultFocus: true)
                 .frame(minHeight: 300)
         } else if didLoad {
             TVEmptyState(icon: "magnifyingglass", title: "Không tìm thấy kết quả",

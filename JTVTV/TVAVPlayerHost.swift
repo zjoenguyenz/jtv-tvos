@@ -697,6 +697,11 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
         private func buildTransportMenu() {
             guard let controller, let session else { return }
             var children: [UIMenuElement] = []
+            // A-8 (1.3.9): Đổi nguồn is its own TOP-LEVEL
+            // transport item, no longer nested inside the
+            // custom menu — `topLevel` collects the bar's
+            // custom items in order.
+            var topLevel: [UIMenuElement] = []
             let targets = session.switchTargets
             // L-T13 (1.3.1): the Đổi nguồn submenu now also
             // carries the PROVIDER rows (same hash, chosen
@@ -745,11 +750,12 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
                     title: playingName.isEmpty ? "Đổi nguồn" : "Đổi nguồn · \(playingName)",
                     image: UIImage(systemName: "arrow.triangle.2.circlepath"),
                     children: switchChildren)
-                children.append(switchMenu)
+                topLevel.append(switchMenu)
             }
             // L-T13 §5.0 breadcrumb: menu contents are now
-            // countable from the log.
-            DiagLog.log("player", "menu.built children=\(children.count + 1) switchTargets=\(targets.count) providers=\(providerRows.count)")
+            // countable from the log (items = the top-level
+            // custom items, switch menu included when present).
+            DiagLog.log("player", "menu.built items=\(topLevel.count + 1) switchTargets=\(targets.count) providers=\(providerRows.count)")
             // Gate fix pass (F-B3/C-F2): remember exactly which
             // provider rows this menu was built from — the
             // observation above rebuilds only on a real change
@@ -761,9 +767,16 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
             ) { [weak self] _ in
                 self?.session?.presentedPanel = .subtitles
             })
-            controller.transportBarCustomMenuItems = [
-                UIMenu(title: "Media Service", children: children)
-            ]
+            // B-3 (1.3.9, owner ruling 2026-11-23): the custom
+            // menu's label is functional now, no longer the
+            // app's camouflage name. Design-pass ruling
+            // (D-4): after the A-8 split this menu holds
+            // ONLY the subtitle item, so it is titled
+            // "Phụ đề" — the name must describe its
+            // contents; B-3's findability goal is carried
+            // by the top-level Đổi nguồn item above.
+            topLevel.append(UIMenu(title: "Phụ đề", children: children))
+            controller.transportBarCustomMenuItems = topLevel
         }
 
         // MARK: Subtitles (§4.2/§4.4)

@@ -1126,6 +1126,10 @@ struct TVNetProbeView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var model = TVNetProbeModel()
     @FocusState private var closeFocused: Bool
+    /// A-13 (1.3.9): the done state offers the log export
+    /// right here — no trip back through Settings.
+    @State private var showLogExport = false
+    @FocusState private var logFocused: Bool
 
     var body: some View {
         ZStack {
@@ -1135,7 +1139,7 @@ struct TVNetProbeView: View {
                     .font(.system(size: 44, weight: .bold))
                     .foregroundStyle(.white)
 
-                Text("App thử phân giải tên miền và kết nối HTTPS tới từng máy chủ phim ngay trên TV này. Kết quả đầy đủ ghi vào log chẩn đoán — đo xong, mở “Gửi log chẩn đoán” để lấy log về.")
+                Text("App thử phân giải tên miền và kết nối HTTPS tới từng máy chủ phim ngay trên TV này. Kết quả đầy đủ ghi vào log chẩn đoán — đo xong, bấm “Gửi log ngay” ở dưới để lấy log về.")
                     .font(.system(size: 25))
                     .foregroundStyle(.white.opacity(0.7))
                     .multilineTextAlignment(.center)
@@ -1162,18 +1166,35 @@ struct TVNetProbeView: View {
                     .frame(maxWidth: 1250, alignment: .leading)
                 }
 
-                Button {
-                    model.cancel()
-                    dismiss()
-                } label: {
-                    Text("Đóng")
-                        .font(.system(size: 28))
+                HStack(spacing: 24) {
+                    // A-13 (1.3.9): at the done state (probe
+                    // finished, results on screen) the log
+                    // export opens from right here.
+                    if !model.isRunning && !model.lines.isEmpty {
+                        Button {
+                            showLogExport = true
+                        } label: {
+                            Text("Gửi log ngay")
+                                .font(.system(size: 28))
+                        }
+                        .focused($logFocused)
+                    }
+                    Button {
+                        model.cancel()
+                        dismiss()
+                    } label: {
+                        Text("Đóng")
+                            .font(.system(size: 28))
+                    }
+                    .focused($closeFocused)
                 }
-                .focused($closeFocused)
             }
             .padding(60)
         }
         .defaultFocus($closeFocused, true)
+        .fullScreenCover(isPresented: $showLogExport) {
+            LogExportView()
+        }
         .onAppear {
             session.touch()
             DiagLog.log("settings", "net probe screen opened")

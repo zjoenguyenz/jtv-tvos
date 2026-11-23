@@ -753,7 +753,7 @@ struct ActorRoute: Hashable {
 /// the search behaviour rather than opening a screen whose
 /// endpoint was never verified.
 enum ActorScope {
-    static let fullPlugins: Set<String> = ["missav", "123av", "njav", "topxx"]
+    static let fullPlugins: Set<String> = ["missav", "123av", "njav", "topxx", "javguru", "javsnap"]
 
     static func isFull(pluginId: String) -> Bool {
         fullPlugins.contains(pluginId)
@@ -763,7 +763,7 @@ enum ActorScope {
 enum FallbackCatalog {
     /// Plugins whose titles are indexed by a base catalogue code and whose
     /// failure can start a fallback. (Plan §2, RESEARCH-SOURCE-HEALTH.)
-    static let origins: Set<String> = ["missav", "123av", "njav", "avdbapi"]
+    static let origins: Set<String> = ["missav", "123av", "njav", "avdbapi", "javguru"]
     /// Plugins whose resolved playlist is pre-flighted (§3): their known
     /// failure mode is a playlist-level refusal. 123av is excluded — its
     /// failure is page-level transport, and its resolved streams come from
@@ -771,15 +771,21 @@ enum FallbackCatalog {
     static let preflightSet: Set<String> = ["missav", "njav", "avdbapi"]
     /// Ordered fallback targets per origin (health order per
     /// RESEARCH-SOURCE-HEALTH: the sources most likely to actually play
-    /// first). JavGuru joins this table when its plugin ships (post-probe
-    /// build); jav.spa is excluded permanently (helvid-walled playback —
-    /// RESEARCH-NJAV addendum).
+    /// first). JavGuru joined this table in 1.22.21/1.3.9 (its plugin
+    /// shipped and its playback is device-proven): appended LAST in
+    /// every row so the proven hop order among the existing three is
+    /// preserved, and deliberately NOT in `preflightSet` — its
+    /// per-title hls3-domain refusal class needs device evidence from
+    /// real fallback logs before preflight can score it (treated
+    /// like 123av this round). jav.spa is excluded permanently
+    /// (helvid-walled playback — RESEARCH-NJAV addendum).
     static func targets(for origin: String) -> [String] {
         switch origin {
-        case "missav":  return ["123av", "njav", "avdbapi"]
-        case "123av":   return ["missav", "njav", "avdbapi"]
-        case "njav":    return ["123av", "missav", "avdbapi"]
-        case "avdbapi": return ["123av", "missav", "njav"]
+        case "missav":  return ["123av", "njav", "avdbapi", "javguru"]
+        case "123av":   return ["missav", "njav", "avdbapi", "javguru"]
+        case "njav":    return ["123av", "missav", "avdbapi", "javguru"]
+        case "avdbapi": return ["123av", "missav", "njav", "javguru"]
+        case "javguru": return ["missav", "123av", "njav", "avdbapi"]
         default:        return []
         }
     }
@@ -794,7 +800,7 @@ enum ActorMerge {
     /// set from FallbackCatalog (§2.1): topxx is actor-capable but not
     /// a fallback origin; avdbapi is a fallback origin but SEARCH-ONLY
     /// for actors and never merges (§13.13).
-    static let canonicalOrder: [String] = ["missav", "123av", "njav", "topxx"]
+    static let canonicalOrder: [String] = ["missav", "123av", "njav", "topxx", "javguru", "javsnap"]
 
     /// Merge targets for an actor page: every actor-capable source
     /// except the page's origin, in canonical order.

@@ -215,9 +215,29 @@ struct TVDetailView: View {
                 }
                 .defaultFocus(hasPlayableEpisode ? $playFocused : $favFocused, true)
             } else if loadError != nil {
-                TVErrorState(message: "Không tải được thông tin phim") {
+                // A-9 (1.3.9): this error state is the ONLY
+                // focusable on the screen — its retry button
+                // is the declared landing focus.
+                TVErrorState(message: "Không tải được thông tin phim", onRetry: {
                     Task { await load() }
+                }, retryIsDefaultFocus: true)
+            } else if autoResume {
+                // A-11 (1.3.9, F-11): a Continue Watching
+                // reopen shows a MINIMAL state — spinner +
+                // label, NO focusable button — while the
+                // detail loads and the player presents itself.
+                // The full loading state's retry button held
+                // default focus, so an inertial OK during the
+                // wait reloaded instead of waiting.
+                VStack(spacing: 22) {
+                    ProgressView()
+                        .tint(theme.textPrimary)
+                        .scaleEffect(1.5)
+                    Text("Đang mở lại…")
+                        .font(.system(size: 27, weight: .semibold))
+                        .foregroundStyle(theme.textDim)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 TVLoadingState(onRetry: { Task { await load() } })
             }
@@ -386,7 +406,7 @@ struct TVDetailView: View {
                         .foregroundStyle(theme.accent)
                         .lineLimit(1)
                     if record.isManga {
-                        Text("Đã đọc tới trang \(Int(record.lastPosition) + 1)")
+                        Text(mangaResumeText(record))
                             .font(.system(size: 22))
                             .foregroundStyle(theme.textDim)
                     } else if record.duration > 0 {
@@ -414,6 +434,24 @@ struct TVDetailView: View {
             .strokeBorder(resumeFocused ? theme.focusRing : theme.cardStroke,
                           lineWidth: resumeFocused ? theme.ringWidth : 1))
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    /// A-12 (1.3.9): the manga banner names the units the
+    /// reader itself uses — the STRIP ("Ảnh i/n", n = the
+    /// record's duration, the chapter's image count) and,
+    /// when the tvOS aux store holds the in-strip page for
+    /// this exact record, the page within the strip. The old
+    /// text printed the strip NUMBER labelled as a page.
+    private func mangaResumeText(_ record: HistoryRecord) -> String {
+        let strip = Int(record.lastPosition) + 1
+        let strips = Int(record.duration)
+        var text = strips > 0 ? "Đã đọc tới ảnh \(strip)/\(strips)" : "Đã đọc tới ảnh \(strip)"
+        if let segment = TVMangaPositionStore.segment(
+            pluginId: record.pluginId, movieId: record.movie.id,
+            episodeId: record.episodeId, imageIndex: Int(record.lastPosition)) {
+            text += " • trang \(segment + 1) trong ảnh"
+        }
+        return text
     }
 
     /// L-T19 / FL-403 (owner ruling 2026-11-22): a metadata

@@ -45,9 +45,17 @@ struct TVSettingsView: View {
     @AppStorage(TVPreviewSettings.defaultsKey) private var previewEnabled = true
     @FocusState private var previewButtonFocused: Bool
 
+    /// B-2 (1.3.9, owner ruling 2026-11-23): auto-advance to
+    /// the next episode at item end — default ON. The same
+    /// key is read by TVPlayerSession at every item end.
+    @AppStorage(TVAutoAdvance.defaultsKey) private var autoAdvanceEnabled = true
+    @FocusState private var autoAdvanceButtonFocused: Bool
+
     /// Entry focus (Diagnosis §4.1.6, JoeSettings.swift:306
-    /// shape): declared on the first focusable — the first
-    /// credential status row.
+    /// shape), retargeted by A-7 (1.3.9): the landing focus
+    /// is the first ACTIONABLE row — the first theme chip.
+    /// The credential status rows stay focusable for
+    /// traversal; they no longer own the entry focus.
     @FocusState private var firstRowFocused: Bool
     @FocusState private var pinButtonFocused: Bool
     @FocusState private var logButtonFocused: Bool
@@ -85,6 +93,9 @@ struct TVSettingsView: View {
                     .focusSection()
 
                 previewSection
+                    .focusSection()
+
+                playbackSection
                     .focusSection()
 
                 if BundledSecrets.pinConfigured {
@@ -128,8 +139,7 @@ struct TVSettingsView: View {
             Text("Dịch vụ đã nạp sẵn")
                 .font(.system(size: 30, weight: .semibold))
             StatusRow(label: "Real-Debrid",
-                      configured: Self.isConfigured(BundledSecrets.rdToken),
-                      entryFocus: $firstRowFocused)
+                      configured: Self.isConfigured(BundledSecrets.rdToken))
             StatusRow(label: "TorBox",
                       configured: Self.isConfigured(BundledSecrets.torboxToken))
             StatusRow(label: "Premiumize",
@@ -155,7 +165,8 @@ struct TVSettingsView: View {
             HStack(spacing: 16) {
                 ForEach(JTVThemeID.allCases) { id in
                     TVChip(title: id.displayName,
-                           selected: themeRaw == id.rawValue) {
+                           selected: themeRaw == id.rawValue,
+                           entryFocus: id == JTVThemeID.allCases.first ? $firstRowFocused : nil) {
                         themeRaw = id.rawValue
                     }
                 }
@@ -183,6 +194,28 @@ struct TVSettingsView: View {
             .jtvCardButton()
             .focused($previewButtonFocused)
             Text("Khi mở chi tiết phim, nền sẽ tự chạy một đoạn video xem trước (không tiếng) sau khoảng 1,5 giây. Tắt thì màn hình chi tiết giữ nguyên ảnh nền tĩnh như trước.")
+                .font(.system(size: 23))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Playback (B-2, 1.3.9)
+
+    private var playbackSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Phát lại")
+                .font(.system(size: 30, weight: .semibold))
+            Button {
+                autoAdvanceEnabled.toggle()
+            } label: {
+                ActionRowLabel {
+                    Label(autoAdvanceEnabled ? "Tự chạy tập tiếp theo — Đang bật" : "Tự chạy tập tiếp theo — Đang tắt",
+                          systemImage: autoAdvanceEnabled ? "play.circle.fill" : "play.circle")
+                }
+            }
+            .jtvCardButton()
+            .focused($autoAdvanceButtonFocused)
+            Text("Khi một tập kết thúc, tập tiếp theo của cùng nguồn sẽ tự phát. Tắt thì app dừng ở cuối tập và hiện hàng nút Tập trước / Xem lại / Tập tiếp theo.")
                 .font(.system(size: 23))
                 .foregroundStyle(.secondary)
         }
@@ -272,9 +305,6 @@ struct TVSettingsView: View {
 private struct StatusRow: View {
     let label: String
     let configured: Bool
-    /// Set only on the screen's first row: the declared entry
-    /// focus target (.defaultFocus in the parent binds here).
-    var entryFocus: FocusState<Bool>.Binding? = nil
     @Environment(\.isFocused) private var isFocused
 
     var body: some View {
@@ -303,22 +333,6 @@ private struct StatusRow: View {
                           lineWidth: isFocused ? 3 : 0))
         .focusable()
         .focusEffectDisabled()
-        .modifier(EntryFocusModifier(binding: entryFocus))
-    }
-}
-
-/// Applies a FocusState binding only when one was handed in
-/// (the entry row); every other row is focusable without a
-/// binding.
-private struct EntryFocusModifier: ViewModifier {
-    let binding: FocusState<Bool>.Binding?
-
-    func body(content: Content) -> some View {
-        if let binding {
-            content.focused(binding)
-        } else {
-            content
-        }
     }
 }
 
