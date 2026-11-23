@@ -363,6 +363,19 @@ struct MovieDetail: Codable {
     var country: String = ""
     var director: String = ""
     var casts: String = ""
+    /// Metadata-overlay supplies (1.22.20, METADATA-
+    /// OVERLAY-DESIGN §5): fields the plugins do not carry,
+    /// filled ONLY by the overlay merge at display-model
+    /// construction (MetadataOverlay) from the code-keyed
+    /// shared data file — never by a plugin payload and
+    /// never used by any playback path. Additive +
+    /// defaulted, decode-if-present: old persisted JSON
+    /// and plugin payloads decode with the empty defaults.
+    var studio: String = ""
+    var label: String = ""
+    var series: String = ""
+    var releaseDate: String = ""
+    var runtimeMinutes: Int = 0
     var tmdbId: String = ""
     var tmdbSeason: Int = 0
     var tmdbType: String = ""
@@ -370,6 +383,7 @@ struct MovieDetail: Codable {
     enum CodingKeys: String, CodingKey {
         case id, title, originName, posterUrl, backdropUrl, description, year, rating,
              quality, servers, episode_current, lang, category, country, director, casts,
+             studio, label, series, releaseDate, runtimeMinutes,
              tmdbId, tmdbSeason, tmdbType
     }
 
@@ -399,6 +413,11 @@ struct MovieDetail: Codable {
         country = try c.decodeIfPresent(String.self, forKey: .country) ?? ""
         director = try c.decodeIfPresent(String.self, forKey: .director) ?? ""
         casts = try c.decodeIfPresent(String.self, forKey: .casts) ?? ""
+        studio = try c.decodeIfPresent(String.self, forKey: .studio) ?? ""
+        label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
+        series = try c.decodeIfPresent(String.self, forKey: .series) ?? ""
+        releaseDate = try c.decodeIfPresent(String.self, forKey: .releaseDate) ?? ""
+        runtimeMinutes = try c.decodeIfPresent(Int.self, forKey: .runtimeMinutes) ?? 0
         if let t = try? c.decodeIfPresent(String.self, forKey: .tmdbId) {
             tmdbId = t ?? ""
         } else if let ti = try? c.decodeIfPresent(Int.self, forKey: .tmdbId) {
@@ -451,6 +470,16 @@ struct MovieDetail: Codable {
     /// this — their routes drive the actor screens.
     var categoryDisplay: String { Self.plainDisplayText(category) }
     var directorDisplay: String { Self.plainDisplayText(director) }
+
+    /// The overlay-supplied studio • label • series line
+    /// (1.22.20, metadata overlay): the non-empty parts in
+    /// that order, joined the way the design's detail-page
+    /// vision writes the line. Empty when no overlay hit
+    /// supplied any of the three — the shells then render
+    /// no row at all.
+    var studioLine: String {
+        [studio, label, series].filter { !$0.isEmpty }.joined(separator: " • ")
+    }
 
     /// Hand scanner (no regex, same two-delimiter shape
     /// as parseCastEntries): a completed `[text](route)`

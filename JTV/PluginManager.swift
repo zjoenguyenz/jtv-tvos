@@ -13,6 +13,20 @@ struct InstalledPlugin: Identifiable {
     var id: String { manifest.id }
 }
 
+/// tvOS-only (1.3.8): the plugins.json 123av entry may carry
+/// a `relayBase` — the home-LAN relay base the TV reaches
+/// 123av through (relay-pc design). Decoded separately from
+/// the manifest text so the shared PluginManifest (kept
+/// byte-identical with iOS) grows no tvOS-only field.
+private struct RelayBaseEntry: Decodable {
+    let id: String
+    let relayBase: String?
+}
+
+private struct RelayBaseFile: Decodable {
+    let plugins: [RelayBaseEntry]
+}
+
 /// Owns plugin sources, the on-disk scripts, sync, the adult gate and
 /// the active-plugin selection.
 @MainActor
@@ -58,10 +72,19 @@ final class PluginManager: ObservableObject {
         static let manifests = "jtv_installed_manifests"
         static let manifestSources = "jtv_installed_manifest_sources"
         static let disabled = "jtv_disabled_plugin_ids"
+        static let relayBase123av = "jtv_relay_base_123av"
     }
 
     private var engines: [String: PluginEngine] = [:]
     private let enginesLock = NSLock()
+
+    /// The configured 123av relay base ("" = direct, no
+    /// prelude). Captured from plugins.json by sync (the
+    /// source of truth) or introduced by the bundled floor;
+    /// persisted so a cold launch honours it before the
+    /// first sync lands. The value itself is never logged
+    /// (it carries the relay's path token).
+    private var relayBase123av: String = ""
 
     // MARK: - Storage locations
 
@@ -90,6 +113,7 @@ final class PluginManager: ObservableObject {
     init() {
         let defaults = UserDefaults.standard
         self.activePluginId = defaults.string(forKey: Keys.activePlugin) ?? ""
+        self.relayBase123av = defaults.string(forKey: Keys.relayBase123av) ?? ""
         // The 18+ gate is session-only by the owner's rule: adult sources
         // appear only while he has the switch on, so every launch starts
         // with the gate OFF regardless of the previous session.
@@ -148,6 +172,15 @@ final class PluginManager: ObservableObject {
             let data = try? Data(contentsOf: jsonURL),
             let file = try? JSONDecoder().decode(PluginManifestFile.self, from: data)
         else { return }
+
+        // 1.3.8: the bundled floor may INTRODUCE a 123av
+        // relay base. It never removes one — removal is the
+        // synced source's call (syncSource sets-or-clears).
+        if let relayFile = try? JSONDecoder().decode(RelayBaseFile.self, from: data),
+           let base = relayFile.plugins.first(where: { $0.id == "123av" })?.relayBase,
+           !base.isEmpty {
+            setRelayBase123av(base)
+        }
 
         var changed = false
         for entry in file.plugins where !entry.id.isEmpty {
@@ -248,6 +281,27 @@ final class PluginManager: ObservableObject {
         return out
     }
 
+    /// The 123av relay prelude line (relay-pc design §3):
+    /// `var JTV_RELAY_123AV = "<relayBase>";` ahead of the
+    /// script. Applies to the 123av plugin only, and only
+    /// while a non-empty relay base is configured; every
+    /// other load passes through byte-identical.
+    static func relayPrelude(pluginId: String, relayBase: String, script: String) -> String {
+        guard pluginId == "123av", !relayBase.isEmpty else { return script }
+        return "var JTV_RELAY_123AV = \"\(relayBase)\";\n" + script
+    }
+
+    /// Records the 123av relay base (persisted; an empty
+    /// value clears it). A change drops the cached 123av
+    /// engine so the next load re-applies the prelude.
+    private func setRelayBase123av(_ base: String) {
+        guard base != relayBase123av else { return }
+        relayBase123av = base
+        UserDefaults.standard.set(base, forKey: Keys.relayBase123av)
+        invalidateEngine(for: "123av")
+        DiagLog.log("plugin", "id=123av relay=\(base.isEmpty ? "off" : "set")")
+    }
+
     /// Loads a candidate script and returns its manifest when it runs
     /// and identifies as the expected plugin.
     private func validatedManifest(for script: String, pluginId: String) async -> PluginManifest? {
@@ -321,11 +375,38 @@ final class PluginManager: ObservableObject {
         guard let script = try? String(contentsOf: file, encoding: .utf8), !script.isEmpty else {
             return nil
         }
+        // 1.3.8 relay prelude (tvOS only): with a relayBase
+        // configured for 123av, the evaluated copy carries
+        // the JTV_RELAY_123AV global from the start — the
+        // plugin routes its catalogue hops through the home
+        // relay because 123av.com does not answer the TV
+        // directly. No relayBase → the script loads
+        // byte-identically to before. The on-disk script
+        // is never modified; the prelude exists only in
+        // the evaluated copy.
+        var capturedBase = relayBase123av
         let engine = PluginEngine(pluginId: pluginId)
+        var loaded = await engine.load(script: Self.relayPrelude(pluginId: pluginId, relayBase: capturedBase, script: script))
+        // Gate 12220 B-t5: if the relay base changed while
+        // the load was in flight, setRelayBase123av's
+        // invalidation found nothing cached to drop — the
+        // engine just loaded carries the OLD prelude and
+        // caching it would pin that stale engine for the
+        // session (the stored base already equals the new
+        // value, so no later sync would re-invalidate).
+        // Reload with the CURRENT base until the captured
+        // base survives a load unchanged; only then may the
+        // engine be cached. (PluginEngine.load builds a
+        // fresh JSContext per call, so reloading this
+        // instance replaces its context wholesale.)
+        while loaded, pluginId == "123av", relayBase123av != capturedBase {
+            capturedBase = relayBase123av
+            loaded = await engine.load(script: Self.relayPrelude(pluginId: pluginId, relayBase: capturedBase, script: script))
+        }
         // v1.22.15: an engine whose load raised is returned for
         // this call but NOT cached — caching it would pin the
         // broken context for every later call.
-        if await engine.load(script: script) {
+        if loaded {
             enginesLock.withLock { engines[pluginId] = engine }
         } else {
             DiagLog.log("plugin", "id=\(pluginId) engine not cached (load raised)")
@@ -466,6 +547,19 @@ final class PluginManager: ObservableObject {
         guard let data = text.data(using: .utf8) else { throw URLError(.cannotDecodeContentData) }
         let file = try JSONDecoder().decode(PluginManifestFile.self, from: data)
         let remoteIds = Set(file.plugins.map { $0.id })
+
+        // 1.3.8: the synced manifest is the source of truth
+        // for the 123av relay base — capture it, or its
+        // removal, for the engine-load prelude. Gate 12220
+        // leader ruling: a synced file with NO 123av entry
+        // (or an entry with no relayBase) CLEARS any
+        // previously set base — absence means no relay —
+        // so the capture always runs when the file decodes,
+        // with the same engine-invalidation discipline
+        // (setRelayBase123av no-ops on an unchanged value).
+        if let relayFile = try? JSONDecoder().decode(RelayBaseFile.self, from: data) {
+            setRelayBase123av(relayFile.plugins.first(where: { $0.id == "123av" })?.relayBase ?? "")
+        }
 
         var result: [InstalledPlugin] = []
         var changed = false

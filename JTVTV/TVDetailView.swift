@@ -83,6 +83,13 @@ struct TVDetailView: View {
     /// recreated (a new navigation makes a new view with
     /// fresh @State).
     @State private var playLatched = false
+    /// L-23 (1.3.8): true while a play intent is healing a
+    /// stage-1 placeholder detail (see healedDetailForPlay) —
+    /// the episode grid is inert for that span and a second
+    /// play intent returns instead of double-healing. Play
+    /// itself is NOT disabled: dropping its focus mid-heal
+    /// would be a worse fault than the wait.
+    @State private var isHealingPlay = false
     @AppStorage(TVPreviewSettings.defaultsKey) private var previewEnabled = true
     @State private var isLoading = false
     @State private var loadError: String?
@@ -485,6 +492,14 @@ struct TVDetailView: View {
             metaRow("Thể loại", detail.categoryDisplay)
             metaRow("Quốc gia", detail.country)
             metaRow("Đạo diễn", detail.directorDisplay)
+            // Metadata overlay (1.3.8): the supplied fields,
+            // in the design's detail-page order — metaRow
+            // renders nothing for an empty value, so each
+            // row exists only when an overlay hit supplied
+            // it.
+            metaRow("Hãng phim", detail.studioLine)
+            metaRow("Phát hành", detail.releaseDate)
+            metaRow("Thời lượng", detail.runtimeMinutes > 0 ? "\(detail.runtimeMinutes) phút" : "")
         }
     }
 
@@ -587,11 +602,11 @@ struct TVDetailView: View {
                     ForEach(server.episodes) { episode in
                         TVEpisodeChip(name: episode.name,
                                       watched: historyRecord?.episodeId == episode.id) {
-                            play(episode: episode, server: server, detail: detail,
-                                 startPosition: 0, knownStreamURL: "")
+                            playEpisode(episode, server: server, detail: detail)
                         }
                     }
                 }
+                .disabled(isHealingPlay)
             }
             .detailFocusSection(if: detail.servers.count > 1 || !detail.servers[min(selectedServer, detail.servers.count - 1)].episodes.isEmpty)
         }
@@ -809,7 +824,58 @@ struct TVDetailView: View {
 
     // MARK: Play intents (iOS §1.5, exact)
 
+    /// L-23: the stage-1 placeholder predicate — the exact
+    /// test load() uses to decide the stage-2 swap.
+    private func isPlaceholder(_ detail: MovieDetail) -> Bool {
+        detail.servers.first?.episodes.first?.id.hasPrefix("jtvstreams:") == true
+    }
+
+    /// L-23 heal (1.3.8): a play intent that lands while
+    /// the detail is still the torrenthub stage-1
+    /// placeholder awaits the shipped stage-2 expansion
+    /// FIRST (the same call load() makes, published into
+    /// `bundle` the same way, under the same generation /
+    /// alive guards load() observes) and only then lets
+    /// the caller build its request from the real list —
+    /// the placeholder episode is a loading marker, never
+    /// a playable target. Returns nil when the screen has
+    /// moved on or the swapped detail still has no
+    /// playable episode (stage 2 failed or came back
+    /// empty): no player is presented and the page keeps
+    /// its loading affordance.
+    private func healedDetailForPlay(_ detail: MovieDetail) async -> MovieDetail? {
+        let gen = loadGeneration
+        isHealingPlay = true
+        defer { isHealingPlay = false }
+        let full = await service.detailStreams(pluginId: pluginId, movieId: movie.id, detail: detail)
+        guard gen == loadGeneration, detailAlive, !Task.isCancelled else { return nil }
+        if full.servers != detail.servers, let current = bundle {
+            bundle = MovieService.DetailBundle(detail: full, detailStream: current.detailStream)
+            logDetailCounts(full, stage: "stage2-heal")
+            selectFirstPlayableServerIfNeeded(servers: full.servers)
+        }
+        let healed = bundle?.detail ?? full
+        guard let first = healed.servers.first(where: { !$0.episodes.isEmpty })?.episodes.first,
+              !first.id.hasPrefix("jtvstreams:") else { return nil }
+        return healed
+    }
+
     private func playFirstEpisode(_ detail: MovieDetail) {
+        // L-23: heal a stage-1 placeholder before building
+        // the request; a second tap while a heal is in
+        // flight is a no-op (the grid is inert meanwhile).
+        if isPlaceholder(detail) {
+            guard !isHealingPlay else { return }
+            Task {
+                guard let healed = await healedDetailForPlay(detail) else { return }
+                playFirstEpisodeNow(healed)
+            }
+            return
+        }
+        playFirstEpisodeNow(detail)
+    }
+
+    private func playFirstEpisodeNow(_ detail: MovieDetail) {
         guard let serverIndex = detail.servers.firstIndex(where: { !$0.episodes.isEmpty }),
               let episode = detail.servers[serverIndex].episodes.first else { return }
         let server = detail.servers[serverIndex]
@@ -817,6 +883,25 @@ struct TVDetailView: View {
         let known = bundle?.detailStream.url ?? ""
         play(episode: episode, server: server, detail: detail, startPosition: 0,
              knownStreamURL: MediaURL.isDirectMedia(known) ? known : "")
+    }
+
+    /// Episode-chip tap entry. In the placeholder state
+    /// the grid shows exactly one stub cell, so the tap
+    /// heals and then takes the default pick — the stub's
+    /// only referent. Resume does NOT pass through here:
+    /// it calls play() directly with a real episode id and
+    /// is never diverted by the heal.
+    private func playEpisode(_ episode: Episode, server: EpisodeServer, detail: MovieDetail) {
+        if isPlaceholder(detail) {
+            guard !isHealingPlay else { return }
+            Task {
+                guard let healed = await healedDetailForPlay(detail) else { return }
+                playFirstEpisodeNow(healed)
+            }
+            return
+        }
+        play(episode: episode, server: server, detail: detail,
+             startPosition: 0, knownStreamURL: "")
     }
 
     private func resume(_ record: HistoryRecord, detail: MovieDetail) {

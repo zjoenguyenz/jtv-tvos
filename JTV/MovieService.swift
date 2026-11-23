@@ -235,20 +235,24 @@ final class MovieService: ObservableObject {
 
     func list(pluginId: String, slug: String, filters: ListFilters, page: Int) async throws -> ListPage {
         let cacheKey = Self.listCacheKey(pluginId: pluginId, slug: slug, filters: filters, page: page)
-        if let cached = cachedListPage(forKey: cacheKey) { return cached }
+        if let cached = cachedListPage(forKey: cacheKey) { return MetadataOverlay.merged(cached) }
         let engine = try await engine(for: pluginId)
         guard let url = await engine.urlForList(slug: slug, filtersJson: filters.jsonString(page: page)) else {
             throw MovieServiceError.noURL
         }
         let text = try await fetchPage(url)
         let parsed = await engine.parseList(text: text)
+        // Metadata overlay (1.22.20): the cache stores the
+        // RAW parse; the overlay merge applies at return,
+        // so an overlay landing mid-session takes effect
+        // from the next read on (design §5.4.3).
         storeListPage(parsed, forKey: cacheKey)
-        return parsed
+        return MetadataOverlay.merged(parsed)
     }
 
     func search(pluginId: String, keyword: String, page: Int) async throws -> ListPage {
         let cacheKey = "search|\(pluginId)|\(keyword)|\(page)"
-        if let cached = cachedListPage(forKey: cacheKey) { return cached }
+        if let cached = cachedListPage(forKey: cacheKey) { return MetadataOverlay.merged(cached) }
         let engine = try await engine(for: pluginId)
         let filters = ListFilters()
         guard let url = await engine.urlForSearch(keyword: keyword, filtersJson: filters.jsonString(page: page)) else {
@@ -257,7 +261,7 @@ final class MovieService: ObservableObject {
         let text = try await fetchPage(url)
         let parsed = await engine.parseSearch(text: text)
         storeListPage(parsed, forKey: cacheKey)
-        return parsed
+        return MetadataOverlay.merged(parsed)
     }
 
     // MARK: - Filter option lists
@@ -310,7 +314,11 @@ final class MovieService: ObservableObject {
         async let parsedStream = engine.parseStream(text: text, url: url)
         let (detail, stream) = await (parsedDetail, parsedStream)
         guard let detail else { throw MovieServiceError.emptyDetail }
-        return DetailBundle(detail: detail, detailStream: stream)
+        // Metadata overlay (1.22.20): merged here, at
+        // construction — detailStreams only swaps the
+        // server list afterwards, so the merged display
+        // fields survive stage 2 untouched (design §5.4.3).
+        return DetailBundle(detail: MetadataOverlay.merged(detail), detailStream: stream)
     }
 
     /// Stage 2 for two-stage plugins (torrenthub): a meta payload's
@@ -598,6 +606,20 @@ final class MovieService: ObservableObject {
         guard !target.isEmpty else {
             DiagLog.log("resolve", "error plugin=\(pluginId) empty target")
             chainOutcome = "error kind=unresolvedEpisode"
+            throw MovieServiceError.unresolvedEpisode
+        }
+        guard !target.hasPrefix("jtvstreams:") else {
+            // L-23 (1.22.20/1.3.8): a torrenthub stage-1
+            // placeholder id is a detail-stage marker, never a
+            // resolvable target — refuse it here, labelled,
+            // instead of letting the embed chain hand the
+            // pseudo-scheme to the fetcher, where it dies as
+            // -1002 after the ~1 s retry loop. The play
+            // intents heal the placeholder before a request
+            // is built; this guard is defence in depth for
+            // any future path that leaks one through.
+            DiagLog.log("resolve", "error plugin=\(pluginId) kind=placeholderTarget")
+            chainOutcome = "error kind=placeholderTarget"
             throw MovieServiceError.unresolvedEpisode
         }
         // Log the target KIND and its redacted shape only — a

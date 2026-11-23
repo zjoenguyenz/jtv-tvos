@@ -117,6 +117,15 @@ enum TVNetProbe {
         Target(host: "24av.net", role: "mirror-123av-24av", kind: .mirrorState),
         // §6.3: the JavGuru chain walk (host jav.guru).
         Target(host: "jav.guru", role: "javguru-chain", kind: .chainWalk),
+        // Round-2 source candidates (1.3.8, RESEARCH-SOURCES-ROUND2
+        // probe batch): plain reachability only — the javsnap
+        // player host exactly as sampled in the research, the
+        // omgjav CDN, and the two JavMenu lines. One run settles
+        // these three candidates alongside the JavGuru walk above.
+        Target(host: "o-1wxmrhzolp.vid-snap-player.com", role: "javsnap-player"),
+        Target(host: "a41.355510382.xyz", role: "omgjav-cdn"),
+        Target(host: "xbv2608.com", role: "javmenu-xbv"),
+        Target(host: "t30.cdn2020.com", role: "javmenu-t30"),
     ]
 
     private static let sysBudget: TimeInterval = 6
