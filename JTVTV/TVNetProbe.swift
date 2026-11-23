@@ -588,7 +588,6 @@ enum TVNetProbe {
             }
         }
     }
-}
 
     // MARK: - Body-keeping GET (§6.2 mirror-state + §6.3 chain steps)
 
@@ -1042,6 +1041,7 @@ enum TVNetProbe {
         components.query = "\(rtype)r=\(reversed)"
         return components.url
     }
+}
 
 // MARK: - Run model
 
