@@ -165,17 +165,25 @@ struct TVBackdropPreviewHost: UIViewRepresentable {
                         // ever shown, so the retire is not
                         // animated. An unmeasurable stream
                         // (no video track dimensions yet)
-                        // passes — the gate only convicts a
-                        // MEASURED low quality.
+                        // also retires, with
+                        // reason=unmeasurable: the preview
+                        // plays ONLY on a measured ≥720
+                        // verdict — unverifiable ⇒ does not
+                        // play (plan §2.5; gate fix, Phase 2
+                        // Round 1 D-B2 — this branch
+                        // previously passed on unknown).
                         let measuredHeight = self.measuredVideoHeight(item: item)
-                        if let height = measuredHeight, height < 720 {
+                        guard let height = measuredHeight else {
+                            DiagLog.log("preview", "quality verdict=unmeasurable")
+                            self.retire(reason: "unmeasurable", animated: false)
+                            return
+                        }
+                        if height < 720 {
                             DiagLog.log("preview", "quality verdict=low-quality measured-height=\(height)")
                             self.retire(reason: "low-quality", animated: false)
                             return
                         }
-                        if let height = measuredHeight {
-                            DiagLog.log("preview", "quality verdict=pass measured-height=\(height)")
-                        }
+                        DiagLog.log("preview", "quality verdict=pass measured-height=\(height)")
                         // Ready-gated play (FL-201).
                         self.player?.play()
                         self.armCap()

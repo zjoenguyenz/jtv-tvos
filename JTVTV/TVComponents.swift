@@ -167,6 +167,17 @@ struct TVPosterCard: View {
     let isFavorite: Bool
     let onSelect: () -> Void
     let onLongPress: () -> Void
+    /// Phase 2 opt-ins (both default to the pre-Phase-2
+    /// behaviour, so every existing call site is unchanged):
+    /// - `onFocusChange`: the actor screen's dwell preview and
+    ///   focus counter need to know WHICH card holds focus;
+    ///   the card's focus state itself stays internal.
+    /// - `selectOnImageFailure`: the flow audit's A-3 rule
+    ///   (a card whose image failed still opens its film),
+    ///   adopted by the actor screen from its drawing (audit
+    ///   P-4). Elsewhere the tap keeps retrying the image.
+    var onFocusChange: ((Bool) -> Void)? = nil
+    var selectOnImageFailure: Bool = false
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var isFocused: Bool
@@ -177,17 +188,21 @@ struct TVPosterCard: View {
          width: CGFloat = 240,
          isFavorite: Bool,
          onSelect: @escaping () -> Void,
-         onLongPress: @escaping () -> Void) {
+         onLongPress: @escaping () -> Void,
+         onFocusChange: ((Bool) -> Void)? = nil,
+         selectOnImageFailure: Bool = false) {
         self.movie = movie
         self.width = width
         self.isFavorite = isFavorite
         self.onSelect = onSelect
         self.onLongPress = onLongPress
+        self.onFocusChange = onFocusChange
+        self.selectOnImageFailure = selectOnImageFailure
     }
 
     var body: some View {
         Button {
-            if imageFailed {
+            if imageFailed && !selectOnImageFailure {
                 retryToken += 1
             } else {
                 // L-T04 breadcrumb D0 (card form): the tap is
@@ -224,6 +239,7 @@ struct TVPosterCard: View {
         .tvCardButton()
         .focused($isFocused)
         .onChange(of: movie.id) { imageFailed = false; retryToken = 0 }
+        .onChange(of: isFocused) { _, focused in onFocusChange?(focused) }
         .onLongPressGesture(minimumDuration: 0.5) {
             onLongPress()
         }
@@ -295,22 +311,30 @@ struct TVGridPosterCell: View {
     let isFavorite: Bool
     let onSelect: () -> Void
     let onLongPress: () -> Void
+    var onFocusChange: ((Bool) -> Void)? = nil
+    var selectOnImageFailure: Bool = false
 
     init(movie: Movie,
          width: CGFloat = 240,
          isFavorite: Bool,
          onSelect: @escaping () -> Void,
-         onLongPress: @escaping () -> Void) {
+         onLongPress: @escaping () -> Void,
+         onFocusChange: ((Bool) -> Void)? = nil,
+         selectOnImageFailure: Bool = false) {
         self.movie = movie
         self.width = width
         self.isFavorite = isFavorite
         self.onSelect = onSelect
         self.onLongPress = onLongPress
+        self.onFocusChange = onFocusChange
+        self.selectOnImageFailure = selectOnImageFailure
     }
 
     var body: some View {
         TVPosterCard(movie: movie, width: width, isFavorite: isFavorite,
-                     onSelect: onSelect, onLongPress: onLongPress)
+                     onSelect: onSelect, onLongPress: onLongPress,
+                     onFocusChange: onFocusChange,
+                     selectOnImageFailure: selectOnImageFailure)
     }
 }
 
@@ -739,16 +763,22 @@ struct TVLoadingState: View {
 }
 
 /// Designed error surface with a focusable "Thử lại" button.
+/// `retryIsDefaultFocus` is the flow audit's A-9 opt-in (an
+/// error surface that is the only focusable on its screen
+/// must declare its landing — the actor screen passes true,
+/// audit P-4); default false keeps existing call sites as-is.
 struct TVErrorState: View {
     let message: String
     let onRetry: () -> Void
+    var retryIsDefaultFocus: Bool = false
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var retryFocused: Bool
 
-    init(message: String, onRetry: @escaping () -> Void) {
+    init(message: String, onRetry: @escaping () -> Void, retryIsDefaultFocus: Bool = false) {
         self.message = message
         self.onRetry = onRetry
+        self.retryIsDefaultFocus = retryIsDefaultFocus
     }
 
     var body: some View {
@@ -771,5 +801,6 @@ struct TVErrorState: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(60)
+        .defaultFocus($retryFocused, retryIsDefaultFocus)
     }
 }

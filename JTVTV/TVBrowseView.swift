@@ -93,6 +93,27 @@ final class TVNavPath {
         assign([])
     }
 
+    /// B-1 (Phase 2, owner ruling 2026-11-22 15:56): pop
+    /// exactly ONE level — the step a film Detail takes back
+    /// to the actor screen it was opened from, and the step
+    /// the actor screen itself takes back to its origin
+    /// Detail. Through the same assign door as every write.
+    func pop() {
+        guard !path.isEmpty else { return }
+        assign(Array(path.dropLast()))
+    }
+
+    /// B-1: true when the route directly beneath the stack's
+    /// top is an actor route — the signal TVDetailView's Menu
+    /// arbiter reads for the actor exception. The exception
+    /// follows the actual navigation chain; no flag is stored
+    /// on any route, so a Detail reached any other way keeps
+    /// the L-T31 pop-to-root behaviour by construction.
+    var isActorBeneathTop: Bool {
+        guard path.count >= 2, case .actor = path[path.count - 2] else { return false }
+        return true
+    }
+
     func push(_ route: AppRoute) {
         assign(NavPathMutation.pushing(route, onto: path))
         // L-T04 breadcrumb D1: the append + sanitise + assign
@@ -105,6 +126,8 @@ final class TVNavPath {
             DiagLog.log("detail", "push.category plugin=\(r.pluginId) slug=\(r.slug)")
         case .search(let r):
             DiagLog.log("detail", "push.search plugin=\(r.pluginId)")
+        case .actor(let r):
+            DiagLog.log("actor", "push plugin=\(r.pluginId) name=\(r.name)")
         }
     }
 
@@ -162,6 +185,8 @@ extension View {
                 TVBrowseView(pluginId: r.pluginId, slug: r.slug, title: r.title, initialFilters: r.filters)
             case .search(let r):
                 TVSearchResultsView(query: r.keyword, pluginId: r.pluginId)
+            case .actor(let r):
+                TVActorView(pluginId: r.pluginId, name: r.name, route: r.route)
             }
         }
     }

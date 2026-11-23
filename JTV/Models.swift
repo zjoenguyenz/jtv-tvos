@@ -224,18 +224,28 @@ struct Movie: Codable, Identifiable, Hashable {
     var quality: String = ""
     var episode_current: String = ""
     var lang: String = ""
+    /// Per-item preview clip the LIST payload itself carries
+    /// (missav / njav plugins emit `previewUrl` beside every
+    /// list item — a direct mp4 of the trailer). The model
+    /// dropped it at decode until Phase 2 (actor filmography),
+    /// whose focus-dwell preview consumes it as its fast path
+    /// under the same measured ≥720p gate as every preview.
+    /// Additive + defaulted: old persisted JSON decodes with "".
+    var previewUrl: String = ""
 
     enum CodingKeys: String, CodingKey {
-        case id, title, posterUrl, backdropUrl, year, quality, episode_current, lang
+        case id, title, posterUrl, backdropUrl, year, quality, episode_current, lang, previewUrl
     }
 
     init() {}
 
     init(id: String, title: String, posterUrl: String = "", backdropUrl: String = "",
-         year: Int = 0, quality: String = "", episode_current: String = "", lang: String = "") {
+         year: Int = 0, quality: String = "", episode_current: String = "", lang: String = "",
+         previewUrl: String = "") {
         self.id = id; self.title = title; self.posterUrl = posterUrl
         self.backdropUrl = backdropUrl; self.year = year; self.quality = quality
         self.episode_current = episode_current; self.lang = lang
+        self.previewUrl = previewUrl
     }
 
     init(from decoder: Decoder) throws {
@@ -254,6 +264,7 @@ struct Movie: Codable, Identifiable, Hashable {
         quality = try c.decodeIfPresent(String.self, forKey: .quality) ?? ""
         episode_current = try c.decodeIfPresent(String.self, forKey: .episode_current) ?? ""
         lang = try c.decodeIfPresent(String.self, forKey: .lang) ?? ""
+        previewUrl = try c.decodeIfPresent(String.self, forKey: .previewUrl) ?? ""
     }
 
     var displayBackdrop: String { backdropUrl.isEmpty ? posterUrl : backdropUrl }
@@ -403,9 +414,88 @@ struct MovieDetail: Codable {
               year: year, quality: quality, episode_current: episode_current, lang: lang)
     }
 
-    var castNames: [String] {
-        casts.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    /// Structured cast entries parsed from the raw `casts`
+    /// string (Phase 2, actor filmography): plugins that can
+    /// route an actor emit the markdown convention
+    /// `[name](route)` (missav / 123av / njav / topxx since
+    /// Phase 1); every other name is a bare, route-less entry.
+    /// Order is the source's own order; duplicates collapse to
+    /// the first occurrence (a name listed twice is one chip).
+    var castEntries: [CastEntry] {
+        Self.parseCastEntries(casts)
     }
+
+    /// Display projection of `castEntries` — the names only.
+    /// Kept as the one display shape every existing consumer
+    /// reads; before Phase 2 it split the raw string on ",",
+    /// which handed the shells the raw markdown text of routed
+    /// casts as if it were a name (the iOS chip-title bug and
+    /// the tvOS sprawl collision, L-T19/L-T25 family).
+    var castNames: [String] {
+        castEntries.map(\.name)
+    }
+
+    /// Hand parser for the `[name](route)` convention — no
+    /// regex (the house avoids per-call regex compilation, and
+    /// this shape is a simple two-delimiter scan). A `[` that
+    /// does not complete a well-formed `](`…`)` link is treated
+    /// as literal text of a bare name. Routes emitted by the
+    /// plugins are URL-encoded, so a route never contains a
+    /// raw `)` or `,`; names are split on "," exactly as the
+    /// pre-Phase-2 `castNames` split them.
+    static func parseCastEntries(_ raw: String) -> [CastEntry] {
+        var entries: [CastEntry] = []
+        var seen = Set<String>()
+        func append(name: String, route: String?) {
+            let trimmed = name.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, seen.insert(trimmed).inserted else { return }
+            let route = route?.trimmingCharacters(in: .whitespaces)
+            entries.append(CastEntry(name: trimmed, route: (route?.isEmpty ?? true) ? nil : route))
+        }
+        var bare = ""
+        var index = raw.startIndex
+        while index < raw.endIndex {
+            if raw[index] == "[",
+               let closeBracket = raw[index...].firstIndex(of: "]") {
+                let afterBracket = raw.index(after: closeBracket)
+                if afterBracket < raw.endIndex, raw[afterBracket] == "(",
+                   let closeParen = raw[afterBracket...].firstIndex(of: ")") {
+                    // A completed link: flush any pending bare
+                    // names first (comma-separated), then the
+                    // routed entry.
+                    for part in bare.split(separator: ",") {
+                        append(name: String(part), route: nil)
+                    }
+                    bare = ""
+                    let name = String(raw[raw.index(after: index)..<closeBracket])
+                    let routeStart = raw.index(after: afterBracket)
+                    append(name: name, route: String(raw[routeStart..<closeParen]))
+                    index = raw.index(after: closeParen)
+                    continue
+                }
+            }
+            if raw[index] == "," {
+                append(name: bare, route: nil)
+                bare = ""
+            } else {
+                bare.append(raw[index])
+            }
+            index = raw.index(after: index)
+        }
+        append(name: bare, route: nil)
+        return entries
+    }
+}
+
+/// One cast member of a detail: a display name plus, when the
+/// plugin routed the actor (Phase 1 markdown convention), the
+/// actor route slug the plugin's own list endpoint consumes
+/// (e.g. `/vi/actresses/Emma%20Kiritani`, `actresses/<slug>`,
+/// `/en/actor/<Name>`, `actor-<code>`). Route-less entries are
+/// display/search names only — no filmography exists for them.
+struct CastEntry: Hashable {
+    var name: String
+    var route: String? = nil
 }
 
 // MARK: - Streaming
@@ -541,6 +631,42 @@ struct SearchRoute: Hashable {
     let keyword: String
 }
 
+/// Navigation route to an actor filmography screen (Phase 2):
+/// pushed by a routed cast chip of a FULL-scope plugin only.
+/// `route` is the plugin-native actor slug the plugin's list
+/// endpoint consumes (see CastEntry); the filmography is
+/// source-native — the same name in another plugin is a
+/// different, unrelated route (no cross-plugin merging, owner
+/// ruling). Carries no portrait: almost no source supplies
+/// one, and the screens render the no-photo header by default.
+struct ActorRoute: Hashable {
+    let pluginId: String
+    let name: String
+    let route: String
+}
+
+/// The Phase 2 actor scope table (plan §1 — data only; each
+/// shell renders the outcome in its own idiom):
+/// - FULL plugins emit routed casts (Phase 1) and own a real
+///   actor list endpoint → a routed chip opens the actor
+///   screen.
+/// - SEARCH-ONLY plugins (vlxx, avdbapi) emit bare names → a
+///   chip keeps landing on the plugin's keyword search.
+/// - Every other plugin is NONE for this feature: no actor
+///   routing exists, and the shells keep exactly their
+///   pre-Phase-2 cast behaviour for them.
+/// A routed entry surfacing under a non-FULL plugin (never
+/// observed — only FULL plugins emit routes) falls back to
+/// the search behaviour rather than opening a screen whose
+/// endpoint was never verified.
+enum ActorScope {
+    static let fullPlugins: Set<String> = ["missav", "123av", "njav", "topxx"]
+
+    static func isFull(pluginId: String) -> Bool {
+        fullPlugins.contains(pluginId)
+    }
+}
+
 /// The single route type every browsing stack (Home / Categories /
 /// Search / Library) is built on, so each stack's path is explicit
 /// state the app owns instead of SwiftUI's opaque internal store.
@@ -548,6 +674,7 @@ enum AppRoute: Hashable {
     case movie(MovieRoute)
     case category(CategoryRoute)
     case search(SearchRoute)
+    case actor(ActorRoute)
 }
 
 /// Guards the browsing stacks against a navigation race: a push
