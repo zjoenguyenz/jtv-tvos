@@ -444,7 +444,7 @@ struct TVActorView: View {
                             Task { @MainActor in
                                 try? await Task.sleep(for: .milliseconds(700))
                                 guard previewGeneration == retiredGeneration else { return }
-                                previewStream = nil
+                                self.previewStream = nil
                             }
                         })
                         .frame(width: 928, height: 522)
