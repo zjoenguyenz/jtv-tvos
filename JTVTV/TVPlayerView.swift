@@ -300,9 +300,36 @@ private struct TVPlayerSessionView: View {
             Text(session.currentRequest.episode.name)
                 .font(.system(size: 26))
                 .foregroundStyle(theme.textDim)
-            Text("Đang tải…")
-                .font(.system(size: 26, weight: .medium))
-                .foregroundStyle(theme.textDim)
+            // §1C (1.3.6): for a hash attempt in Phase 2 the
+            // status line is replaced IN ITS SLOT by the
+            // torrent wait line (same typography); every other
+            // loading state keeps the plain line exactly.
+            if session.isTorrentHashTitle, let wait = session.debridWait {
+                TimelineView(.periodic(from: wait.since, by: 1)) { context in
+                    let elapsed = context.date.timeIntervalSince(wait.since)
+                    VStack(spacing: 22) {
+                        if elapsed >= 3 {
+                            Text(debridWaitLine(names: wait.providerNames, elapsed: elapsed))
+                                .font(.system(size: 26, weight: .medium))
+                                .foregroundStyle(theme.textDim)
+                        } else {
+                            Text("Đang tải…")
+                                .font(.system(size: 26, weight: .medium))
+                                .foregroundStyle(theme.textDim)
+                        }
+                        if elapsed >= 300 {
+                            Text("Vẫn đang tải trên máy chủ. Đóng lại cũng được — phần tải vẫn tiếp tục, mở lại sau sẽ có nhanh hơn.")
+                                .font(.system(size: 22))
+                                .foregroundStyle(theme.textFaint)
+                                .multilineTextAlignment(.center)
+                        }
+                    }
+                }
+            } else {
+                Text("Đang tải…")
+                    .font(.system(size: 26, weight: .medium))
+                    .foregroundStyle(theme.textDim)
+            }
             // NO source list on the loading state — for ANY
             // title. The NEXT-C C3 (1.3.0) loading-state switch
             // list (extended to torrent hash titles by L-T13,
@@ -331,6 +358,31 @@ private struct TVPlayerSessionView: View {
         }
         .padding(60)
     }
+}
+
+/// §1C: `{m:ss}` — no leading-zero minutes, two-digit seconds.
+private func debridElapsedText(_ elapsed: TimeInterval) -> String {
+    let total = max(0, Int(elapsed))
+    return "\(total / 60):" + String(format: "%02d", total % 60)
+}
+
+/// §1C: the race form only while BOTH providers actually
+/// run (fixed order TorBox first); otherwise the single form
+/// naming the (first) waiting provider — or the plain
+/// loading form when no provider name exists at all.
+private func debridWaitLine(names: [String], elapsed: TimeInterval) -> String {
+    let waited = debridElapsedText(elapsed)
+    if names.count == 2, names.contains("TorBox"), names.contains("Premiumize") {
+        return "Đang chờ TorBox và Premiumize tải xong… · đã chờ \(waited)"
+    }
+    // Gate fix (D-4): an empty provider list must never
+    // render the single form with a blank name
+    // ("Đang chờ  tải xong…" — double space, no provider);
+    // fall back to the plain loading form.
+    guard let first = names.first, !first.isEmpty else {
+        return "Đang tải…"
+    }
+    return "Đang chờ \(first) tải xong… · đã chờ \(waited)"
 }
 
 // MARK: - Error state (§3.5)
@@ -435,6 +487,16 @@ private struct TVSourcePanelView: View {
                 Text("Đổi nguồn")
                     .font(.system(size: 36, weight: .bold))
                     .foregroundStyle(theme.textPrimary)
+                // §1A (1.3.6): the REAL playing source, one
+                // subtitle line in the panel's existing
+                // secondary style. Segments joined only when
+                // non-empty, exact duplicates dropped; both
+                // empty → the line is omitted entirely.
+                if let playingLine = playingSourceLine {
+                    Text(playingLine)
+                        .font(.system(size: 24, weight: .semibold))
+                        .foregroundStyle(theme.textDim)
+                }
                 ScrollView {
                     VStack(spacing: 12) {
                         ForEach(session.switchTargets) { episode in
@@ -483,6 +545,20 @@ private struct TVSourcePanelView: View {
             .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
         }
         .defaultFocus($focusedID, defaultTargetID)
+    }
+
+    /// §1A: `Đang phát: <pluginName> · <serverName>` from the
+    /// PLAYING context; nil when both segments are empty.
+    private var playingSourceLine: String? {
+        var segments: [String] = []
+        for segment in [session.playingPluginName, session.currentRequest.serverName] {
+            let trimmed = segment.trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty, !segments.contains(trimmed) {
+                segments.append(trimmed)
+            }
+        }
+        guard !segments.isEmpty else { return nil }
+        return "Đang phát: " + segments.joined(separator: " · ")
     }
 
     /// Default focus lands on the first switchable (enabled)

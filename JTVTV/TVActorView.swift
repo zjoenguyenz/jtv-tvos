@@ -1,5 +1,13 @@
 import SwiftUI
 
+/// Row identity for the merged filmography (§13.2/§13.8):
+/// Movie.id is unique only within its own plugin, so a merged
+/// list keys on plugin + id, never the bare id. (The iOS shell
+/// declares the same conformance in its own target.)
+extension ActorFilmRow: Identifiable {
+    var id: String { "\(pluginId)#\(movie.id)" }
+}
+
 /// JTV tvOS Phase 2 (1.3.5) — the actor filmography screen
 /// (L-T26), built to the approved drawing
 /// (phase2-actor/PREVIEW-actor-tvos.png): actor header with
@@ -13,9 +21,15 @@ import SwiftUI
 /// arbiter.
 ///
 /// Data: an actor route is a category-shaped slug, so the
-/// list rides the same MovieService.list surface TVBrowseView
-/// uses, with TVBrowseView's generation-guarded reload /
-/// load-more discipline. No fetch machinery is touched.
+/// ORIGIN's page 1 rides the same MovieService.list surface
+/// TVBrowseView uses, with TVBrowseView's generation-guarded
+/// reload discipline. §13 (1.3.6): the outcome is handed to a
+/// per-visit ActorMergeCoordinator, which merges the other
+/// actor-capable sources in canonical order behind it; this
+/// view mirrors the coordinator's published state (rows /
+/// contributors / avatar / settled / originFailed) into its
+/// own @State via onChange and renders from the mirrors. The
+/// coordinator owns every pagination cursor after page 1.
 ///
 /// Preview: focus-dwell 1.5 s (JTV Detail's own value), one
 /// attempt per dwell, the attempt dies on any focus move
@@ -45,18 +59,30 @@ struct TVActorView: View {
     @Environment(\.tvTheme) private var theme
     @Environment(TVNavPath.self) private var nav
 
-    @State private var items: [Movie] = []
-    @State private var page = 0
-    @State private var totalPages = 1
+    @State private var rows: [ActorFilmRow] = []
     @State private var isLoading = false
     @State private var isLoadingMore = false
     @State private var loadError: String?
     @State private var didLoad = false
     @State private var loadGeneration = 0
 
+    // §13 merge mirrors: copied out of the coordinator on
+    // every onChange (the coordinator owns the merge; these
+    // are this view's render state). A fresh coordinator is
+    // created per reload().
+    @State private var mergeCoordinator: ActorMergeCoordinator?
+    @State private var contributors: [String] = []
+    @State private var mergedAvatarUrl: String?
+    @State private var mergeSettled = false
+    @State private var originFailed = false
+
+    // §13.1e borrowed-avatar state (TopXX only).
+    @State private var avatarImage: UIImage?
+    @State private var avatarLogged = false
+
     // Focus-dwell preview state (Detail's discipline, scoped
     // to the focused film instead of the page).
-    @State private var focusedMovie: Movie?
+    @State private var focusedRow: ActorFilmRow?
     @State private var previewStream: StreamInfo?
     @State private var previewGeneration = 0
     @State private var previewEpoch = 0
@@ -73,8 +99,28 @@ struct TVActorView: View {
     }
 
     private var focusedIndex: Int {
-        guard let focusedMovie else { return 0 }
-        return items.firstIndex { $0.id == focusedMovie.id } ?? 0
+        guard let focusedRow else { return 0 }
+        return rows.firstIndex { $0.id == focusedRow.id } ?? 0
+    }
+
+    /// §13.1c: the header's merged condition — ANY
+    /// non-origin contributor with rows on screen makes the
+    /// page merged, whatever the origin did: contributed
+    /// alongside it (the normal merge), failed (contributors
+    /// stand in for it), or settled with 0 rows (gate fix
+    /// D-2: the contributors' films are then the page's
+    /// content and are never presented as the origin's own
+    /// solo page). Solo is exactly: no non-origin
+    /// contributor, and no origin failure with contributors.
+    private var isMerged: Bool {
+        contributors.contains { $0 != pluginId } || (originFailed && !contributors.isEmpty)
+    }
+
+    /// §13.1f: the merge is still running and nothing has
+    /// landed yet (any loadError state — contributed rows, not
+    /// the error surface, are this state's resolution).
+    private var isRunningAtZero: Bool {
+        didLoad && !mergeSettled && rows.isEmpty
     }
 
     var body: some View {
@@ -121,7 +167,8 @@ struct TVActorView: View {
         }
         .task { if !didLoad { await reload() } }
         .task(id: dwellTaskKey) { await runDwell() }
-        .onChange(of: focusedMovie?.id) { _, _ in
+        .task(id: mergedAvatarUrl) { await loadAvatar() }
+        .onChange(of: focusedRow?.id) { _, _ in
             // A new focus owner retires the previous film's
             // preview in the same update: the frame falls back
             // to the newly focused film's still while its own
@@ -153,7 +200,11 @@ struct TVActorView: View {
                         .foregroundStyle(theme.accentSoft)
                     Text("·")
                         .foregroundStyle(theme.textFaint)
-                    Text("NGUỒN \(pluginName.uppercased())")
+                    // §13.1c eyebrow: the origin's name until
+                    // a contributor block lands (isMerged),
+                    // then the merged form. Finished solo is
+                    // byte-identical to 1.3.5.
+                    Text(isMerged ? "TỔNG HỢP NHIỀU NGUỒN" : "NGUỒN \(pluginName.uppercased())")
                         .foregroundStyle(theme.textFaint)
                 }
                 .font(.system(size: 17, weight: .bold))
@@ -172,43 +223,114 @@ struct TVActorView: View {
                     .padding(.top, 14)
             }
             Spacer(minLength: 0)
-            sourceChip
-                .padding(.top, 8)
+            VStack(alignment: .trailing, spacing: 12) {
+                sourceChip
+                // §13.1f: the origin-failure retry chip lives
+                // in the header band under the source chip, in
+                // its own focus section, never the default
+                // focus — present only while contributed rows
+                // are on screen over a failed origin.
+                if originFailed && !rows.isEmpty {
+                    retryChip
+                }
+            }
+            .padding(.top, 8)
         }
         .frame(height: 222)
     }
 
-    /// The no-photo header slot (the default — almost no JTV
-    /// source supplies a portrait): the actor's initial over
-    /// the Ultra poster-slot colour, exactly as drawn. A fake
-    /// photo is never substituted (plan §2.4).
+    /// The header slot. Default (almost no JTV source
+    /// supplies a portrait): the actor's initial over the
+    /// Ultra poster-slot colour, exactly as drawn — a fake
+    /// photo is never substituted (plan §2.4). §13.1e: when
+    /// the merge borrowed a TopXX avatar and it loaded, the
+    /// photo covers the slot instead and the KHÔNG CÓ ẢNH
+    /// caption is gone; any load failure falls back to the
+    /// drawn slot instantly.
+    @ViewBuilder
     private var portraitSlot: some View {
-        VStack(spacing: 14) {
-            Text(String(name.prefix(1)).uppercased())
-                .font(.system(size: 76, weight: .bold))
-                .foregroundStyle(Color.white.opacity(0.45))
-            Text("KHÔNG CÓ ẢNH")
-                .font(.system(size: 14, weight: .semibold))
-                .tracking(2.5)
-                .foregroundStyle(Color.white.opacity(0.45))
+        if let avatarImage {
+            Image(uiImage: avatarImage)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 158, height: 222)
+                .clipShape(RoundedRectangle(cornerRadius: theme.posterRadius, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: theme.posterRadius, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.14), lineWidth: 1))
+        } else {
+            VStack(spacing: 14) {
+                Text(String(name.prefix(1)).uppercased())
+                    .font(.system(size: 76, weight: .bold))
+                    .foregroundStyle(Color.white.opacity(0.45))
+                Text("KHÔNG CÓ ẢNH")
+                    .font(.system(size: 14, weight: .semibold))
+                    .tracking(2.5)
+                    .foregroundStyle(Color.white.opacity(0.45))
+            }
+            .frame(width: 158, height: 222)
+            .background(RoundedRectangle(cornerRadius: theme.posterRadius, style: .continuous)
+                .fill(theme.isUltra ? Color(red: 0.149, green: 0.149, blue: 0.169) : theme.cardFill))
+            .overlay(RoundedRectangle(cornerRadius: theme.posterRadius, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.14), lineWidth: 1))
         }
-        .frame(width: 158, height: 222)
-        .background(RoundedRectangle(cornerRadius: theme.posterRadius, style: .continuous)
-            .fill(theme.isUltra ? Color(red: 0.149, green: 0.149, blue: 0.169) : theme.cardFill))
-        .overlay(RoundedRectangle(cornerRadius: theme.posterRadius, style: .continuous)
-            .strokeBorder(Color.white.opacity(0.14), lineWidth: 1))
+    }
+
+    /// §13.1e: load the borrowed avatar the coordinator
+    /// published (TopXX only, by construction of the core).
+    /// Runs as .task(id: mergedAvatarUrl): a new URL clears
+    /// the slot first; success shows the photo and logs the
+    /// borrow once per view (§13.9).
+    private func loadAvatar() async {
+        avatarImage = nil
+        guard let url = mergedAvatarUrl else { return }
+        let image = await ImageCacheManager.shared.loadImage(urlString: url, bucket: 720)
+        guard !Task.isCancelled, mergedAvatarUrl == url else { return }
+        if let image {
+            avatarImage = image
+            if !avatarLogged {
+                avatarLogged = true
+                DiagLog.log("actor", "avatar source=topxx")
+            }
+        }
+    }
+
+    /// §13.1c suffixes, appended in this order when they
+    /// apply: the origin-failure disclosure (§13.1f), then
+    /// the borrowed-avatar credit for the edge where TopXX
+    /// resolved the actor but contributed no rows and so is
+    /// named nowhere else on the page (§13.1e). In the pure
+    /// solo outcome neither applies and the suffix is empty —
+    /// the settled-solo line stays byte-identical to 1.3.5.
+    private var metaSuffixExtras: String {
+        var extras = ""
+        if originFailed && !rows.isEmpty {
+            extras += " · nguồn chính lỗi tải"
+        }
+        if avatarImage != nil && !contributors.contains("topxx") {
+            extras += " · Ảnh đại diện: TopXX"
+        }
+        return extras
     }
 
     @ViewBuilder
     private var metaLine: some View {
         if didLoad {
-            HStack(spacing: 0) {
-                Text("\(items.count) phim trong danh sách")
+            if originFailed && mergeSettled && rows.isEmpty {
+                // §13.1f: the merge settled empty over a
+                // failed origin — today's failure copy (the
+                // grid zone shows the error surface itself).
+                Text("Không tải được danh sách phim")
+                    .font(.system(size: 26))
                     .foregroundStyle(theme.textPrimary)
-                Text(" · sắp theo thứ tự nguồn trả về")
-                    .foregroundStyle(theme.textDim)
+            } else {
+                HStack(spacing: 0) {
+                    Text("\(rows.count) phim trong danh sách")
+                        .foregroundStyle(theme.textPrimary)
+                    Text(metaLineSuffix)
+                        .foregroundStyle(theme.textDim)
+                }
+                .font(.system(size: 26))
             }
-            .font(.system(size: 26))
         } else if loadError != nil {
             Text("Không tải được danh sách phim")
                 .font(.system(size: 26))
@@ -220,11 +342,23 @@ struct TVActorView: View {
         }
     }
 
+    /// §13.1c meta suffix: running / settled-merged /
+    /// settled-solo, plus the ordered extras.
+    private var metaLineSuffix: String {
+        if !mergeSettled {
+            return " · đang gộp thêm từ các nguồn khác…" + metaSuffixExtras
+        }
+        if isMerged {
+            return " · gộp từ \(contributors.count) nguồn theo thứ tự cố định" + metaSuffixExtras
+        }
+        return " · sắp theo thứ tự nguồn trả về" + metaSuffixExtras
+    }
+
     private var sourceChip: some View {
         HStack(spacing: 8) {
             Text("Nguồn")
                 .foregroundStyle(theme.textPrimary)
-            Text(pluginName)
+            Text(sourceChipName)
                 .fontWeight(.bold)
                 .foregroundStyle(theme.heroMeta)
         }
@@ -235,9 +369,41 @@ struct TVActorView: View {
         .overlay(Capsule().strokeBorder(Color.white.opacity(0.14), lineWidth: 1.5))
     }
 
+    /// §13.1c source chip: the chip always names the ORIGIN
+    /// anchor — running, it says the merge is still looking;
+    /// settled-merged, it counts the OTHER contributors
+    /// (contributors minus the origin when the origin itself
+    /// contributed); settled-solo (and pre-load) it is
+    /// today's chip verbatim.
+    private var sourceChipName: String {
+        if didLoad && !mergeSettled {
+            return "\(pluginName) · đang tìm thêm"
+        }
+        if didLoad && isMerged {
+            let others = contributors.count - (contributors.contains(pluginId) ? 1 : 0)
+            return "\(pluginName) + \(others) nguồn khác"
+        }
+        return pluginName
+    }
+
+    /// §13.1f retry chip: a full reload(), offered only
+    /// while a failed origin has contributed rows standing
+    /// in for it. TVChip language, its OWN focus section,
+    /// never the default focus.
+    private var retryChip: some View {
+        TVChip(title: "Thử tải lại", selected: false) {
+            Task { await reload() }
+        }
+        .focusSection()
+    }
+
     // MARK: Left column — section row, grid, bottom hint
 
-    private var isEmptyResult: Bool { didLoad && loadError == nil && items.isEmpty }
+    /// §13.1f: the empty state exists only once the merge
+    /// has SETTLED with zero rows and no origin failure —
+    /// while the merge runs at zero rows the page waits
+    /// (isRunningAtZero), it does not declare itself empty.
+    private var isEmptyResult: Bool { didLoad && loadError == nil && rows.isEmpty && mergeSettled }
 
     private var leftColumn: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -266,8 +432,8 @@ struct TVActorView: View {
                 .foregroundStyle(theme.textPrimary)
                 .lineLimit(1)
             Spacer(minLength: 0)
-            if !items.isEmpty {
-                Text(String(format: "%02d / %02d", focusedIndex + 1, items.count))
+            if !rows.isEmpty {
+                Text(String(format: "%02d / %02d", focusedIndex + 1, rows.count))
                     .font(.system(size: 20))
                     .tracking(1)
                     .foregroundStyle(theme.textFaint)
@@ -275,43 +441,69 @@ struct TVActorView: View {
         }
     }
 
+    /// The focusable Quay lại chip shared by the empty and
+    /// running-at-0 branches: it holds the initial focus in
+    /// both (Menu also exits — this surface's arbiter).
+    private var backChipRow: some View {
+        HStack {
+            TVChip(title: "Quay lại", selected: false) { nav.pop() }
+            Spacer()
+        }
+    }
+
     @ViewBuilder
     private var gridZone: some View {
-        if isLoading && items.isEmpty {
+        if isLoading && rows.isEmpty {
             ProgressView()
                 .tint(.white)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let loadError, items.isEmpty {
+        } else if let loadError, rows.isEmpty && mergeSettled {
             // Audit P-4: the actor grid's failure uses the
             // shared error surface with the A-9 default-focus
             // opt-in, so the retry is the landing focus.
+            // §13.1f: this surface appears ONLY on a settled
+            // zero-row outcome — while the merge runs, or once
+            // any contributor has landed, contributed rows win
+            // over the error.
             TVErrorState(message: loadError, onRetry: { Task { await reload() } },
                          retryIsDefaultFocus: true)
-        } else if isEmptyResult {
-            // Plan §3: the trailer zone hides and a focusable
-            // Quay lại chip holds the initial focus (Menu also
-            // exits — this surface's arbiter).
-            HStack {
-                TVChip(title: "Quay lại", selected: false) { nav.pop() }
-                Spacer()
+        } else if isRunningAtZero {
+            // §13.1f running-at-0: the waiting line in place
+            // of the grid, trailer zone hidden (rightColumn),
+            // and the Quay lại chip holding focus exactly as
+            // in the empty branch.
+            VStack(alignment: .leading, spacing: 22) {
+                Text("Đang tìm ở các nguồn khác…")
+                    .font(.system(size: 24))
+                    .foregroundStyle(theme.textDim)
+                backChipRow
+                Spacer(minLength: 0)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .focusSection()
             .prefersDefaultFocus(true, in: focusNS)
+        } else if isEmptyResult {
+            // Plan §3: the trailer zone hides and a focusable
+            // Quay lại chip holds the initial focus (Menu also
+            // exits — this surface's arbiter).
+            backChipRow
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .focusSection()
+                .prefersDefaultFocus(true, in: focusNS)
         } else {
             ScrollView {
                 VStack(spacing: 28) {
                     LazyVGrid(columns: Array(repeating: GridItem(.fixed(240), spacing: 24), count: 3),
                               spacing: 44) {
-                        ForEach(items) { movie in
+                        ForEach(rows) { row in
                             TVGridPosterCell(
-                                movie: movie,
+                                movie: row.movie,
                                 width: 240,
-                                isFavorite: favorites.isFavorite(pluginId: pluginId, movieId: movie.id),
-                                onSelect: { openFilm(movie) },
-                                onLongPress: { favorites.toggle(pluginId: pluginId, movie: movie) },
+                                isFavorite: favorites.isFavorite(pluginId: row.pluginId, movieId: row.movie.id),
+                                onSelect: { openFilm(row) },
+                                onLongPress: { favorites.toggle(pluginId: row.pluginId, movie: row.movie) },
                                 onFocusChange: { focused in
-                                    if focused { focusedMovie = movie }
+                                    if focused { focusedRow = row }
                                 },
                                 selectOnImageFailure: true
                             )
@@ -323,8 +515,9 @@ struct TVActorView: View {
                             .padding(.vertical, 8)
                     }
                     // Bottom sentinel: load-more hangs on the
-                    // scroll position (FL-234), guarded by the
-                    // loader's own page state.
+                    // scroll position (FL-234) and delegates to
+                    // the coordinator's lockstep pagination
+                    // (§13.5) — it owns every source's cursor.
                     Color.clear
                         .frame(height: 8)
                         .onAppear { Task { await loadMore() } }
@@ -353,28 +546,30 @@ struct TVActorView: View {
             }
             .frame(height: 40)
             Spacer().frame(height: 10)
-            if isEmptyResult {
-                // Plan §3: with an empty filmography the
-                // trailer zone hides — the zone keeps its
-                // geometry so the composition does not jump.
+            if rows.isEmpty && !isLoading {
+                // Plan §3 + §13.1f: with no rows on screen
+                // (empty result, settled error, or the merge
+                // still running at zero) the trailer zone
+                // hides — the zone keeps its geometry so the
+                // composition does not jump.
                 Color.clear.frame(width: 928, height: 522)
             } else {
                 previewFrame
             }
             Spacer().frame(height: 26)
-            if let focusedMovie {
+            if let focusedRow {
                 HStack(alignment: .firstTextBaseline, spacing: 14) {
-                    Text(focusedMovie.title)
+                    Text(focusedRow.movie.title)
                         .font(.system(size: 30, weight: .medium))
                         .foregroundStyle(theme.textPrimary)
                         .lineLimit(1)
-                    if focusedMovie.year > 0 {
-                        Text(String(focusedMovie.year))
+                    if focusedRow.movie.year > 0 {
+                        Text(String(focusedRow.movie.year))
                             .font(.system(size: 22))
                             .foregroundStyle(theme.textDim)
                     }
                 }
-                Text(frameMetaText(focusedMovie))
+                Text(frameMetaText(focusedRow))
                     .font(.system(size: 22))
                     .foregroundStyle(theme.textDim)
                     .lineLimit(1)
@@ -389,10 +584,15 @@ struct TVActorView: View {
         return ""
     }
 
-    private func frameMetaText(_ movie: Movie) -> String {
-        [movie.episode_current, movie.lang]
+    /// §13.1d: the frame's meta line names the focused
+    /// ROW's source for EVERY card, origin rows included —
+    /// the frame is where the card's source matters (dwell
+    /// resolution and OK both act through it).
+    private func frameMetaText(_ row: ActorFilmRow) -> String {
+        var parts = [row.movie.episode_current, row.movie.lang]
             .filter { !$0.isEmpty }
-            .joined(separator: " · ")
+        parts.append("Nguồn \(plugins.installedPlugin(id: row.pluginId)?.manifest.name ?? row.pluginId)")
+        return parts.joined(separator: " · ")
     }
 
     /// The frame's layer stack, in the drawing's fallback
@@ -404,15 +604,15 @@ struct TVActorView: View {
         ZStack {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(theme.surfaceBottom)
-            if let movie = focusedMovie {
-                if movie.displayBackdrop.isEmpty {
-                    Text(movie.title)
+            if let row = focusedRow {
+                if row.movie.displayBackdrop.isEmpty {
+                    Text(row.movie.title)
                         .font(.system(size: 30, weight: .semibold))
                         .foregroundStyle(theme.textFaint)
                         .multilineTextAlignment(.center)
                         .padding(40)
                 } else {
-                    TVRemoteImage(urlString: movie.displayBackdrop, bucket: 1920)
+                    TVRemoteImage(urlString: row.movie.displayBackdrop, bucket: 1920)
                 }
                 if let previewStream {
                     TVBackdropPreviewHost(
@@ -452,10 +652,10 @@ struct TVActorView: View {
                         .opacity(previewVisible ? 1 : 0)
                         .id(previewGeneration)
                 }
-                if !movie.quality.isEmpty {
+                if !row.movie.quality.isEmpty {
                     VStack {
                         HStack {
-                            Text(movie.quality)
+                            Text(row.movie.quality)
                                 .font(.system(size: 17, weight: .bold))
                                 .foregroundStyle(.black)
                                 .padding(.horizontal, 10)
@@ -514,37 +714,110 @@ struct TVActorView: View {
 
     /// Card tap → the film's own Detail, pushed over this
     /// screen (FL-057 prevention: the destination carries the
-    /// FILM's identity, never the origin context). The push
-    /// also sets the play latch so no preview re-arms behind
-    /// the Detail.
-    private func openFilm(_ movie: Movie) {
+    /// FILM's identity, never the origin context — §13.6: the
+    /// ROW's plugin, so a contributed film opens in its own
+    /// source). The push also sets the play latch so no
+    /// preview re-arms behind the Detail, and freezes the
+    /// merge (§13.1g): this visit's list never changes again.
+    private func openFilm(_ row: ActorFilmRow) {
         previewLatched = true
         previewEpoch += 1
         previewStream = nil
-        DiagLog.log("actor", "open-film plugin=\(pluginId) movie=\(movie.id)")
-        nav.push(.movie(MovieRoute(pluginId: pluginId, movie: movie)))
+        mergeCoordinator?.freeze()
+        DiagLog.log("actor", "open-film plugin=\(row.pluginId) movie=\(row.movie.id)")
+        nav.push(.movie(MovieRoute(pluginId: row.pluginId, movie: row.movie)))
     }
 
-    // MARK: List loading (TVBrowseView's discipline, same
-    // service surface — generation-guarded, dedupe by id)
+    // MARK: List loading (TVBrowseView's discipline for the
+    // origin's page 1 — generation-guarded; the coordinator
+    // owns everything after, §13.5/§13.8)
 
     private func reload() async {
         loadGeneration += 1
         let gen = loadGeneration
         isLoading = true
         loadError = nil
+        // Gate fix (F-A2/C-2): the OUTGOING coordinator is
+        // frozen BEFORE its replacement is installed — its
+        // target/budget tasks are cancelled and its late
+        // completions drop on the coordinator's frozen
+        // guards, so a superseded visit can never write into
+        // this reload's mirrors.
+        mergeCoordinator?.freeze()
+        // Fresh coordinator per reload (§13.8). Its onChange
+        // mirrors the published state into this view's @State;
+        // the capture list binds the @State wrappers directly
+        // (not the view value), so no view ↔ coordinator
+        // retain cycle forms through the mergeCoordinator
+        // storage — and the coordinator itself is captured
+        // WEAKLY (gate fix F-A2): the closure lives ON the
+        // coordinator, so a strong capture would close a
+        // coordinator → closure → coordinator self-retain
+        // cycle and leak one coordinator per visit; the
+        // view's @State storage is the sole strong owner.
+        // The mirrors reset with the new coordinator — a
+        // retry reload is a FULL reload (§13.1f): the grid
+        // resets and focus returns to the first card.
+        let coordinator = ActorMergeCoordinator(service: service, originPluginId: pluginId, name: name)
+        coordinator.originRoute = route
+        coordinator.onChange = { [weak coordinator, rowsBox = _rows, contributorsBox = _contributors,
+                                  avatarBox = _mergedAvatarUrl, settledBox = _mergeSettled,
+                                  failedBox = _originFailed] in
+            guard let coordinator else { return }
+            rowsBox.wrappedValue = coordinator.rows
+            contributorsBox.wrappedValue = coordinator.contributors
+            avatarBox.wrappedValue = coordinator.avatarUrl
+            settledBox.wrappedValue = coordinator.settled
+            failedBox.wrappedValue = coordinator.originFailed
+        }
+        mergeCoordinator = coordinator
+        rows = []
+        contributors = []
+        mergedAvatarUrl = nil
+        mergeSettled = false
+        originFailed = false
+        focusedRow = nil
         do {
             let result = try await service.list(pluginId: pluginId, slug: route,
                                                 filters: ListFilters(), page: 1)
             guard gen == loadGeneration else { return }
-            items = result.items.uniquedById()
-            page = result.pagination.currentPage
-            totalPages = max(result.pagination.totalPages, 1)
-            DiagLog.log("actor", "list plugin=\(pluginId) count=\(items.count) totalPages=\(totalPages)")
+            // The coordinator id-dedupes the origin block as
+            // it appends (replacing uniquedById()); begin()
+            // publishes synchronously, so the mirrored rows
+            // already carry the deduped count for this line.
+            coordinator.begin(originFirstPage: result, originFailed: false)
+            DiagLog.log("actor", "list plugin=\(pluginId) count=\(rows.count) totalPages=\(max(result.pagination.totalPages, 1))")
         } catch {
             guard gen == loadGeneration else { return }
-            loadError = "Không tải được danh sách phim"
-            DiagLog.log("actor", "list failed plugin=\(pluginId) kind=\((error as NSError).domain)#\((error as NSError).code)")
+            // L-15: cancellation is not an error — an
+            // instance torn down mid-load must not flash
+            // the error state or mark the origin failed
+            // for a merge nobody is watching.
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                DiagLog.log("actor", "list cancelled plugin=\(pluginId)")
+                // Gate fix (C-M3, mirrored from iOS): a
+                // cancelled reload leaves the view UNLOADED
+                // — didLoad stays false. The fresh
+                // coordinator above was never begun, so
+                // claiming a completed load here would
+                // strand the page in the still-merging
+                // branch with no merge running and no retry
+                // path; with didLoad false the page keeps
+                // its pre-load surface and re-entering
+                // re-runs the load. (Beginning the
+                // coordinator as origin-failed instead would
+                // contradict the L-15 rule above: a
+                // cancelled load is not an origin failure.)
+                isLoading = false
+                return
+            } else {
+                loadError = "Không tải được danh sách phim"
+                DiagLog.log("actor", "list failed plugin=\(pluginId) kind=\((error as NSError).domain)#\((error as NSError).code)")
+                // §13.1f: the targets still run over a failed
+                // origin — contributed rows win over the error
+                // surface.
+                coordinator.begin(originFirstPage: nil, originFailed: true)
+            }
         }
         if gen == loadGeneration {
             isLoading = false
@@ -552,31 +825,23 @@ struct TVActorView: View {
         }
     }
 
+    /// §13.5 lockstep pagination, owned by the coordinator
+    /// (every source's cursor, canonical block order, the
+    /// same dedupe). The shell no longer logs `list.more` —
+    /// §13.9 assigns the cycle to the coordinator's
+    /// `merge more` line.
     private func loadMore() async {
-        guard didLoad, !isLoading, !isLoadingMore, page >= 1, page < totalPages else { return }
-        let gen = loadGeneration
+        guard didLoad, !isLoading, !isLoadingMore,
+              let coordinator = mergeCoordinator else { return }
         isLoadingMore = true
-        do {
-            let result = try await service.list(pluginId: pluginId, slug: route,
-                                                filters: ListFilters(), page: page + 1)
-            guard gen == loadGeneration else { isLoadingMore = false; return }
-            let known = Set(items.map(\.id))
-            items.append(contentsOf: result.items.filter { !known.contains($0.id) })
-            page = result.pagination.currentPage
-            totalPages = max(result.pagination.totalPages, 1)
-            DiagLog.log("actor", "list.more plugin=\(pluginId) count=\(items.count) page=\(page)")
-        } catch {
-            // Non-fatal (the tree's discipline): keep what is
-            // on screen.
-            DiagLog.log("actor", "list.more failed plugin=\(pluginId) kind=\((error as NSError).domain)#\((error as NSError).code)")
-        }
+        await coordinator.loadMore()
         isLoadingMore = false
     }
 
     // MARK: Focus-dwell preview
 
     private var dwellTaskKey: String {
-        "\(focusedMovie?.id ?? "-")#\(previewEpoch)#\(previewEnabled)"
+        "\(focusedRow?.id ?? "-")#\(previewEpoch)#\(previewEnabled)"
     }
 
     /// One attempt per dwell: sleep 1.5 s (SwiftUI cancels
@@ -586,12 +851,12 @@ struct TVActorView: View {
     /// latch is re-checked at the publish point, not only at
     /// arming).
     private func runDwell() async {
-        guard let movie = focusedMovie, previewEnabled, !previewLatched else { return }
+        guard let row = focusedRow, previewEnabled, !previewLatched else { return }
         try? await Task.sleep(nanoseconds: 1_500_000_000)
         guard !Task.isCancelled else { return }
         previewGeneration += 1
         let generation = previewGeneration
-        let stream = await resolveActorPreview(movie: movie)
+        let stream = await resolveActorPreview(row: row)
         guard !Task.isCancelled, generation == previewGeneration, !previewLatched else { return }
         if let stream {
             previewNoTrailer = false
@@ -599,7 +864,7 @@ struct TVActorView: View {
         } else {
             previewStream = nil
             previewNoTrailer = true
-            DiagLog.log("actor", "preview outcome=no-trailer plugin=\(pluginId) movie=\(movie.id)")
+            DiagLog.log("actor", "preview outcome=no-trailer plugin=\(row.pluginId) movie=\(row.movie.id)")
         }
     }
 
@@ -609,26 +874,29 @@ struct TVActorView: View {
     /// convict a KNOWN-low source; the host's measured gate
     /// decides the rest), otherwise the focused film's detail
     /// through the shared probe, exactly as Detail runs it.
-    private func resolveActorPreview(movie: Movie) async -> StreamInfo? {
+    /// §13.6/§13.8: every rung runs with the ROW's plugin —
+    /// a contributed film previews through its own source.
+    private func resolveActorPreview(row: ActorFilmRow) async -> StreamInfo? {
+        let movie = row.movie
         if !movie.previewUrl.isEmpty, MediaURL.isDirectMedia(movie.previewUrl) {
             let declaredRank = max(TVPreviewProbe.declaredQualityRank(movie.quality),
                                    TVPreviewProbe.declaredQualityRank(movie.episode_current))
             if declaredRank == 1 {
-                DiagLog.log("actor", "preview outcome=low-quality-declared plugin=\(pluginId) movie=\(movie.id)")
+                DiagLog.log("actor", "preview outcome=low-quality-declared plugin=\(row.pluginId) movie=\(movie.id)")
                 return nil
             }
             DiagLog.log("actor", "preview rung=preview-url host=\(URL(string: movie.previewUrl)?.host ?? "?")")
             return StreamInfo(url: movie.previewUrl, headers: [:])
         }
-        guard let bundle = try? await service.detail(pluginId: pluginId, movieId: movie.id) else {
-            DiagLog.log("actor", "preview outcome=detail-failed plugin=\(pluginId) movie=\(movie.id)")
+        guard let bundle = try? await service.detail(pluginId: row.pluginId, movieId: movie.id) else {
+            DiagLog.log("actor", "preview outcome=detail-failed plugin=\(row.pluginId) movie=\(movie.id)")
             return nil
         }
         var snap = bundle.detail.asMovie
         snap.id = movie.id
         return await TVPreviewProbe.resolve(
-            service: service, pluginId: pluginId,
-            pluginName: plugins.installedPlugin(id: pluginId)?.manifest.name ?? "",
+            service: service, pluginId: row.pluginId,
+            pluginName: plugins.installedPlugin(id: row.pluginId)?.manifest.name ?? "",
             isManga: false, detail: bundle.detail,
             detailStream: bundle.detailStream, movie: snap)
     }

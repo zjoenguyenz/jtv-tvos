@@ -76,10 +76,22 @@ import SwiftUI
 
 enum TVNetProbe {
 
+    enum TargetKind {
+        /// The existing three-leg measurement.
+        case host
+        /// §6.2: DNS legs + a body-keeping root GET, classified.
+        case mirrorState
+        /// §6.3: the JavGuru chain walk (own section below).
+        case chainWalk
+    }
+
     struct Target {
         let host: String
         /// ASCII role token for the log line.
         let role: String
+        /// Path used by the HTTPS leg (default root).
+        var path: String = "/"
+        var kind: TargetKind = .host
     }
 
     static let targets: [Target] = [
@@ -87,10 +99,24 @@ enum TVNetProbe {
         Target(host: "sadie-shop.site", role: "123av-embed"),
         Target(host: "www.njav.com", role: "njav-main"),
         Target(host: "upload18.org", role: "njav-player"),
-        Target(host: "njav.tv", role: "mirror-123av-njavtv"),
-        Target(host: "123av.me", role: "mirror-123av-me"),
+        Target(host: "njav.tv", role: "mirror-123av-njavtv", kind: .mirrorState),
+        Target(host: "123av.me", role: "mirror-123av-me", kind: .mirrorState),
         Target(host: "missav.ws", role: "control-missav"),
         Target(host: "raw.githubusercontent.com", role: "control-github"),
+        // §6.1 new host targets (1.3.6).
+        Target(host: "jav.guru", role: "javguru-main"),
+        Target(host: "javclan.com", role: "javguru-embed"),
+        Target(host: "guest.freeanimehentai.net", role: "hanime-api",
+               path: "/api/v11/search_hvs"),
+        Target(host: "hanime-cdn.com", role: "hanime-cdn"),
+        Target(host: "www.javmost.ws", role: "javmost-main"),
+        Target(host: "jav.spa", role: "javspa-main"),
+        Target(host: "upload18.to", role: "njav-player-to"),
+        Target(host: "static.javcdn.vip", role: "njav-posters"),
+        // §6.2: 24av.net joins the mirror-state set.
+        Target(host: "24av.net", role: "mirror-123av-24av", kind: .mirrorState),
+        // §6.3: the JavGuru chain walk (host jav.guru).
+        Target(host: "jav.guru", role: "javguru-chain", kind: .chainWalk),
     ]
 
     private static let sysBudget: TimeInterval = 6
@@ -111,6 +137,9 @@ enum TVNetProbe {
     /// was cancelled mid-host (the caller stops the run).
     static func measure(_ target: Target,
                         dohSession: URLSession) async -> HostResult? {
+        if target.kind == .chainWalk {
+            return await runChainWalk()
+        }
         let host = target.host
         DiagLog.log("netprobe", "host=\(host) role=\(target.role) begin")
 
@@ -146,8 +175,48 @@ enum TVNetProbe {
             dnsNote = "dns-both-empty"
         }
 
+        // Leg 3 (mirror-state targets, §6.2): the root GET
+        // KEEPS its body up to 48 KB for classification.
+        if target.kind == .mirrorState {
+            let fetched = await httpsGetBody(host: host, path: target.path,
+                                             maxBytes: 48 * 1024, budget: 10)
+            if Task.isCancelled { return nil }
+            let state: String
+            let bytes: Int
+            let status: Int
+            var mirrorAnswered = false
+            switch fetched {
+            case .responded(let fetchedStatus, let body, _):
+                mirrorAnswered = true
+                status = fetchedStatus
+                bytes = body.count
+                state = classifyMirror(body: body)
+            case .failed, .deadline:
+                status = 0
+                bytes = 0
+                state = "unknown"
+            }
+            DiagLog.log("netprobe", "host=\(host) mirror-state=\(state) bytes=\(bytes) status=\(status)")
+            let stateText: String
+            switch state {
+            case "moved": stateText = "đã chuyển nhà (moved)"
+            case "content": stateText = "CÓ NỘI DUNG"
+            case "shell": stateText = "vỏ SPA"
+            default: stateText = "chưa rõ"
+            }
+            var mirrorLine = "\(host) — gương 123av: \(stateText)"
+            switch dnsNote {
+            case "dns-system-fail": mirrorLine += " · DNS hệ thống không phân giải được"
+            case "dns-diverge": mirrorLine += " · DNS lệch với DNS công cộng"
+            case "dns-both-empty": mirrorLine += " · cả hai DNS đều trống"
+            default: break
+            }
+            DiagLog.log("netprobe", "host=\(host) verdict=mirror-\(state)\(dnsNote.isEmpty ? "" : " " + dnsNote)")
+            return HostResult(answered: mirrorAnswered, displayLine: mirrorLine)
+        }
+
         // Leg 3 — a real HTTPS GET.
-        let outcome = await httpsGet(host: host)
+        let outcome = await httpsGet(host: host, path: target.path)
         if Task.isCancelled { return nil }
         let verdict: String
         let display: String
@@ -399,8 +468,8 @@ enum TVNetProbe {
     /// Times one HTTPS GET of the host's root on an ephemeral
     /// session, TVSourceProbe's construction: the transfer is
     /// cancelled at the first body byte and nothing is kept.
-    private static func httpsGet(host: String) async -> GetOutcome {
-        guard let url = URL(string: "https://\(host)/") else {
+    private static func httpsGet(host: String, path: String = "/") async -> GetOutcome {
+        guard let url = URL(string: "https://\(host)\(path)") else {
             return .failed(domain: "probe", code: 0, ms: 0)
         }
         var request = URLRequest(url: url)
@@ -521,6 +590,459 @@ enum TVNetProbe {
     }
 }
 
+    // MARK: - Body-keeping GET (§6.2 mirror-state + §6.3 chain steps)
+
+    private enum BodyOutcome {
+        case responded(status: Int, body: Data, ms: Int)
+        case failed(domain: String, code: Int, ms: Int)
+        case deadline(ms: Int)
+    }
+
+    /// §6.2 classification (case-insensitive body scan).
+    static func classifyMirror(body: Data) -> String {
+        let text = String(decoding: body, as: UTF8.self).lowercased()
+        if text.contains("we have moved") { return "moved" }
+        if text.contains("class=\"card\"") || mirrorVideoHref(text) {
+            return "content"
+        }
+        if body.count < 8 * 1024,
+           text.contains("id=\"app\"") || text.contains("id=\"root\"")
+            || text.contains("__nuxt") || text.contains("type=\"module\"") {
+            return "shell"
+        }
+        return "unknown"
+    }
+
+    /// A `/v/<code>` href marker (§6.2 content test).
+    private static func mirrorVideoHref(_ text: String) -> Bool {
+        var searchStart = text.startIndex
+        while let hit = text.range(of: "/v/", range: searchStart..<text.endIndex) {
+            let after = text[hit.upperBound...]
+            if let first = after.first, first.isLetter || first.isNumber {
+                return true
+            }
+            searchStart = hit.upperBound
+        }
+        return false
+    }
+
+    /// One HTTPS GET on an ephemeral session that KEEPS the
+    /// body up to `maxBytes` (then cancels), under `budget`
+    /// seconds. Redirects follow the session default. Used by
+    /// the mirror-state leg and every chain-walk step.
+    private static func httpsGetBody(host: String, path: String,
+                                     maxBytes: Int, budget: TimeInterval) async -> BodyOutcome {
+        guard let url = URL(string: "https://\(host)\(path)") else {
+            return .failed(domain: "probe", code: 0, ms: 0)
+        }
+        return await httpsGetBody(url: url, maxBytes: maxBytes, budget: budget)
+    }
+
+    private static func httpsGetBody(url: URL, maxBytes: Int,
+                                     budget: TimeInterval) async -> BodyOutcome {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = budget
+        let delegate = BodyProbeDelegate(limit: maxBytes)
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = budget
+        configuration.timeoutIntervalForResource = budget
+        let session = URLSession(configuration: configuration,
+                                 delegate: delegate, delegateQueue: queue)
+        let outcome = await withCheckedContinuation { continuation in
+            delegate.arm(continuation: continuation)
+            let task = session.dataTask(with: request)
+            delegate.attach(task: task, queue: queue)
+            task.resume()
+            Task {
+                try? await Task.sleep(for: .seconds(budget))
+                delegate.expire()
+            }
+        }
+        session.invalidateAndCancel()
+        return outcome
+    }
+
+    /// Resume-once body-accumulating delegate — the
+    /// GetProbeDelegate discipline (serial delegate queue /
+    /// arm-attach happens-before / expire hops onto the queue).
+    private final class BodyProbeDelegate: NSObject, URLSessionDataDelegate,
+        @unchecked Sendable {
+        private var continuation: CheckedContinuation<BodyOutcome, Never>?
+        private var task: URLSessionDataTask?
+        private var started: Date?
+        private var lastStatus: Int?
+        private var body = Data()
+        private let limit: Int
+        private var finished = false
+        private var callbackQueue: OperationQueue?
+
+        init(limit: Int) { self.limit = limit }
+
+        func arm(continuation: CheckedContinuation<BodyOutcome, Never>) {
+            self.continuation = continuation
+            self.started = Date()
+        }
+
+        func attach(task: URLSessionDataTask, queue: OperationQueue) {
+            self.task = task
+            self.callbackQueue = queue
+        }
+
+        func expire() {
+            guard let queue = callbackQueue else { return }
+            queue.addOperation { [weak self] in
+                self?.finish(.deadline(ms: self?.elapsedMs() ?? 0))
+            }
+        }
+
+        private func elapsedMs() -> Int {
+            guard let started else { return 0 }
+            return Int(Date().timeIntervalSince(started) * 1000)
+        }
+
+        private func finish(_ outcome: BodyOutcome) {
+            guard !finished else { return }
+            finished = true
+            task?.cancel()
+            continuation?.resume(returning: outcome)
+            continuation = nil
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                        didReceive response: URLResponse,
+                        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+            if let http = response as? HTTPURLResponse {
+                lastStatus = http.statusCode
+            }
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                        didReceive data: Data) {
+            body.append(data)
+            if body.count >= limit {
+                body = Data(body.prefix(limit))
+                if let status = lastStatus {
+                    finish(.responded(status: status, body: body, ms: elapsedMs()))
+                } else {
+                    finish(.failed(domain: "non-http", code: 0, ms: elapsedMs()))
+                }
+            }
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        didCompleteWithError error: Error?) {
+            if let error {
+                let nsError = error as NSError
+                finish(.failed(domain: nsError.domain, code: nsError.code,
+                               ms: elapsedMs()))
+            } else if let status = lastStatus {
+                finish(.responded(status: status, body: body, ms: elapsedMs()))
+            } else {
+                finish(.deadline(ms: elapsedMs()))
+            }
+        }
+    }
+
+    // MARK: - §6.3 JavGuru chain walk
+
+    /// One manual redirect hop's answer: the status and the
+    /// raw Location header, if any (redirects NOT followed).
+    private struct HopAnswer {
+        let status: Int
+        let location: String?
+        let ms: Int
+    }
+
+    /// GETs `url` WITHOUT following redirects (own ephemeral
+    /// session, own no-follow delegate). nil on transport
+    /// failure / deadline.
+    private static func httpsHop(url: URL, budget: TimeInterval) async -> HopAnswer? {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = budget
+        let delegate = HopProbeDelegate()
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = budget
+        configuration.timeoutIntervalForResource = budget
+        let session = URLSession(configuration: configuration,
+                                 delegate: delegate, delegateQueue: queue)
+        let answer = await withCheckedContinuation { continuation in
+            delegate.arm(continuation: continuation)
+            let task = session.dataTask(with: request)
+            delegate.attach(task: task, queue: queue)
+            task.resume()
+            Task {
+                try? await Task.sleep(for: .seconds(budget))
+                delegate.expire()
+            }
+        }
+        session.invalidateAndCancel()
+        return answer
+    }
+
+    /// Resume-once no-follow delegate: finishes at the
+    /// response headers (status + Location) and cancels.
+    private final class HopProbeDelegate: NSObject, URLSessionDataDelegate,
+        @unchecked Sendable {
+        private var continuation: CheckedContinuation<HopAnswer?, Never>?
+        private var task: URLSessionDataTask?
+        private var started: Date?
+        private var finished = false
+        private var callbackQueue: OperationQueue?
+
+        func arm(continuation: CheckedContinuation<HopAnswer?, Never>) {
+            self.continuation = continuation
+            self.started = Date()
+        }
+
+        func attach(task: URLSessionDataTask, queue: OperationQueue) {
+            self.task = task
+            self.callbackQueue = queue
+        }
+
+        func expire() {
+            guard let queue = callbackQueue else { return }
+            queue.addOperation { [weak self] in
+                self?.finish(nil)
+            }
+        }
+
+        private func elapsedMs() -> Int {
+            guard let started else { return 0 }
+            return Int(Date().timeIntervalSince(started) * 1000)
+        }
+
+        private func finish(_ answer: HopAnswer?) {
+            guard !finished else { return }
+            finished = true
+            task?.cancel()
+            continuation?.resume(returning: answer)
+            continuation = nil
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                        didReceive response: URLResponse,
+                        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+            if let http = response as? HTTPURLResponse {
+                let location = http.value(forHTTPHeaderField: "Location")
+                finish(HopAnswer(status: http.statusCode, location: location,
+                                 ms: elapsedMs()))
+            } else {
+                finish(nil)
+            }
+            completionHandler(.cancel)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        didCompleteWithError error: Error?) {
+            finish(nil)
+        }
+    }
+
+    /// All `href="…"` values in a page, in document order.
+    private static func hrefs(in text: String) -> [String] {
+        var values: [String] = []
+        var cursor = text.startIndex
+        while let hit = text.range(of: "href=\"", range: cursor..<text.endIndex) {
+            let start = hit.upperBound
+            guard let close = text.range(of: "\"", range: start..<text.endIndex) else { break }
+            values.append(String(text[start..<close.lowerBound]))
+            cursor = close.upperBound
+        }
+        return values
+    }
+
+    /// String values assigned to `key` in an inline config
+    /// (the TVPlayerSession embedConfigValues scan shape).
+    private static func configValues(in text: String, key: String) -> [(range: Range<String.Index>, value: String)] {
+        var results: [(range: Range<String.Index>, value: String)] = []
+        var cursor = text.startIndex
+        while let hit = text.range(of: key, range: cursor..<text.endIndex) {
+            cursor = hit.upperBound
+            var i = hit.upperBound
+            while i < text.endIndex, text[i] == "\"" || text[i] == " " || text[i] == "\t" {
+                i = text.index(after: i)
+            }
+            guard i < text.endIndex, text[i] == ":" else { continue }
+            i = text.index(after: i)
+            while i < text.endIndex, text[i] == " " || text[i] == "\t" || text[i] == "\n" || text[i] == "\r" {
+                i = text.index(after: i)
+            }
+            guard i < text.endIndex, text[i] == "\"" else { continue }
+            let start = text.index(after: i)
+            guard let close = text.range(of: "\"", range: start..<text.endIndex) else { break }
+            let raw = String(text[start..<close.lowerBound])
+            results.append((hit, raw.replacingOccurrences(of: "\\/", with: "/")))
+            cursor = close.upperBound
+        }
+        return results
+    }
+
+    private static func chainFail(step: Int, reason: String) -> HostResult {
+        DiagLog.log("netprobe", "chain outcome=failed step=\(step) reason=\(reason)")
+        return HostResult(answered: false,
+                          displayLine: "jav.guru — chuỗi JavGuru: dừng ở bước \(step) (\(reason))")
+    }
+
+    /// The §6.3 walk: front → detail → gateway → manual
+    /// redirect walk → first byte of the landing URL. Budget
+    /// 45 s total, 10 s per step; string-level only.
+    static func runChainWalk() async -> HostResult? {
+        let walkStart = Date()
+        func overBudget() -> Bool {
+            Date().timeIntervalSince(walkStart) > 45 || Task.isCancelled
+        }
+        // Step 1 — the front page → first detail-page link.
+        let frontStart = Date()
+        guard case .responded(let frontStatus, let frontBody, _) =
+                await httpsGetBody(host: "jav.guru", path: "/", maxBytes: 256 * 1024, budget: 10)
+        else { return chainFail(step: 1, reason: "fetch") }
+        if overBudget() { return nil }
+        DiagLog.log("netprobe", "chain step=front status=\(frontStatus) ms=\(Int(Date().timeIntervalSince(frontStart) * 1000))")
+        let frontText = String(decoding: frontBody, as: UTF8.self)
+        let detailPath = hrefs(in: frontText).first { href in
+            guard let url = URL(string: href, relativeTo: URL(string: "https://jav.guru/")),
+                  url.host == "jav.guru" else { return false }
+            let path = url.path
+            guard path.count > 1, !path.contains("wp-"),
+                  !path.hasPrefix("/category"), !path.hasPrefix("/tag"),
+                  !path.hasPrefix("/page"), !path.hasPrefix("/actor"),
+                  !path.hasPrefix("/studio") else { return false }
+            let last = url.lastPathComponent
+            return last.contains("-") && last.contains { $0.isNumber }
+        }
+        guard let detailPath, let detailURL = URL(string: detailPath, relativeTo: URL(string: "https://jav.guru/"))?.absoluteURL
+        else { return chainFail(step: 1, reason: "no-detail-link") }
+        // Step 2 — the detail page → a server config's gateway.
+        guard case .responded(let detailStatus, let detailBody, _) =
+                await httpsGetBody(url: detailURL, maxBytes: 384 * 1024, budget: 10)
+        else { return chainFail(step: 2, reason: "fetch") }
+        if overBudget() { return nil }
+        let detailText = String(decoding: detailBody, as: UTF8.self)
+        let configs = configValues(in: detailText, key: "iframe_url")
+        guard !configs.isEmpty else { return chainFail(step: 2, reason: "no-server-config") }
+        // Prefer the SB server config (its label sits in the
+        // markup just before its config); else the first.
+        var chosen = configs[0]
+        var serverLabel = "first"
+        for config in configs {
+            let windowStart = detailText.index(config.range.lowerBound, offsetBy: -300, limitedBy: detailText.startIndex) ?? detailText.startIndex
+            let context = detailText[windowStart..<config.range.lowerBound]
+            if context.contains("\"SB\"") || context.contains(">SB<") || context.contains("STREAM SB") {
+                chosen = config
+                serverLabel = "SB"
+                break
+            }
+        }
+        let cleaned = chosen.value.filter { !$0.isWhitespace }
+        guard let decodedData = Data(base64Encoded: cleaned),
+              let gatewayText = String(data: decodedData, encoding: .utf8),
+              let gatewayURL = URL(string: gatewayText)
+        else { return chainFail(step: 2, reason: "bad-gateway") }
+        DiagLog.log("netprobe", "chain step=detail status=\(detailStatus) server=\(serverLabel) gateway-host=\(gatewayURL.host ?? "jav.guru")")
+        // Step 3 — the gateway page → reversed-token embed URL
+        // (RESEARCH-SOURCE-HEALTH's construction: the token
+        // hides in data-* fragments; window.cfg carries base
+        // + rtype; embed = searcho/?<rtype>r=<token reversed>).
+        guard case .responded(let gatewayStatus, let gatewayBody, _) =
+                await httpsGetBody(url: gatewayURL, maxBytes: 64 * 1024, budget: 10)
+        else { return chainFail(step: 3, reason: "fetch") }
+        if overBudget() { return nil }
+        let gatewayPage = String(decoding: gatewayBody, as: UTF8.self)
+        guard let embedURL = buildEmbedURL(from: gatewayPage, gateway: gatewayURL)
+        else { return chainFail(step: 3, reason: "no-token") }
+        DiagLog.log("netprobe", "chain step=gateway status=\(gatewayStatus)")
+        // Step 4 — manual redirect walk (max 5 hops), then a
+        // first-byte GET of the final URL.
+        var current = embedURL
+        var hops = 0
+        var finalAnswer: HopAnswer?
+        while hops < 5 {
+            if overBudget() { return nil }
+            guard let answer = await httpsHop(url: current, budget: 10) else {
+                return chainFail(step: 4, reason: "hop-fetch")
+            }
+            finalAnswer = answer
+            guard let location = answer.location,
+                  (300...399).contains(answer.status),
+                  let next = URL(string: location, relativeTo: current)?.absoluteURL
+            else { break }
+            current = next
+            hops += 1
+        }
+        guard let finalAnswer else { return chainFail(step: 4, reason: "hop-fetch") }
+        let streamStart = Date()
+        let firstByte: GetOutcome
+        if let host = current.host {
+            var path = current.path
+            if let query = current.query, !query.isEmpty { path += "?\(query)" }
+            if path.isEmpty { path = "/" }
+            firstByte = await httpsGet(host: host, path: path)
+        } else {
+            firstByte = .failed(domain: "probe", code: 0, ms: 0)
+        }
+        if overBudget() { return nil }
+        let streamMs = Int(Date().timeIntervalSince(streamStart) * 1000)
+        switch firstByte {
+        case .responded(let status, _):
+            DiagLog.log("netprobe", "chain step=streamhost host=\(current.host ?? "?") status=\(status) ms=\(streamMs)")
+            DiagLog.log("netprobe", "chain outcome=done host=\(current.host ?? "?") status=\(status)")
+            return HostResult(answered: true,
+                              displayLine: "jav.guru — chuỗi JavGuru: tới \(current.host ?? "?") · HTTP \(status)")
+        case .failed(let domain, let code, _):
+            DiagLog.log("netprobe", "chain step=streamhost host=\(current.host ?? "?") status=0 ms=\(streamMs)")
+            return chainFail(step: 4, reason: "stream-\(domain)#\(code)")
+        case .deadline:
+            return chainFail(step: 4, reason: "stream-deadline")
+        }
+    }
+
+    /// Builds the reversed-token embed URL from the gateway
+    /// page: window.cfg's `rtype` + the data-* token fragments
+    /// concatenated in document order, reversed.
+    private static func buildEmbedURL(from page: String, gateway: URL) -> URL? {
+        guard let rtype = configValues(in: page, key: "rtype").first?.value,
+              !rtype.isEmpty else { return nil }
+        var fragments: [String] = []
+        var cursor = page.startIndex
+        while let hit = page.range(of: "data-", range: cursor..<page.endIndex) {
+            var i = hit.upperBound
+            while i < page.endIndex, page[i] != "=", page[i] != "\"", page[i] != " " {
+                i = page.index(after: i)
+            }
+            guard i < page.endIndex, page[i] == "=" else { cursor = hit.upperBound; continue }
+            i = page.index(after: i)
+            guard i < page.endIndex, page[i] == "\"" else { cursor = hit.upperBound; continue }
+            let start = page.index(after: i)
+            guard let close = page.range(of: "\"", range: start..<page.endIndex) else { break }
+            let value = String(page[start..<close.lowerBound])
+            if value.count >= 4, value.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }) {
+                fragments.append(value)
+            }
+            cursor = close.upperBound
+        }
+        let token = fragments.joined()
+        guard token.count >= 8 else { return nil }
+        let reversed = String(token.reversed())
+        var components = URLComponents()
+        components.scheme = gateway.scheme ?? "https"
+        components.host = gateway.host ?? "jav.guru"
+        components.path = "/searcho/"
+        components.query = "\(rtype)r=\(reversed)"
+        return components.url
+    }
+
 // MARK: - Run model
 
 /// Owns ONE probe run for the screen's lifetime: serial over
@@ -620,14 +1142,16 @@ struct TVNetProbeView: View {
                     }
                 }
 
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(Array(model.lines.enumerated()), id: \.offset) { _, line in
-                        Text(line)
-                            .font(.system(size: 27))
-                            .foregroundStyle(.white)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(Array(model.lines.enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(.system(size: 27))
+                                .foregroundStyle(.white)
+                        }
                     }
+                    .frame(maxWidth: 1250, alignment: .leading)
                 }
-                .frame(maxWidth: 1250, alignment: .leading)
 
                 Button {
                     model.cancel()

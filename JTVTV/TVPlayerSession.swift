@@ -98,6 +98,14 @@ enum TVPlayerPanel: Equatable {
     case mangaChapterEnd
 }
 
+/// §4.2 step 4 signal: the measurement pass's started
+/// candidate failed its pre-flight with a refusal — caught
+/// by beginAttempt's resolve task, which re-routes the SAME
+/// attempt into resolveWithFallback.
+struct TVPreflightRefusal: Error {
+    let status: Int
+}
+
 // MARK: - Session
 
 @MainActor
@@ -114,6 +122,44 @@ final class TVPlayerSession: ObservableObject {
     /// its episode in place (the iOS C-3 shape: only `episode`
     /// changes; movie/plugin/server context ride unchanged).
     @Published private(set) var currentRequest: PlaybackRequest
+
+    // MARK: Source rescue (spec §4.1, 1.3.6)
+
+    /// The init request, immutable: the title's IDENTITY
+    /// (movie / pluginId / pluginName) for the title line on
+    /// every surface and for ALL history writes/lookups.
+    let originRequest: PlaybackRequest
+    /// The PLAYING context's plugin (initialised from the
+    /// origin request; updated ONLY by a fallback serve).
+    @Published private(set) var playingPluginId: String
+    @Published private(set) var playingPluginName: String
+    /// True when the CURRENT play was served by a fallback
+    /// hop (§2.6 history rule). Attempt-scoped (gate fix
+    /// F-A1): reset at the head of every beginAttempt, set
+    /// only by that attempt's applyFallbackOutcome — history
+    /// writing consults only the current play's flag.
+    private var servedByFallback = false
+
+    /// Torrent wait state (§5.3): the providers currently in
+    /// Phase 2 (display names) and when Phase 2 began.
+    struct DebridWaitState: Equatable {
+        var providerNames: [String]
+        var since: Date
+    }
+    @Published private(set) var debridWait: DebridWaitState?
+    /// Background measurement task (§4.2 step 3), session-owned.
+    private var backgroundMeasureTask: Task<Void, Never>?
+
+    /// Maps a DebridResolver provider log token to its
+    /// display name via the shell's own Provider table (§5.3).
+    static func debridDisplayName(forToken token: String) -> String {
+        switch token {
+        case "torbox": return DebridResolver.Provider.torbox.displayName
+        case "rd": return DebridResolver.Provider.realDebrid.displayName
+        case "premiumize": return DebridResolver.Provider.premiumize.displayName
+        default: return token
+        }
+    }
 
     // MARK: Provider switch (L-T13, 1.3.1)
 
@@ -288,6 +334,9 @@ final class TVPlayerSession: ObservableObject {
         // construction (the shared segment's first hand-off).
         DiagLog.log("player", "session.init.begin plugin=\(request.pluginId)")
         self.currentRequest = request
+        self.originRequest = request
+        self.playingPluginId = request.pluginId
+        self.playingPluginName = request.pluginName
         self.service = service
         self.history = history
         self.pinSession = pinSession
@@ -404,6 +453,9 @@ final class TVPlayerSession: ObservableObject {
         streamxxLaneTask = nil
         providerProbeTask?.cancel()
         providerProbeTask = nil
+        backgroundMeasureTask?.cancel()
+        backgroundMeasureTask = nil
+        debridWait = nil
         positionProvider = nil
         subtitleApplier = nil
     }
@@ -451,9 +503,24 @@ final class TVPlayerSession: ObservableObject {
         resolveTimeoutTask = nil
         streamxxLaneTask?.cancel()
         streamxxLaneTask = nil
+        backgroundMeasureTask?.cancel()
+        backgroundMeasureTask = nil
+        debridWait = nil
+        // §2.6 (gate fix F-A1): the fallback-serve flag is
+        // PER-PLAY — every new resolve cycle (initial play,
+        // retry, manual switch, non-fallback attempt) starts
+        // unserved; only THIS attempt's applyFallbackOutcome
+        // may set it.
+        servedByFallback = false
 
         DiagLog.log("player", "resolve.begin attempt=\(attempt)")
         let request = currentRequest
+        // §4.1 playing request: the current context with the
+        // PLAYING plugin applied (identity on currentRequest
+        // itself is never rewritten). A no-op until a fallback
+        // serve moves the playing context.
+        var playingRequest = request
+        playingRequest.pluginId = playingPluginId
         // L-T13: a user-pinned provider steers a hash title's
         // resolve through DebridResolver.resolve(hash:provider:)
         // ONLY; every other attempt (including the unpinned
@@ -462,6 +529,19 @@ final class TVPlayerSession: ObservableObject {
         let pinned = forcedProvider
         let pinnedHash: String? = (pinned != nil && request.episode.id.hasPrefix("jtvhash:"))
             ? String(request.episode.id.dropFirst("jtvhash:".count)) : nil
+        // §5.3 shell side: PINNED attempts emit nothing from
+        // the resolver, so the session synthesises the wait
+        // state itself (pinned provider, since = attempt start).
+        if let pinned, pinnedHash != nil {
+            debridWait = DebridWaitState(providerNames: [pinned.displayName],
+                                         since: attemptStartDate ?? Date())
+        }
+        // §4.1 attempt routing (non-hash): a manual pick or a
+        // non-catalogue origin keeps the plain path; an armed
+        // measurement attempt runs §4.2; everything else runs
+        // the fallback chain.
+        let fallbackEligible = !manualSourceChosen
+            && FallbackCatalog.origins.contains(originRequest.pluginId)
         // L-T30 torrent extension (owner ruling 2026-11-22
         // 16:10 CST): an UNPINNED hash attempt is the silent
         // auto-pick — DebridResolver.resolve(hash:) probes the
@@ -487,6 +567,31 @@ final class TVPlayerSession: ObservableObject {
         autoMeasurePending = false
         resolveTask = Task { [weak self] in
             guard let self else { return }
+            // §5.3: the unpinned hash path forwards the phase
+            // handler into resolveEpisode; .downloading turns
+            // into debridWait (display-mapped; since = Phase-2
+            // entry, preserved across re-emissions — §1C).
+            let phaseHandler: @Sendable (DebridPhaseEvent) -> Void = { [weak self] event in
+                guard case .downloading(let tokens) = event else { return }
+                Task { @MainActor [weak self] in
+                    guard let self, self.attemptID == attempt, case .resolving = self.phase else { return }
+                    // §1C (gate fix F-A3): the elapsed clock
+                    // anchors at Phase-2 ENTRY — the first
+                    // .downloading of this attempt (debridWait
+                    // was reset at beginAttempt) — and NEVER
+                    // resets on a join/drop; a later event (the
+                    // race re-emitting the survivor set) updates
+                    // ONLY the provider names.
+                    let names = tokens.map { Self.debridDisplayName(forToken: $0) }
+                    if let existing = self.debridWait {
+                        self.debridWait = DebridWaitState(
+                            providerNames: names, since: existing.since)
+                    } else {
+                        self.debridWait = DebridWaitState(
+                            providerNames: names, since: Date())
+                    }
+                }
+            }
             do {
                 let resolution: PlaybackResolution
                 if let pinned, let pinnedHash {
@@ -498,11 +603,27 @@ final class TVPlayerSession: ObservableObject {
                     // Lens B F-B1): the session has moved on to
                     // a newer attempt, so this task ends
                     // silently — no publish, no failure slate.
-                    guard let measured = try await self.resolveWithMeasurement(attempt: attempt)
-                    else { return }
-                    resolution = measured
+                    do {
+                        guard let measured = try await self.resolveWithMeasurement(attempt: attempt)
+                        else { return }
+                        resolution = measured
+                    } catch let refusal as TVPreflightRefusal {
+                        // §4.2 step 4: the started candidate's
+                        // pre-flight refusal re-routes THIS
+                        // attempt into the fallback chain.
+                        DiagLog.log("player", "autosource.reroute attempt=\(attempt) reason=preflight-refused status=\(refusal.status)")
+                        let outcome = try await self.service.resolveWithFallback(playingRequest)
+                        self.applyFallbackOutcome(outcome)
+                        resolution = outcome.resolution
+                    }
+                } else if pinned == nil, isTorrentHashTitle {
+                    resolution = try await self.service.resolveEpisode(request, onDebridPhase: phaseHandler)
+                } else if fallbackEligible {
+                    let outcome = try await self.service.resolveWithFallback(playingRequest)
+                    self.applyFallbackOutcome(outcome)
+                    resolution = outcome.resolution
                 } else {
-                    resolution = try await self.service.resolveEpisode(request)
+                    resolution = try await self.service.resolveEpisode(playingRequest)
                 }
                 self.resolveSucceeded(attempt: attempt, resolution: resolution)
             } catch {
@@ -526,8 +647,13 @@ final class TVPlayerSession: ObservableObject {
         // loading state carries the source-switch list (C3), so
         // the exempt wait is never a trap.
         if request.pluginId != "torrenthub" {
+            // §2.5/§4.1: attempts that route through
+            // resolveWithFallback (including a measurement
+            // attempt that may re-route into it) get 120 s;
+            // every other attempt keeps 45 s.
+            let deadlineSeconds: Double = fallbackEligible ? 120 : 45
             resolveTimeoutTask = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(45))
+                try? await Task.sleep(for: .seconds(deadlineSeconds))
                 guard let self, !Task.isCancelled else { return }
                 guard self.attemptID == attempt, case .resolving = self.phase else { return }
                 DiagLog.log("player", "fail attempt=\(attempt) stage=resolve error=player#timeout")
@@ -559,20 +685,20 @@ final class TVPlayerSession: ObservableObject {
         return result
     }
 
-    /// Attempt 1's resolve for an auto-selection session:
-    /// measure the candidates SERIALLY (the plugin engine
-    /// serialises JS per plugin — a parallel race would time
-    /// the queue, not the sources), score each by resolve
-    /// time + first-byte time of its resolved URL, and return
-    /// the best candidate's resolution for the attempt to
-    /// play. The resolve machinery itself is only ever CALLED
-    /// (MovieService.resolveEpisode), never modified. A
-    /// candidate that errors, resolves to a non-video shape
-    /// (an embed cannot be probed and would slate anyway), or
-    /// falls outside the total budget is simply unmeasured —
-    /// and unmeasured sources are never auto-selected. If
-    /// every candidate fails, the started candidate's own
-    /// error is thrown, so the attempt lands on exactly the
+    /// Attempt 1's resolve for an auto-selection session.
+    /// §4.2 (1.3.6, P1) restructured it to play-first: the
+    /// STARTED candidate resolves first and plays at once
+    /// (pre-flighted first for preflightSet plugins); the
+    /// remaining candidates are measured in the BACKGROUND
+    /// (measureRemainingCandidates) and only write scores.
+    /// When the started candidate does not play, the
+    /// remaining candidates are measured in the foreground
+    /// and the best measured one plays; when none plays, a
+    /// started-candidate pre-flight refusal throws
+    /// TVPreflightRefusal (beginAttempt re-routes the same
+    /// attempt into resolveWithFallback) and any other
+    /// failure throws the started candidate's own error, so
+    /// the attempt lands on exactly the
     /// failure path a plain resolve would have produced.
     ///
     /// Gate fix (Round 1, Lens B F-B1): the pass QUIESCES
@@ -586,99 +712,294 @@ final class TVPlayerSession: ObservableObject {
     /// scores. The caller treats nil as "the session moved
     /// on" and ends the task silently.
     private func resolveWithMeasurement(attempt: Int) async throws -> PlaybackResolution? {
+        // §4.2 (1.3.6, P1): play-first, measure in background.
         let started = currentRequest
-        let candidates = [started.episode] + autoSourceCandidates()
-        let deadline = Date().addingTimeInterval(Self.autoMeasureTotalBudget)
-        var best: (episode: Episode, resolution: PlaybackResolution, score: Int)?
-        var startedError: Error?
-        // F-B1: superseded = this task was cancelled, a newer
-        // attempt owns the session, or the session stopped.
+        let passStart = Date()
+        let remaining = Array(autoSourceCandidates().prefix(Self.autoMeasureCandidateCap - 1))
         func superseded() -> Bool {
             Task.isCancelled || attempt != attemptID || isStopped
         }
-        for (index, episode) in candidates.prefix(Self.autoMeasureCandidateCap).enumerated() {
+        // Step 1: resolve the STARTED candidate first.
+        var startedError: Error?
+        var startedRefusalStatus: Int?
+        var startedResolution: PlaybackResolution?
+        var startedScore = 0
+        let startedHost = URL(string: started.episode.id)?.host ?? "?"
+        let t0 = Date()
+        do {
+            let resolution = try await service.resolveEpisode(started)
             if superseded() {
-                DiagLog.log("player", "autosource.measure stop=superseded measured=\(index)")
+                DiagLog.log("player", "autosource.measure stop=superseded stage=started")
                 return nil
             }
-            if index > 0, Date() >= deadline {
-                DiagLog.log("player", "autosource.measure stop=budget measured=\(index)")
+            let resolveMs = Int(Date().timeIntervalSince(t0) * 1000)
+            if case .video(let stream) = resolution {
+                if FallbackCatalog.preflightSet.contains(started.pluginId) {
+                    let walk = await shellPreflightWalk(pluginId: started.pluginId, stream: stream)
+                    if superseded() {
+                        DiagLog.log("player", "autosource.measure stop=superseded stage=started-preflight")
+                        return nil
+                    }
+                    switch walk.verdict {
+                    case .ok(_, let ttfb):
+                        startedScore = resolveMs + ttfb
+                        measuredSourceScores[started.episode.id] = startedScore
+                        startedResolution = .video(walk.stream)
+                    case .skipped:
+                        startedScore = resolveMs
+                        measuredSourceScores[started.episode.id] = startedScore
+                        startedResolution = .video(walk.stream)
+                    case .refused(let status):
+                        startedRefusalStatus = status
+                        DiagLog.log("player", "autosource.measure name=\(started.episode.name) host=\(startedHost) outcome=refused status=\(status)")
+                    case .notFound:
+                        DiagLog.log("player", "autosource.measure name=\(started.episode.name) host=\(startedHost) outcome=not-found")
+                    case .unreachable(let detail):
+                        DiagLog.log("player", "autosource.measure name=\(started.episode.name) host=\(startedHost) outcome=unreachable \(detail)")
+                    }
+                } else {
+                    var score = resolveMs
+                    if let streamURL = URL(string: stream.url),
+                       let ttfb = await TVSourceProbe.timeToFirstByte(
+                        url: streamURL, headers: stream.headers) {
+                        score += ttfb
+                    } else {
+                        score += Self.autoProbePenaltyMs
+                    }
+                    if superseded() {
+                        DiagLog.log("player", "autosource.measure stop=superseded stage=started-probe")
+                        return nil
+                    }
+                    startedScore = score
+                    measuredSourceScores[started.episode.id] = score
+                    startedResolution = resolution
+                }
+            } else {
+                DiagLog.log("player", "autosource.measure name=\(started.episode.name) host=\(startedHost) outcome=not-video")
+            }
+        } catch {
+            if superseded() {
+                DiagLog.log("player", "autosource.measure stop=superseded stage=started-error")
+                return nil
+            }
+            startedError = error
+            DiagLog.log("player", "autosource.measure name=\(started.episode.name) host=\(startedHost) outcome=error kind=\(Self.errorLabel(error))")
+        }
+        // Step 3: the started candidate plays NOW; the rest of
+        // the pass runs in the background and only writes scores.
+        if let startedResolution {
+            if !remaining.isEmpty {
+                let startedName = started.episode.name
+                let capturedStartedScore = startedScore
+                backgroundMeasureTask?.cancel()
+                backgroundMeasureTask = Task { [weak self] in
+                    guard let self else { return }
+                    let best = await self.measureRemainingCandidates(
+                        remaining, started: started, passStart: passStart, attempt: attempt)
+                    guard !Task.isCancelled, attempt == self.attemptID, !self.isStopped else { return }
+                    if let best {
+                        DiagLog.log("player", "autosource.measure.done best=\(best.episode.name) score=\(best.score) started=\(startedName) startedScore=\(capturedStartedScore)")
+                    } else {
+                        DiagLog.log("player", "autosource.measure.done best=none score=-1 started=\(startedName) startedScore=\(capturedStartedScore)")
+                    }
+                }
+            }
+            DiagLog.log("player", "autosource.pick name=\(started.episode.name) score=\(startedScore) kept=1")
+            return startedResolution
+        }
+        // Step 2 (foreground): the started candidate did not
+        // play — measure the remaining candidates.
+        let best = await measureRemainingCandidates(
+            remaining, started: started, passStart: passStart, attempt: attempt)
+        if superseded() {
+            DiagLog.log("player", "autosource.measure stop=superseded stage=publish")
+            return nil
+        }
+        if let best {
+            DiagLog.log("player", "autosource.pick name=\(best.episode.name) host=\(URL(string: best.episode.id)?.host ?? "?") score=\(best.score) from=\(started.episode.name)")
+            currentRequest.episode = best.episode
+            triedSourceIDs.insert(best.episode.id)
+            return best.resolution
+        }
+        // Step 4: no candidate playable.
+        if let startedRefusalStatus {
+            throw TVPreflightRefusal(status: startedRefusalStatus)
+        }
+        throw startedError ?? MovieServiceError.timedOut
+    }
+
+    /// §4.2 step 2: measure the remaining candidates (existing
+    /// scoring, 10 s total budget from pass start, supersede
+    /// checks between candidates). For preflightSet plugins
+    /// the pre-flight REPLACES the TTFB probe; other plugins
+    /// keep the existing penalty model untouched. Writes
+    /// measuredSourceScores only; never switches anything.
+    private func measureRemainingCandidates(
+        _ episodes: [Episode], started: PlaybackRequest, passStart: Date, attempt: Int
+    ) async -> (episode: Episode, resolution: PlaybackResolution, score: Int)? {
+        func superseded() -> Bool {
+            Task.isCancelled || attempt != attemptID || isStopped
+        }
+        let deadline = passStart.addingTimeInterval(Self.autoMeasureTotalBudget)
+        var best: (episode: Episode, resolution: PlaybackResolution, score: Int)?
+        for (index, episode) in episodes.enumerated() {
+            if superseded() {
+                DiagLog.log("player", "autosource.measure stop=superseded measured=\(index + 1)")
+                return best
+            }
+            if Date() >= deadline {
+                DiagLog.log("player", "autosource.measure stop=budget measured=\(index + 1)")
                 break
             }
             var req = started
             req.episode = episode
             if episode.id != started.episode.id {
-                // The fast-resume URL belongs to the started
-                // episode only — never offer it for another
-                // source's resolve.
                 req.knownStreamURL = ""
             }
             let host = URL(string: episode.id)?.host ?? "?"
             let t0 = Date()
             do {
                 let resolution = try await service.resolveEpisode(req)
-                // F-B1: the resolve could not be cancelled
-                // mid-flight (the plugin bridge has no cancel
-                // seam) — if the attempt died while it ran, its
-                // result is discarded here, unscored.
                 if superseded() {
-                    DiagLog.log("player", "autosource.measure stop=superseded measured=\(index)")
-                    return nil
+                    DiagLog.log("player", "autosource.measure stop=superseded measured=\(index + 1)")
+                    return best
                 }
                 let resolveMs = Int(Date().timeIntervalSince(t0) * 1000)
                 guard case .video(let stream) = resolution else {
                     DiagLog.log("player", "autosource.measure name=\(episode.name) host=\(host) outcome=not-video")
                     continue
                 }
-                var score = resolveMs
-                if let streamURL = URL(string: stream.url),
-                   let ttfb = await TVSourceProbe.timeToFirstByte(
-                    url: streamURL, headers: stream.headers) {
-                    score += ttfb
-                    DiagLog.log("player", "autosource.measure name=\(episode.name) host=\(host) resolve=\(resolveMs) ttfb=\(ttfb) score=\(score)")
+                var score: Int?
+                var scoredResolution = resolution
+                if FallbackCatalog.preflightSet.contains(started.pluginId) {
+                    let walk = await shellPreflightWalk(pluginId: started.pluginId, stream: stream)
+                    if superseded() {
+                        DiagLog.log("player", "autosource.measure stop=superseded measured=\(index + 1)")
+                        return best
+                    }
+                    switch walk.verdict {
+                    case .ok(_, let ttfb):
+                        let candidateScore = resolveMs + ttfb
+                        score = candidateScore
+                        scoredResolution = .video(walk.stream)
+                        DiagLog.log("player", "autosource.measure name=\(episode.name) host=\(host) resolve=\(resolveMs) ttfb=\(ttfb) score=\(candidateScore)")
+                    case .refused(let status):
+                        DiagLog.log("player", "autosource.measure name=\(episode.name) host=\(host) outcome=refused status=\(status)")
+                    case .notFound:
+                        DiagLog.log("player", "autosource.measure name=\(episode.name) host=\(host) outcome=not-found")
+                    case .unreachable(let detail):
+                        DiagLog.log("player", "autosource.measure name=\(episode.name) host=\(host) outcome=unreachable \(detail)")
+                    case .skipped:
+                        // §3.2/F-A6 (gate fix): scored EXACTLY
+                        // as the started candidate's skipped —
+                        // resolveMs with the walk's stream, and
+                        // NO TTFB probe (for preflightSet
+                        // plugins the pre-flight replaces the
+                        // probe, §4.2 step 2).
+                        score = resolveMs
+                        scoredResolution = .video(walk.stream)
+                    }
                 } else {
-                    score += Self.autoProbePenaltyMs
-                    DiagLog.log("player", "autosource.measure name=\(episode.name) host=\(host) resolve=\(resolveMs) ttfb=-1 score=\(score)")
+                    score = await probeScore(resolveMs: resolveMs, stream: stream, name: episode.name, host: host)
                 }
-                // F-B1: no score write from a superseded pass —
-                // the table belongs to the live session only.
+                guard let score else { continue }
                 if superseded() {
-                    DiagLog.log("player", "autosource.measure stop=superseded measured=\(index)")
-                    return nil
+                    DiagLog.log("player", "autosource.measure stop=superseded measured=\(index + 1)")
+                    return best
                 }
                 measuredSourceScores[episode.id] = score
                 if best == nil || score < best!.score {
-                    best = (episode, resolution, score)
+                    best = (episode, scoredResolution, score)
                 }
             } catch {
-                // F-B1: an error landing after supersede is
-                // not evidence about any live source — drop it.
                 if superseded() {
-                    DiagLog.log("player", "autosource.measure stop=superseded measured=\(index)")
-                    return nil
+                    DiagLog.log("player", "autosource.measure stop=superseded measured=\(index + 1)")
+                    return best
                 }
-                if episode.id == started.episode.id { startedError = error }
                 DiagLog.log("player", "autosource.measure name=\(episode.name) host=\(host) outcome=error kind=\(Self.errorLabel(error))")
             }
         }
-        guard let best else {
-            throw startedError ?? MovieServiceError.timedOut
-        }
-        // A superseded attempt publishes nothing and swaps
-        // nothing: nil, and the caller ends the task silently
-        // (resolveSucceeded's own guard is the second layer).
-        if superseded() {
-            DiagLog.log("player", "autosource.measure stop=superseded stage=publish")
-            return nil
-        }
-        if best.episode.id != started.episode.id {
-            DiagLog.log("player", "autosource.pick name=\(best.episode.name) host=\(URL(string: best.episode.id)?.host ?? "?") score=\(best.score) from=\(started.episode.name)")
-            currentRequest.episode = best.episode
-            triedSourceIDs.insert(best.episode.id)
+        return best
+    }
+
+    /// The existing TTFB-probe scoring (penalty model),
+    /// unchanged: probe success adds the first-byte time, a
+    /// refused probe adds the fixed penalty.
+    private func probeScore(resolveMs: Int, stream: StreamInfo, name: String, host: String) async -> Int {
+        var score = resolveMs
+        if let streamURL = URL(string: stream.url),
+           let ttfb = await TVSourceProbe.timeToFirstByte(
+            url: streamURL, headers: stream.headers) {
+            score += ttfb
+            DiagLog.log("player", "autosource.measure name=\(name) host=\(host) resolve=\(resolveMs) ttfb=\(ttfb) score=\(score)")
         } else {
-            DiagLog.log("player", "autosource.pick name=\(best.episode.name) score=\(best.score) kept=1")
+            score += Self.autoProbePenaltyMs
+            DiagLog.log("player", "autosource.measure name=\(name) host=\(host) resolve=\(resolveMs) ttfb=-1 score=\(score)")
         }
-        return best.resolution
+        return score
+    }
+
+    /// Shell-side replica of the core §3 pre-flight walk (the
+    /// core's own walk is private to MovieService): candidates
+    /// are the stream's URL plus its ranked alternates,
+    /// de-duplicated, in order; the first .ok wins and
+    /// substitutes the stream URL; a .skipped verdict fails
+    /// only its own candidate (the walk is .skipped — stream
+    /// untouched — only when EVERY candidate is skipped);
+    /// all failing returns the LAST decided candidate's
+    /// verdict. Built only on the core's public
+    /// StreamPreflight.check.
+    private func shellPreflightWalk(pluginId: String, stream: StreamInfo) async
+        -> (verdict: PreflightVerdict, stream: StreamInfo) {
+        if stream.requiresProxy || stream.isEmbed {
+            DiagLog.log("preflight", "plugin=\(pluginId) host=\(URL(string: stream.url)?.host ?? "?") outcome=skipped status=- ms=0")
+            return (.skipped, stream)
+        }
+        var candidates: [String] = []
+        var seen = Set<String>()
+        for candidate in [stream.url] + stream.alternateURLs {
+            if seen.insert(candidate).inserted { candidates.append(candidate) }
+        }
+        var lastVerdict: PreflightVerdict = .skipped
+        for (index, candidate) in candidates.enumerated() {
+            let checkStart = Date()
+            let verdict = await StreamPreflight.check(url: candidate, headers: stream.headers)
+            let ms = Int(Date().timeIntervalSince(checkStart) * 1000)
+            let outcomeLabel: String
+            let statusLabel: String
+            switch verdict {
+            case .ok(let status, _):
+                outcomeLabel = "ok"; statusLabel = "\(status)"
+            case .refused(let status):
+                outcomeLabel = "refused"; statusLabel = "\(status)"
+            case .notFound:
+                outcomeLabel = "not-found"; statusLabel = "-"
+            case .unreachable:
+                outcomeLabel = "unreachable"; statusLabel = "-"
+            case .skipped:
+                outcomeLabel = "skipped"; statusLabel = "-"
+            }
+            if pluginId == "missav", candidates.count > 1 {
+                DiagLog.log("preflight", "candidate=\(index + 1)/\(candidates.count) plugin=\(pluginId) host=\(URL(string: candidate)?.host ?? "?") outcome=\(outcomeLabel) status=\(statusLabel) ms=\(ms)")
+            } else {
+                DiagLog.log("preflight", "plugin=\(pluginId) host=\(URL(string: candidate)?.host ?? "?") outcome=\(outcomeLabel) status=\(statusLabel) ms=\(ms)")
+            }
+            if verdict == .skipped {
+                // §3.2 (gate fix F-A6): a skipped candidate
+                // fails that candidate only — identical to
+                // the core walk; an earlier decided verdict
+                // stands, and an all-skipped walk still
+                // returns .skipped via lastVerdict.
+                continue
+            }
+            if case .ok = verdict {
+                var winning = stream
+                if candidate != stream.url { winning.url = candidate }
+                return (verdict, winning)
+            }
+            lastVerdict = verdict
+        }
+        return (lastVerdict, stream)
     }
 
     /// The best MEASURED source that has not had an attempt
@@ -701,8 +1022,27 @@ final class TVPlayerSession: ObservableObject {
             ?? (currentRequest.allEpisodes.first { $0.id == bestID })
     }
 
+    /// §4.1: applying a FallbackOutcome — the playing
+    /// context (episode / serverName / allEpisodes /
+    /// switchList + playing plugin) moves to the serving
+    /// request; the identity (movie / pluginId / pluginName
+    /// on currentRequest) is never touched.
+    private func applyFallbackOutcome(_ outcome: FallbackOutcome) {
+        guard outcome.didFallback else { return }
+        let served = outcome.servedRequest
+        currentRequest.episode = served.episode
+        currentRequest.serverName = served.serverName
+        currentRequest.allEpisodes = served.allEpisodes
+        currentRequest.switchList = served.switchList
+        playingPluginId = served.pluginId
+        playingPluginName = served.pluginName
+        servedByFallback = true
+        triedSourceIDs.insert(served.episode.id)
+    }
+
     private func resolveSucceeded(attempt: Int, resolution: PlaybackResolution) {
         guard attempt == attemptID, case .resolving = phase else { return }
+        debridWait = nil
         resolveTimeoutTask?.cancel()
         resolveTimeoutTask = nil
         let done = Date()
@@ -920,8 +1260,23 @@ final class TVPlayerSession: ObservableObject {
 
     private func resolveFailed(attempt: Int, error: Error) {
         guard attempt == attemptID, case .resolving = phase else { return }
+        debridWait = nil
         resolveTimeoutTask?.cancel()
         resolveTimeoutTask = nil
+        // §1B/§4.1: the typed refusal gets its own slate copy
+        // and a grep-distinguishable error label.
+        if let serviceError = error as? MovieServiceError,
+           case .sourceRefused(_, let refusalStatus) = serviceError {
+            // §2.7: the HTTP status rides the typed error
+            // when the core's terminal decision knew it.
+            let statusSuffix = refusalStatus.map { " status=\($0)" } ?? ""
+            DiagLog.log("player", "fail attempt=\(attempt) stage=resolve error=source-refused\(statusSuffix)")
+            phase = .failed(TVPlayerFailure(
+                stage: .resolve,
+                message: error.localizedDescription,
+                errorLabel: "source-refused"))
+            return
+        }
         let label = Self.errorLabel(error)
         DiagLog.log("player", "fail attempt=\(attempt) stage=resolve error=\(label)")
         phase = .failed(TVPlayerFailure(
@@ -1171,7 +1526,7 @@ final class TVPlayerSession: ObservableObject {
     /// attempt is not a finished title.
     func itemEnded(attempt: Int) {
         guard attempt == attemptID, case .playing = phase else { return }
-        if let record = history.record(for: currentRequest.pluginId, movieId: currentRequest.movie.id) {
+        if let record = history.record(for: originRequest.pluginId, movieId: originRequest.movie.id) {
             history.remove(record)
         }
     }
@@ -1208,7 +1563,7 @@ final class TVPlayerSession: ObservableObject {
         if duration.isFinite, duration > 0 { liveDuration = duration }
         guard livePosition > 10, liveDuration > 0 else { return }
         if livePosition >= liveDuration - 30 {
-            if let record = history.record(for: currentRequest.pluginId, movieId: currentRequest.movie.id) {
+            if let record = history.record(for: originRequest.pluginId, movieId: originRequest.movie.id) {
                 history.remove(record)
             }
             return
@@ -1222,15 +1577,19 @@ final class TVPlayerSession: ObservableObject {
     }
 
     private func makeHistoryRecord(position: Double, duration: Double) -> HistoryRecord {
+        // §2.6/§4.1: identity from the ORIGIN request; a
+        // fallback-served play records the ORIGIN episode and
+        // an EMPTY streamURL (the serving plugin's URL must
+        // not enter the origin title's fast-resume path).
         HistoryRecord(
-            pluginId: currentRequest.pluginId,
-            pluginName: currentRequest.pluginName,
-            isManga: currentRequest.isManga,
-            movie: currentRequest.movie,
+            pluginId: originRequest.pluginId,
+            pluginName: originRequest.pluginName,
+            isManga: originRequest.isManga,
+            movie: originRequest.movie,
             serverName: currentRequest.serverName,
-            episodeName: currentRequest.episode.name,
-            episodeId: currentRequest.episode.id,
-            streamURL: currentStream?.url ?? "",
+            episodeName: servedByFallback ? originRequest.episode.name : currentRequest.episode.name,
+            episodeId: servedByFallback ? originRequest.episode.id : currentRequest.episode.id,
+            streamURL: servedByFallback ? "" : (currentStream?.url ?? ""),
             lastPosition: position,
             duration: duration,
             updatedAt: Date())

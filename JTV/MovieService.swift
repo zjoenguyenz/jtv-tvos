@@ -6,6 +6,7 @@ enum MovieServiceError: Error, LocalizedError {
     case emptyDetail
     case unresolvedEpisode
     case timedOut
+    case sourceRefused(pluginName: String, status: Int?)
 
     var errorDescription: String? {
         switch self {
@@ -14,6 +15,10 @@ enum MovieServiceError: Error, LocalizedError {
         case .emptyDetail: return "Không tải được thông tin phim."
         case .unresolvedEpisode: return "Không tìm được link phát cho tập này."
         case .timedOut: return "Lấy link quá lâu. Kiểm tra mạng/VPN rồi bấm Thử lại."
+        case .sourceRefused(let pluginName, _):
+            return pluginName.isEmpty
+                ? "Nguồn phát đã từ chối phát phim này. Không có nguồn nào khác phát được phim này."
+                : "Nguồn \(pluginName) đã từ chối phát phim này. Không có nguồn nào khác phát được phim này."
         }
     }
 }
@@ -94,6 +99,44 @@ final class MovieService: ObservableObject {
     private let pageCacheLock = NSLock()
     private let pageCacheTTL: TimeInterval = 60
 
+    /// L-15 (1.3.6): parsed-list companion to the text cache
+    /// above. The text cache alone still made every re-created
+    /// ActorView / SearchResultsView instance re-run the full
+    /// spinner → fetch → parse → paint cycle (a churned view
+    /// instance pays it again per re-creation); caching the
+    /// PARSED page under the same 60 s TTL lets a re-created
+    /// view repaint from the stored page instead. Keyed
+    /// plugin|slug-or-keyword|page — the list form carries
+    /// its filter fields as one extra segment so a filtered
+    /// category call can never collide with the actor
+    /// surface's unfiltered call on the same slug + page.
+    /// Successful parses only; playback resolution is never
+    /// cached (see the text cache's note above).
+    private struct CachedListPage { let page: ListPage; let at: Date }
+    private var parsedListCache: [String: CachedListPage] = [:]
+    private let parsedListCacheLock = NSLock()
+
+    private func cachedListPage(forKey key: String) -> ListPage? {
+        let hit = parsedListCacheLock.withLock { parsedListCache[key] }
+        guard let hit, Date().timeIntervalSince(hit.at) < pageCacheTTL else { return nil }
+        return hit.page
+    }
+
+    private func storeListPage(_ page: ListPage, forKey key: String) {
+        parsedListCacheLock.withLock {
+            parsedListCache[key] = CachedListPage(page: page, at: Date())
+            if parsedListCache.count > 200 { parsedListCache.removeAll() }
+        }
+    }
+
+    private static func listCacheKey(pluginId: String, slug: String, filters: ListFilters, page: Int) -> String {
+        let extras = filters.extra.filter { !$0.value.isEmpty }
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: "&")
+        return "list|\(pluginId)|\(slug)|\(page)|\(filters.category)|\(filters.country)|\(filters.year)|\(filters.sort)|\(extras)"
+    }
+
     private func fetchPage(_ url: String) async throws -> String {
         // Swift 6: scoped withLock replaces lock()/unlock()
         // pairs in async contexts (see Cache.swift note).
@@ -153,6 +196,16 @@ final class MovieService: ObservableObject {
             || path.hasSuffix(".html") || path.hasSuffix(".htm") || path.hasSuffix(".php")
     }
 
+    /// L-16 (1.3.6): the resolve-duration line's outcome
+    /// vocabulary for a finished resolution.
+    private static func chainOutcomeLabel(_ resolution: PlaybackResolution) -> String {
+        switch resolution {
+        case .video: return "video"
+        case .embed: return "embed"
+        case .manga: return "manga"
+        }
+    }
+
     func defaultHeaders(for pluginId: String) async -> [String: String] {
         var headers = ["User-Agent": Net.desktopUA]
         if let base = await manifest(for: pluginId)?.baseUrl, !base.isEmpty {
@@ -181,22 +234,30 @@ final class MovieService: ObservableObject {
     // MARK: - Lists & search
 
     func list(pluginId: String, slug: String, filters: ListFilters, page: Int) async throws -> ListPage {
+        let cacheKey = Self.listCacheKey(pluginId: pluginId, slug: slug, filters: filters, page: page)
+        if let cached = cachedListPage(forKey: cacheKey) { return cached }
         let engine = try await engine(for: pluginId)
         guard let url = await engine.urlForList(slug: slug, filtersJson: filters.jsonString(page: page)) else {
             throw MovieServiceError.noURL
         }
         let text = try await fetchPage(url)
-        return await engine.parseList(text: text)
+        let parsed = await engine.parseList(text: text)
+        storeListPage(parsed, forKey: cacheKey)
+        return parsed
     }
 
     func search(pluginId: String, keyword: String, page: Int) async throws -> ListPage {
+        let cacheKey = "search|\(pluginId)|\(keyword)|\(page)"
+        if let cached = cachedListPage(forKey: cacheKey) { return cached }
         let engine = try await engine(for: pluginId)
         let filters = ListFilters()
         guard let url = await engine.urlForSearch(keyword: keyword, filtersJson: filters.jsonString(page: page)) else {
             throw MovieServiceError.noURL
         }
         let text = try await fetchPage(url)
-        return await engine.parseSearch(text: text)
+        let parsed = await engine.parseSearch(text: text)
+        storeListPage(parsed, forKey: cacheKey)
+        return parsed
     }
 
     // MARK: - Filter option lists
@@ -373,9 +434,21 @@ final class MovieService: ObservableObject {
             defer {
                 if inFlightPrefetch[key]?.token == token { inFlightPrefetch[key] = nil }
             }
-            guard let resolution = try? await task.value,
-                  case .embed = resolution else { return }
-            prefetchLock.withLock { prefetchedEmbeds[key] = (resolution, Date()) }
+            // L-16: the warm's outcome is logged — a failed
+            // warm used to vanish into `try?`, leaving the
+            // play tap's cold re-run of the same chain
+            // unexplained in the log.
+            do {
+                let resolution = try await task.value
+                guard case .embed = resolution else {
+                    DiagLog.log("prefetch", "warm outcome=discarded-non-embed plugin=\(request.pluginId)")
+                    return
+                }
+                prefetchLock.withLock { prefetchedEmbeds[key] = (resolution, Date()) }
+                DiagLog.log("prefetch", "warm outcome=cached plugin=\(request.pluginId)")
+            } catch {
+                DiagLog.log("prefetch", "warm outcome=failed plugin=\(request.pluginId) kind=\((error as NSError).domain)#\((error as NSError).code)")
+            }
         }
     }
 
@@ -418,8 +491,8 @@ final class MovieService: ObservableObject {
     /// Resolves an episode tap following the plugin episode semantics:
     /// direct media -> native player; manga chapter API -> images;
     /// embed page -> plugin embed/detail parser, else webview sniffer.
-    func resolveEpisode(_ request: PlaybackRequest) async throws -> PlaybackResolution {
-        try await resolveEpisode(request, joiningPrefetch: true)
+    func resolveEpisode(_ request: PlaybackRequest, onDebridPhase: (@Sendable (DebridPhaseEvent) -> Void)? = nil) async throws -> PlaybackResolution {
+        try await resolveEpisode(request, joiningPrefetch: true, onDebridPhase: onDebridPhase)
     }
 
     /// L-T12 (1.3.1) PROBE-ONLY façade for the Detail backdrop
@@ -498,7 +571,7 @@ final class MovieService: ObservableObject {
         }
     }
 
-    private func resolveEpisode(_ request: PlaybackRequest, joiningPrefetch: Bool, probeOnly: Bool = false) async throws -> PlaybackResolution {
+    private func resolveEpisode(_ request: PlaybackRequest, joiningPrefetch: Bool, probeOnly: Bool = false, onDebridPhase: (@Sendable (DebridPhaseEvent) -> Void)? = nil) async throws -> PlaybackResolution {
         // v1.22.15 (B-4): register the MediaFusion credential host
         // with the logger BEFORE any line below can carry an MF
         // stream URL through urlForLog. A persisted MF episode can
@@ -512,10 +585,19 @@ final class MovieService: ObservableObject {
         // success and throw alike. No other change here.
         let chainStart = Date()
         let pluginId = request.pluginId
-        defer { DiagLog.log("resolve", "duration plugin=\(pluginId) ms=\(Int(Date().timeIntervalSince(chainStart) * 1000))") }
+        // L-16 (1.3.6): the duration line also carries the
+        // chain's terminal outcome — a resolve that died on a
+        // thrown hop fetch used to leave NOTHING after its
+        // start line (the 123av silent death, L-16). Every
+        // exit below records its outcome in chainOutcome; the
+        // default is a canary — if it ever reaches a log, an
+        // exit was missed.
+        var chainOutcome = "error kind=unannotated"
+        defer { DiagLog.log("resolve", "duration plugin=\(pluginId) ms=\(Int(Date().timeIntervalSince(chainStart) * 1000)) outcome=\(chainOutcome)") }
         let target = request.episode.id
         guard !target.isEmpty else {
             DiagLog.log("resolve", "error plugin=\(pluginId) empty target")
+            chainOutcome = "error kind=unresolvedEpisode"
             throw MovieServiceError.unresolvedEpisode
         }
         // Log the target KIND and its redacted shape only — a
@@ -531,6 +613,7 @@ final class MovieService: ObservableObject {
         // (probeOnly == false) is byte-for-byte unchanged.
         if !probeOnly, let prefetched = consumePrefetchedEmbed(pluginId: pluginId, target: target) {
             DiagLog.log("resolve", "route=embed via=prefetched")
+            chainOutcome = "embed"
             return prefetched
         }
 
@@ -559,9 +642,13 @@ final class MovieService: ObservableObject {
             // registry, and its watcher may still cache an
             // embed outcome.
             if let shared = await Self.joinInFlightPrefetch(inFlight.task) {
+                chainOutcome = Self.chainOutcomeLabel(shared)
                 return shared
             }
-            if Task.isCancelled { throw CancellationError() }
+            if Task.isCancelled {
+                chainOutcome = "error kind=cancelled"
+                throw CancellationError()
+            }
         }
 
         // Fast resume: a previously resolved direct stream.
@@ -571,8 +658,12 @@ final class MovieService: ObservableObject {
             var headers = request.fallbackHeaders
             if headers.isEmpty { headers = await defaultHeaders(for: pluginId) }
             let stream = await markProxyIfNeeded(StreamInfo(url: request.knownStreamURL, headers: headers), pluginId: pluginId)
-            if let fallback = await streamxxPlayerFallback(url: stream.url, headers: stream.headers) { return fallback }
+            if let fallback = await streamxxPlayerFallback(url: stream.url, headers: stream.headers) {
+                chainOutcome = "embed"
+                return fallback
+            }
             DiagLog.log("resolve", "route=video engine=\(stream.useCompatEngine ? "ksplayer" : "avplayer") via=fast-resume url=\(DiagLog.urlForLog(stream.url))")
+            chainOutcome = "video"
             return .video(stream)
         }
 
@@ -588,11 +679,19 @@ final class MovieService: ObservableObject {
             // chain's own backstop for the same rule.
             if probeOnly {
                 DiagLog.log("resolve", "route=debrid outcome=refused-probe-only")
+                chainOutcome = "error kind=unresolvedEpisode"
                 throw MovieServiceError.unresolvedEpisode
             }
             let hash = String(target.dropFirst("jtvhash:".count))
             DiagLog.log("resolve", "route=debrid")
-            return .video(try await DebridResolver.resolve(hash: hash))
+            do {
+                let stream = try await DebridResolver.resolve(hash: hash, onPhase: onDebridPhase)
+                chainOutcome = "video"
+                return .video(stream)
+            } catch {
+                chainOutcome = "error kind=\((error as NSError).domain)#\((error as NSError).code)"
+                throw error
+            }
         }
 
         // Direct media target.
@@ -600,27 +699,40 @@ final class MovieService: ObservableObject {
             var headers = request.fallbackHeaders
             if headers.isEmpty { headers = await defaultHeaders(for: pluginId) }
             let stream = await markProxyIfNeeded(StreamInfo(url: target, headers: headers), pluginId: pluginId)
-            if let fallback = await streamxxPlayerFallback(url: stream.url, headers: stream.headers) { return fallback }
+            if let fallback = await streamxxPlayerFallback(url: stream.url, headers: stream.headers) {
+                chainOutcome = "embed"
+                return fallback
+            }
             DiagLog.log("resolve", "route=video engine=\(stream.useCompatEngine ? "ksplayer" : "avplayer") via=direct url=\(DiagLog.urlForLog(stream.url))")
+            chainOutcome = "video"
             return .video(stream)
         }
 
         guard let engine = try? await engine(for: pluginId) else {
             DiagLog.log("resolve", "error plugin=\(pluginId) plugin unavailable")
+            chainOutcome = "error kind=pluginUnavailable"
             throw MovieServiceError.pluginUnavailable
         }
 
         // Manga chapter: fetch the chapter API and parse its image list.
         if request.isManga {
-            let text = try await Net.fetchText(target)
+            let text: String
+            do {
+                text = try await Net.fetchText(target)
+            } catch {
+                chainOutcome = "error kind=\((error as NSError).domain)#\((error as NSError).code)"
+                throw error
+            }
             let stream = await engine.parseStream(text: text, url: target)
             if !stream.images.isEmpty {
                 var resolved = stream
                 if resolved.headers.isEmpty { resolved.headers = await defaultHeaders(for: pluginId) }
                 DiagLog.log("resolve", "route=manga images=\(resolved.images.count)")
+                chainOutcome = "manga"
                 return .manga(resolved)
             }
             DiagLog.log("resolve", "error plugin=\(pluginId) manga chapter had no images")
+            chainOutcome = "error kind=unresolvedEpisode"
             throw MovieServiceError.unresolvedEpisode
         }
 
@@ -660,6 +772,7 @@ final class MovieService: ObservableObject {
                 let raw = StreamInfo(url: target, headers: headers, useCompatEngine: compat)
                 let stream = await markProxyIfNeeded(raw, pluginId: pluginId)
                 DiagLog.log("resolve", "route=video via=torrent-direct kind=\(isMFHost ? "mediafusion" : "container") host=\(targetURL.host ?? "?") engine=\(stream.useCompatEngine ? "ksplayer" : "avplayer")")
+                chainOutcome = "video"
                 return .video(stream)
             }
         }
@@ -675,7 +788,16 @@ final class MovieService: ObservableObject {
         // URL to AVPlayer, which failed instantly.
         var currentURL = target
         var currentHeaders = await defaultHeaders(for: pluginId)
-        var payload = try await Net.fetchText(currentURL, headers: currentHeaders)
+        var payload: String
+        do {
+            payload = try await Net.fetchText(currentURL, headers: currentHeaders)
+        } catch {
+            // L-16: hop 0 (the target page itself) — the
+            // same record as the in-loop hop failures below.
+            DiagLog.log("resolve", "hop failed plugin=\(pluginId) hop=0 host=\(URL(string: currentURL)?.host ?? "?") err=\((error as NSError).domain)#\((error as NSError).code)")
+            chainOutcome = "error kind=\((error as NSError).domain)#\((error as NSError).code)"
+            throw error
+        }
         var lastEmbedURL = target
         // Embed-chain parse budget: 4 by default (the historical
         // bound). A plugin may declare a larger need in its
@@ -688,7 +810,7 @@ final class MovieService: ObservableObject {
         if parseBudget != 4 {
             DiagLog.log("resolve", "budget plugin=\(pluginId) parses=\(parseBudget)")
         }
-        for _ in 0..<parseBudget {
+        for hopIndex in 0..<parseBudget {
             var step = await engine.parseEmbed(html: payload, url: currentURL)
             if step == nil || step?.hasPlayableURL != true {
                 let parsed = await engine.parseStream(text: payload, url: currentURL)
@@ -699,6 +821,7 @@ final class MovieService: ObservableObject {
                 var resolved = step
                 if resolved.headers.isEmpty { resolved.headers = currentHeaders }
                 DiagLog.log("resolve", "route=manga via=embed-chain images=\(resolved.images.count)")
+                chainOutcome = "manga"
                 return .manga(resolved)
             }
             if !step.isEmbed || MediaURL.isDirectMedia(step.url) {
@@ -711,13 +834,18 @@ final class MovieService: ObservableObject {
                     var pageHeaders = step.headers
                     if pageHeaders.isEmpty { pageHeaders = currentHeaders }
                     DiagLog.log("resolve", "route=embed via=webpage url=\(DiagLog.urlForLog(step.url))")
+                    chainOutcome = "embed"
                     return .embed(url: pageURL, headers: pageHeaders, sniffMedia: true)
                 }
                 var resolved = step
                 if resolved.headers.isEmpty { resolved.headers = currentHeaders }
                 let stream = await markProxyIfNeeded(resolved, pluginId: pluginId)
-                if let fallback = await streamxxPlayerFallback(url: stream.url, headers: stream.headers) { return fallback }
+                if let fallback = await streamxxPlayerFallback(url: stream.url, headers: stream.headers) {
+                    chainOutcome = "embed"
+                    return fallback
+                }
                 DiagLog.log("resolve", "route=video engine=\(stream.useCompatEngine ? "ksplayer" : "avplayer") via=embed-chain url=\(DiagLog.urlForLog(stream.url))")
+                chainOutcome = "video"
                 return .video(stream)
             }
             // Self-embed (123av's shape): the parser points back at
@@ -728,6 +856,7 @@ final class MovieService: ObservableObject {
                 var pageHeaders = step.headers
                 if pageHeaders.isEmpty { pageHeaders = currentHeaders }
                 DiagLog.log("resolve", "route=embed via=self-embed url=\(DiagLog.urlForLog(step.url))")
+                chainOutcome = "embed"
                 return .embed(url: pageURL, headers: pageHeaders, sniffMedia: true)
             }
             // Follow the hop.
@@ -736,20 +865,312 @@ final class MovieService: ObservableObject {
             if !step.headers.isEmpty {
                 currentHeaders = (await defaultHeaders(for: pluginId)).merging(step.headers) { _, new in new }
             }
-            if let body = step.postBody, !body.isEmpty {
-                payload = try await Net.fetchTextPOST(currentURL, body: body, headers: currentHeaders)
-            } else {
-                payload = try await Net.fetchText(currentURL, headers: currentHeaders)
+            do {
+                if let body = step.postBody, !body.isEmpty {
+                    payload = try await Net.fetchTextPOST(currentURL, body: body, headers: currentHeaders)
+                } else {
+                    payload = try await Net.fetchText(currentURL, headers: currentHeaders)
+                }
+            } catch {
+                // L-16: a hop fetch that throws used to kill
+                // the chain without a trace — record the hop
+                // (host + error kind only, never the URL)
+                // before the rethrow. The HTTP status rides
+                // the Net per-attempt lines beside this one.
+                DiagLog.log("resolve", "hop failed plugin=\(pluginId) hop=\(hopIndex + 1) host=\(URL(string: currentURL)?.host ?? "?") err=\((error as NSError).domain)#\((error as NSError).code)")
+                chainOutcome = "error kind=\((error as NSError).domain)#\((error as NSError).code)"
+                throw error
             }
         }
 
         // Last resort: open the embed in the sniffing webview.
         guard let url = URL(string: lastEmbedURL) else {
             DiagLog.log("resolve", "error plugin=\(pluginId) unresolved episode")
+            chainOutcome = "error kind=unresolvedEpisode"
             throw MovieServiceError.unresolvedEpisode
         }
         DiagLog.log("resolve", "route=embed via=last-resort url=\(DiagLog.urlForLog(lastEmbedURL))")
+        chainOutcome = "embed"
         return .embed(url: url, headers: await defaultHeaders(for: pluginId), sniffMedia: true)
+    }
+
+    // MARK: - Source-rescue fallback (spec §2, 1.3.6)
+
+    private static func fallbackMs(since start: Date) -> Int {
+        Int(Date().timeIntervalSince(start) * 1000)
+    }
+
+    /// The outcome of the primary attempt, kept for the
+    /// terminal-error rule (§2.5) once every hop has failed.
+    private enum PrimaryFailure {
+        case refused(status: Int)
+        case notFound
+        case unreachable(String)
+        case emptyURL
+        case thrown(Error)
+    }
+
+    private struct PreflightWalk {
+        var verdict: PreflightVerdict
+        var stream: StreamInfo
+    }
+
+    private struct HopServed {
+        var resolution: PlaybackResolution
+        var request: PlaybackRequest
+    }
+
+    private struct HopOutcome {
+        var label: String
+        var served: HopServed?
+    }
+
+    /// Pre-flight walk (§3.1/§3.2): candidates are the stream's
+    /// own URL plus its ranked alternates, de-duplicated, in
+    /// order; the first `.ok` wins and substitutes the stream
+    /// URL. All candidates failing returns the LAST decided
+    /// candidate's verdict. A `.skipped` verdict fails only
+    /// its own candidate — it never aborts the walk and never
+    /// pardons an earlier candidate's refusal; the walk as a
+    /// whole is `.skipped` (stream returned untouched, nothing
+    /// triggered) only when EVERY candidate is skipped.
+    private func preflightWalk(pluginId: String, stream: StreamInfo) async -> PreflightWalk {
+        if stream.requiresProxy || stream.isEmbed {
+            DiagLog.log("preflight", "plugin=\(pluginId) host=\(URL(string: stream.url)?.host ?? "?") outcome=skipped status=- ms=0")
+            return PreflightWalk(verdict: .skipped, stream: stream)
+        }
+        var candidates: [String] = []
+        var seen = Set<String>()
+        for candidate in [stream.url] + stream.alternateURLs {
+            if seen.insert(candidate).inserted { candidates.append(candidate) }
+        }
+        var lastVerdict: PreflightVerdict = .skipped
+        for (index, candidate) in candidates.enumerated() {
+            let checkStart = Date()
+            let verdict = await StreamPreflight.check(url: candidate, headers: stream.headers)
+            let ms = Self.fallbackMs(since: checkStart)
+            let outcomeLabel: String
+            let statusLabel: String
+            switch verdict {
+            case .ok(let status, _):
+                outcomeLabel = "ok"; statusLabel = "\(status)"
+            case .refused(let status):
+                outcomeLabel = "refused"; statusLabel = "\(status)"
+            case .notFound:
+                outcomeLabel = "not-found"; statusLabel = "-"
+            case .unreachable:
+                outcomeLabel = "unreachable"; statusLabel = "-"
+            case .skipped:
+                outcomeLabel = "skipped"; statusLabel = "-"
+            }
+            if pluginId == "missav", candidates.count > 1 {
+                DiagLog.log("preflight", "candidate=\(index + 1)/\(candidates.count) plugin=\(pluginId) host=\(URL(string: candidate)?.host ?? "?") outcome=\(outcomeLabel) status=\(statusLabel) ms=\(ms)")
+            } else {
+                DiagLog.log("preflight", "plugin=\(pluginId) host=\(URL(string: candidate)?.host ?? "?") outcome=\(outcomeLabel) status=\(statusLabel) ms=\(ms)")
+            }
+            if verdict == .skipped {
+                // §3.2 (gate fix m-1/F-A6): a skipped candidate
+                // fails that candidate only — the walk
+                // continues and an earlier decided verdict
+                // stands. lastVerdict keeps its initial
+                // .skipped, so an all-skipped walk still
+                // returns .skipped below.
+                continue
+            }
+            if case .ok = verdict {
+                var winning = stream
+                if candidate != stream.url { winning.url = candidate }
+                return PreflightWalk(verdict: verdict, stream: winning)
+            }
+            lastVerdict = verdict
+        }
+        return PreflightWalk(verdict: lastVerdict, stream: stream)
+    }
+
+    /// Resolves an episode, falling back across sources by base
+    /// catalogue code when the origin plugin fails (§2.4).
+    /// `resolveEpisode` itself is untouched by this path: every
+    /// existing caller keeps byte-identical behaviour.
+    func resolveWithFallback(_ request: PlaybackRequest) async throws -> FallbackOutcome {
+        let origin = request.pluginId
+        let started = Date()
+        let code = BaseCode.extract(from: request)
+        DiagLog.log("fallback", "begin plugin=\(origin) code=\(code ?? "none")")
+        let primaryStart = Date()
+        var primaryFailure: PrimaryFailure?
+        do {
+            let resolution = try await resolveEpisode(request)
+            switch resolution {
+            case .embed, .manga:
+                DiagLog.log("fallback", "primary plugin=\(origin) outcome=played ms=\(Self.fallbackMs(since: primaryStart))")
+                return FallbackOutcome(resolution: resolution, servedRequest: request, didFallback: false)
+            case .video(let stream):
+                if !stream.hasPlayableURL {
+                    DiagLog.log("fallback", "primary plugin=\(origin) outcome=empty-url ms=\(Self.fallbackMs(since: primaryStart))")
+                    primaryFailure = .emptyURL
+                } else if FallbackCatalog.preflightSet.contains(origin) {
+                    let walk = await preflightWalk(pluginId: origin, stream: stream)
+                    switch walk.verdict {
+                    case .ok, .skipped:
+                        DiagLog.log("fallback", "primary plugin=\(origin) outcome=played ms=\(Self.fallbackMs(since: primaryStart))")
+                        return FallbackOutcome(resolution: .video(walk.stream), servedRequest: request, didFallback: false)
+                    case .refused(let status):
+                        DiagLog.log("fallback", "primary plugin=\(origin) outcome=refused status=\(status) ms=\(Self.fallbackMs(since: primaryStart))")
+                        primaryFailure = .refused(status: status)
+                    case .notFound:
+                        DiagLog.log("fallback", "primary plugin=\(origin) outcome=not-found ms=\(Self.fallbackMs(since: primaryStart))")
+                        primaryFailure = .notFound
+                    case .unreachable(let detail):
+                        DiagLog.log("fallback", "primary plugin=\(origin) outcome=unreachable \(detail) ms=\(Self.fallbackMs(since: primaryStart))")
+                        primaryFailure = .unreachable(detail)
+                    }
+                } else {
+                    DiagLog.log("fallback", "primary plugin=\(origin) outcome=played ms=\(Self.fallbackMs(since: primaryStart))")
+                    return FallbackOutcome(resolution: resolution, servedRequest: request, didFallback: false)
+                }
+            }
+        } catch {
+            let nsError = error as NSError
+            DiagLog.log("fallback", "primary plugin=\(origin) outcome=error \(nsError.domain)#\(nsError.code) ms=\(Self.fallbackMs(since: primaryStart))")
+            primaryFailure = .thrown(error)
+        }
+
+        // §2.5 (gate fix F-A4/M-2): the 60 s ceiling is the
+        // HOPS budget — it is anchored HERE, where the
+        // primary attempt has concluded, so a slow primary
+        // never charges against it (the shell deadlines are
+        // sized primary + hops). `started` above remains the
+        // whole-chain anchor for the `served … total-ms` line.
+        let hopsStarted = Date()
+
+        guard let failure = primaryFailure else {
+            // Every non-returning path above sets a failure;
+            // this guard only keeps the flow total.
+            throw MovieServiceError.unresolvedEpisode
+        }
+        guard let code else {
+            let terminal = await fallbackTerminalError(for: failure, origin: origin, request: request)
+            throw terminal
+        }
+        for target in FallbackCatalog.targets(for: origin) {
+            if Date().timeIntervalSince(hopsStarted) > 60 { break }
+            if Task.isCancelled { throw CancellationError() }
+            let hopStart = Date()
+            let hop = await runFallbackHop(target: target, code: code, origin: request)
+            DiagLog.log("fallback", "hop plugin=\(target) code=\(code) outcome=\(hop.label) ms=\(Self.fallbackMs(since: hopStart))")
+            if let served = hop.served {
+                DiagLog.log("fallback", "served plugin=\(target) code=\(code) total-ms=\(Self.fallbackMs(since: started))")
+                return FallbackOutcome(resolution: served.resolution, servedRequest: served.request, didFallback: true)
+            }
+        }
+        if Task.isCancelled { throw CancellationError() }
+        let terminal = await fallbackTerminalError(for: failure, origin: origin, request: request)
+        throw terminal
+    }
+
+    /// Terminal-error rule (§2.5): a primary pre-flight refusal
+    /// names the origin source; a primary throw is rethrown
+    /// unchanged; every other primary failure keeps the
+    /// existing unresolved-episode copy.
+    private func fallbackTerminalError(for failure: PrimaryFailure, origin: String, request: PlaybackRequest) async -> Error {
+        switch failure {
+        case .refused(let status):
+            let name = await manifest(for: origin)?.name ?? request.pluginName
+            return MovieServiceError.sourceRefused(pluginName: name, status: status)
+        case .thrown(let error):
+            return error
+        case .notFound, .unreachable, .emptyURL:
+            return MovieServiceError.unresolvedEpisode
+        }
+    }
+
+    /// One fallback hop under its 20 s ceiling (§2.5), enforced
+    /// with the task-group race idiom the resolver screen uses
+    /// for its 45 s deadline: the hop work races a sleep that
+    /// throws `timedOut`; the loser is cancelled.
+    private func runFallbackHop(target: String, code: String, origin: PlaybackRequest) async -> HopOutcome {
+        do {
+            return try await withThrowingTaskGroup(of: HopOutcome.self) { group in
+                group.addTask { await self.performFallbackHop(target: target, code: code, origin: origin) }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 20_000_000_000)
+                    throw MovieServiceError.timedOut
+                }
+                let first = try await group.next()!
+                group.cancelAll()
+                return first
+            }
+        } catch {
+            // §2.7 (gate fix m-2): the ceiling's own timeout
+            // is a distinguishable outcome inside the hop
+            // vocabulary (`error timeout`), not a bridged
+            // NSError indistinguishable from a genuine hop
+            // error.
+            if let serviceError = error as? MovieServiceError,
+               case .timedOut = serviceError {
+                return HopOutcome(label: "error timeout", served: nil)
+            }
+            let nsError = error as NSError
+            return HopOutcome(label: "error \(nsError.domain)#\(nsError.code)", served: nil)
+        }
+    }
+
+    /// The hop itself (§2.4 steps a–d): ONE search call for the
+    /// base code, the first exact code match, its detail via
+    /// the same two calls Detail makes, and a resolve of the
+    /// hop request built through Detail's population path.
+    /// Never throws — every failure is an outcome label.
+    private func performFallbackHop(target: String, code: String, origin: PlaybackRequest) async -> HopOutcome {
+        do {
+            let page = try await search(pluginId: target, keyword: code, page: 1)
+            guard let match = page.items.first(where: { BaseCode.extract(id: $0.id, title: $0.title) == code }) else {
+                return HopOutcome(label: "not-carried", served: nil)
+            }
+            let bundle = try await detailMeta(pluginId: target, movieId: match.id)
+            let detail = await detailStreams(pluginId: target, movieId: match.id, detail: bundle.detail)
+            guard let server = detail.servers.first, let episode = server.episodes.first else {
+                return HopOutcome(label: "no-episodes", served: nil)
+            }
+            let hopRequest = PlaybackRequest(
+                movie: detail.asMovie,
+                pluginId: target,
+                pluginName: await manifest(for: target)?.name ?? "",
+                isManga: false,
+                serverName: server.name,
+                episode: episode,
+                allEpisodes: server.episodes,
+                startPosition: origin.startPosition,
+                knownStreamURL: "",
+                fallbackHeaders: bundle.detailStream.headers,
+                switchList: []
+            )
+            let resolution = try await resolveEpisode(hopRequest)
+            switch resolution {
+            case .video(let stream):
+                guard stream.hasPlayableURL else {
+                    return HopOutcome(label: "unreachable empty-url", served: nil)
+                }
+                if FallbackCatalog.preflightSet.contains(target) {
+                    let walk = await preflightWalk(pluginId: target, stream: stream)
+                    switch walk.verdict {
+                    case .ok, .skipped:
+                        return HopOutcome(label: "served", served: HopServed(resolution: .video(walk.stream), request: hopRequest))
+                    case .refused(let status):
+                        return HopOutcome(label: "refused status=\(status)", served: nil)
+                    case .notFound:
+                        return HopOutcome(label: "not-found", served: nil)
+                    case .unreachable(let detailText):
+                        return HopOutcome(label: "unreachable \(detailText)", served: nil)
+                    }
+                }
+                return HopOutcome(label: "served", served: HopServed(resolution: resolution, request: hopRequest))
+            case .embed, .manga:
+                return HopOutcome(label: "unreachable non-video-outcome", served: nil)
+            }
+        } catch {
+            let nsError = error as NSError
+            return HopOutcome(label: "error \(nsError.domain)#\(nsError.code)", served: nil)
+        }
     }
 
     /// streamxx route decision (v1.22.11): the operator's newer
@@ -866,6 +1287,722 @@ final class MovieService: ObservableObject {
         var resolved = stream
         if resolved.headers.isEmpty { resolved.headers = await defaultHeaders(for: pluginId) }
         return resolved
+    }
+}
+
+// MARK: - Source rescue: base code, fallback outcome, pre-flight (spec §2/§3)
+
+/// The result of `MovieService.resolveWithFallback`: the
+/// resolution to play, the request that actually serves it
+/// (== the input when no fallback occurred), and whether a
+/// fallback hop served it.
+struct FallbackOutcome {
+    var resolution: PlaybackResolution
+    var servedRequest: PlaybackRequest
+    var didFallback: Bool
+}
+
+/// Base catalogue code extraction (§2.2): JAV titles are
+/// indexed across sources by a normalised code
+/// (`<LETTERS>-<DIGITS>` or the FC2-PPV form). Candidates in
+/// order: the movie id's slug (last path component first),
+/// then the title. Match comparison between the query code
+/// and a search result's code is exact equality on the
+/// normalised form.
+enum BaseCode {
+    static func extract(from request: PlaybackRequest) -> String? {
+        extract(movieId: request.movie.id, title: request.movie.title)
+    }
+
+    static func extract(id: String, title: String) -> String? {
+        extract(movieId: id, title: title)
+    }
+
+    /// The Movie-level entry point (§13.5): the same candidate
+    /// order (the id's last path component, then the title)
+    /// and the same patterns as the request-based extractor —
+    /// every entry point sits on this one core so the forms
+    /// can never drift.
+    static func extract(movieId: String, title: String) -> String? {
+        let slug = movieId.split(separator: "/").last.map(String.init) ?? movieId
+        if let code = fromSlug(slug) { return code }
+        return fromText(title)
+    }
+
+    /// FC2 form, searched anywhere in the uppercased text:
+    /// `FC2-?PPV-?(\d{5,7})` -> `FC2-PPV-<digits>`.
+    private static func fc2(in upper: String) -> String? {
+        guard let anchor = upper.range(of: "FC2") else { return nil }
+        var rest = upper[anchor.upperBound...]
+        if rest.hasPrefix("-") { rest = rest.dropFirst() }
+        guard rest.hasPrefix("PPV") else { return nil }
+        rest = rest.dropFirst(3)
+        if rest.hasPrefix("-") { rest = rest.dropFirst() }
+        let digits = rest.prefix { $0.isASCII && $0.isNumber }
+        guard digits.count >= 5 else { return nil }
+        return "FC2-PPV-" + String(digits.prefix(7))
+    }
+
+    /// Standard form at the START of the slug token stream,
+    /// after stripping leading locale segments (en/vi/ja):
+    /// `([A-Z]{2,6})-(\d{2,6})`. Everything after the numeric
+    /// token (`-uncensored-leak`, `-sub`, ...) is discarded by
+    /// construction.
+    private static func fromSlug(_ slug: String) -> String? {
+        let upper = slug.uppercased()
+        if let code = fc2(in: upper) { return code }
+        var tokens = upper.split(separator: "-").map(String.init)
+        while let first = tokens.first, ["EN", "VI", "JA"].contains(first) {
+            tokens.removeFirst()
+        }
+        guard tokens.count >= 2 else { return nil }
+        let letters = tokens[0]
+        let digits = tokens[1]
+        guard (2...6).contains(letters.count),
+              letters.allSatisfy({ $0.isASCII && $0.isLetter }),
+              (2...6).contains(digits.count),
+              digits.allSatisfy({ $0.isASCII && $0.isNumber }) else { return nil }
+        return "\(letters)-\(digits)"
+    }
+
+    /// From a title: the first standard/FC2 match anywhere.
+    private static func fromText(_ text: String) -> String? {
+        let upper = text.uppercased()
+        if let code = fc2(in: upper) { return code }
+        let chars = Array(upper)
+        var i = 0
+        while i < chars.count {
+            guard chars[i].isASCII, chars[i].isLetter else { i += 1; continue }
+            var j = i
+            while j < chars.count, chars[j].isASCII, chars[j].isLetter { j += 1 }
+            // A letter run longer than 6 can still end in a
+            // code: the pattern's match is its last 6 letters.
+            let start = j - min(j - i, 6)
+            if j < chars.count, chars[j] == "-" {
+                var k = j + 1
+                while k < chars.count, chars[k].isASCII, chars[k].isNumber { k += 1 }
+                if k - (j + 1) >= 2 {
+                    let digits = String(chars[(j + 1)..<min(k, j + 7)])
+                    return String(chars[start..<j]) + "-" + digits
+                }
+            }
+            i = j
+        }
+        return nil
+    }
+}
+
+/// Verdict of one playlist pre-flight (§3.1).
+enum PreflightVerdict: Equatable {
+    case ok(status: Int, ttfbMs: Int)
+    case refused(status: Int)        // 401 / 403
+    case notFound                     // 404 / 410
+    case unreachable(String)          // other HTTP status, or transport detail
+    case skipped                      // not a pre-flightable stream
+}
+
+/// Playlist pre-flight (§3.1): an ephemeral URLSession (the
+/// TVSourceProbe discipline, in core), GET with
+/// `Range: bytes=0-0` and the resolved stream's headers
+/// exactly as the player would send them, cancelled at the
+/// first body byte, 4 s budget. The verdict is status /
+/// first-byte only — the body is never read beyond the first
+/// chunk and never stored. Used ONLY by the fallback engine
+/// and the tvOS measurement pass — never inside
+/// `resolveEpisode` itself.
+enum StreamPreflight {
+    static func check(url: String, headers: [String: String]) async -> PreflightVerdict {
+        guard MediaURL.isDirectMedia(url), let target = URL(string: url) else { return .skipped }
+        var request = URLRequest(url: target)
+        for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
+        request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        let delegate = PreflightDelegate()
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 4
+        configuration.timeoutIntervalForResource = 4
+        let session = URLSession(configuration: configuration,
+                                 delegate: delegate, delegateQueue: queue)
+        let verdict: PreflightVerdict = await withCheckedContinuation { continuation in
+            delegate.arm(continuation: continuation)
+            let task = session.dataTask(with: request)
+            delegate.attach(task: task, queue: queue)
+            task.resume()
+            // The budget enforcer: whichever of first-byte,
+            // completion, or this deadline lands first wins;
+            // the delegate resumes exactly once.
+            Task {
+                try? await Task.sleep(for: .seconds(4))
+                delegate.expire()
+            }
+        }
+        session.invalidateAndCancel()
+        return verdict
+    }
+
+    /// Resume-once delegate (the TVSourceProbe FirstByteDelegate
+    /// idiom): all mutable state is touched only on the
+    /// session's serial delegate queue or before the task
+    /// resumes, except `expire()`, which hops onto that same
+    /// queue — the `@unchecked Sendable` states exactly that
+    /// confinement for the compiler.
+    private final class PreflightDelegate: NSObject, URLSessionDataDelegate,
+        @unchecked Sendable {
+        private var continuation: CheckedContinuation<PreflightVerdict, Never>?
+        private var task: URLSessionDataTask?
+        private var started: Date?
+        private var status: Int?
+        private var finished = false
+        private var callbackQueue: OperationQueue?
+
+        func arm(continuation: CheckedContinuation<PreflightVerdict, Never>) {
+            self.continuation = continuation
+            self.started = Date()
+        }
+
+        func attach(task: URLSessionDataTask, queue: OperationQueue) {
+            self.task = task
+            self.callbackQueue = queue
+        }
+
+        func expire() {
+            guard let queue = callbackQueue else { return }
+            queue.addOperation { [weak self] in
+                self?.finish(.unreachable("timeout"))
+            }
+        }
+
+        private func finish(_ verdict: PreflightVerdict) {
+            guard !finished else { return }
+            finished = true
+            task?.cancel()
+            continuation?.resume(returning: verdict)
+            continuation = nil
+        }
+
+        /// The verdict a status alone decides, or nil when the
+        /// status is 2xx and the first body byte must land
+        /// before the stream can be called ok.
+        private static func verdict(forStatus status: Int) -> PreflightVerdict? {
+            switch status {
+            case 401, 403: return .refused(status: status)
+            case 404, 410: return .notFound
+            case 200..<300: return nil
+            default: return .unreachable("http=\(status)")
+            }
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                        didReceive response: URLResponse,
+                        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            status = code
+            if let verdict = Self.verdict(forStatus: code) {
+                completionHandler(.cancel)
+                finish(verdict)
+            } else {
+                completionHandler(.allow)
+            }
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                        didReceive data: Data) {
+            guard let started else { finish(.unreachable("no-clock")); return }
+            finish(.ok(status: status ?? 200,
+                       ttfbMs: Int(Date().timeIntervalSince(started) * 1000)))
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        didCompleteWithError error: Error?) {
+            if let error {
+                let nsError = error as NSError
+                finish(.unreachable("\(nsError.domain)#\(nsError.code)"))
+            } else if let status, let verdict = Self.verdict(forStatus: status) {
+                finish(verdict)
+            } else {
+                // A 2xx answer that completed with no body byte
+                // at all: the host answered, so the stream is
+                // not refused — ok with no measured TTFB.
+                finish(.ok(status: status ?? 200, ttfbMs: 0))
+            }
+        }
+    }
+}
+
+// MARK: - Cross-source actor merge (spec §13, 1.3.6)
+
+/// One source's resolved actor filmography (§13.4): the
+/// target plugin's OWN actor route in the exact form its
+/// cast chips emit, plus the filmography's page 1 (which may
+/// be empty: resolved, zero rows — §13.1a applies).
+/// `avatarUrl` is set only by the topxx index resolution.
+struct ActorContribution {
+    let pluginId: String
+    let route: String        // the target plugin's OWN actor route,
+                             // in the exact form its cast chips emit
+    let avatarUrl: String?   // topxx index resolution only; else nil
+    let firstPage: ListPage  // the filmography's page 1 (may be empty:
+                             // resolved, zero rows — §13.1a applies)
+}
+
+extension MovieService {
+    /// §13.4: resolves one source's actor filmography for the
+    /// cross-source actor page. `nil` means "no contribution"
+    /// for ANY reason (not installed, disabled, no match,
+    /// error, timeout) — the caller never distinguishes; the
+    /// DiagLog line does (§13.9, emitted by the merge
+    /// coordinator from the detailed form below). Every path
+    /// uses ONLY the existing service surfaces (`search`,
+    /// `detailMeta`, `list`) — no plugin is modified.
+    func actorContribution(pluginId: String, name: String) async -> ActorContribution? {
+        await actorContributionDetailed(pluginId: pluginId, name: name).contribution
+    }
+
+    /// The detailed form of `actorContribution`: the
+    /// contribution plus the §13.9 outcome label and the
+    /// page-1 hit count for the coordinator's per-source log
+    /// line. Never throws — every failure is an outcome.
+    func actorContributionDetailed(pluginId: String, name: String) async
+        -> (contribution: ActorContribution?, outcome: String, hits: Int) {
+        guard await manager.installedPlugin(id: pluginId) != nil,
+              await manager.isPluginEnabled(pluginId) else {
+            return (nil, "not-installed", 0)
+        }
+        do {
+            switch pluginId {
+            case "njav":
+                // By construction (§13.4): the plugin's route
+                // IS the name — "/en/actor/" + the name with
+                // each space replaced by %20, the exact form
+                // mod08's cast chips emit. The normalize-equal
+                // gate is inherent: the route embeds the query
+                // name verbatim, so any films returned are
+                // njav's own resolution of that exact string.
+                let route = "/en/actor/" + name.replacingOccurrences(of: " ", with: "%20")
+                let page = try await list(pluginId: pluginId, slug: route, filters: ListFilters(), page: 1)
+                guard !page.items.isEmpty else { return (nil, "no-match", 0) }
+                return (ActorContribution(pluginId: pluginId, route: route, avatarUrl: nil, firstPage: page),
+                        "resolved", page.items.count)
+            case "missav", "123av":
+                // Search harvest (§13.4): walk page 1 of the
+                // plugin's own search IN ORDER, at most 3
+                // detail fetches total. An actress-index item
+                // whose title normalize-equals the query
+                // resolves the source with NO detail fetch
+                // spent; otherwise the first detail whose
+                // castEntries carry a routed entry whose name
+                // normalize-equals the query resolves it, and
+                // the route is that entry's route verbatim.
+                let results = try await search(pluginId: pluginId, keyword: name, page: 1)
+                var route: String?
+                var detailBudget = 3
+                for item in results.items {
+                    if item.quality == "ACTRESS", ActorName.matches(item.title, name) {
+                        route = item.id
+                        break
+                    }
+                    guard detailBudget > 0 else { continue }
+                    detailBudget -= 1
+                    guard let bundle = try? await detailMeta(pluginId: pluginId, movieId: item.id) else { continue }
+                    if let entry = bundle.detail.castEntries.first(where: { $0.route != nil && ActorName.matches($0.name, name) }) {
+                        route = entry.route
+                        break
+                    }
+                }
+                guard let resolvedRoute = route else { return (nil, "no-match", 0) }
+                let page = try await list(pluginId: pluginId, slug: resolvedRoute, filters: ListFilters(), page: 1)
+                return (ActorContribution(pluginId: pluginId, route: resolvedRoute, avatarUrl: nil, firstPage: page),
+                        "resolved", page.items.count)
+            case "topxx":
+                // Bounded index scan (§13.4): the route needs
+                // an `actor-<code>` the app cannot construct
+                // from a name, and topxx's movie search
+                // ignores its query (Phase 0, proven) — so
+                // resolution scans the actors index through
+                // the list surface, pages 1...8, stopping at
+                // the first ACTRESS item whose title
+                // normalize-equals the query. Its id is the
+                // route; its posterUrl is the actor record's
+                // avatar field (the plugin maps it there).
+                var route: String?
+                var avatarUrl: String?
+                for indexPage in 1...8 {
+                    let page = try await list(pluginId: pluginId, slug: "actors", filters: ListFilters(), page: indexPage)
+                    if let hit = page.items.first(where: { $0.quality == "ACTRESS" && ActorName.matches($0.title, name) }) {
+                        route = hit.id
+                        avatarUrl = hit.posterUrl.isEmpty ? nil : hit.posterUrl
+                        break
+                    }
+                }
+                guard let resolvedRoute = route else { return (nil, "unresolved-cap", 0) }
+                let page = try await list(pluginId: pluginId, slug: resolvedRoute, filters: ListFilters(), page: 1)
+                return (ActorContribution(pluginId: pluginId, route: resolvedRoute, avatarUrl: avatarUrl, firstPage: page),
+                        "resolved", page.items.count)
+            default:
+                return (nil, "no-match", 0)
+            }
+        } catch {
+            let nsError = error as NSError
+            return (nil, "error \(nsError.domain)#\(nsError.code)", 0)
+        }
+    }
+}
+
+/// The §13 merge engine — a per-visit object the actor
+/// shells create and observe. It lives in the shared core
+/// so the merge discipline exists exactly once; the shells
+/// mirror its published state into their own `@State` in
+/// their own idioms.
+@MainActor
+final class ActorMergeCoordinator {
+    private(set) var rows: [ActorFilmRow] = []
+    /// Plugin ids with ≥1 row on screen, origin first when it
+    /// contributed, then canonical order — the header naming set
+    /// (§13.1a). A resolved-but-zero-row source never appears here.
+    private(set) var contributors: [String] = []
+    private(set) var avatarUrl: String?      // §13.1e (topxx only)
+    private(set) var originFailed = false
+    private(set) var settled = false         // merge fully settled
+    var onChange: (() -> Void)?
+
+    /// The origin page's own list slug. The spec's init
+    /// carries no route, but the coordinator owns the
+    /// origin's pagination cursor (§13.5), so the shells
+    /// assign this once, before `begin`.
+    var originRoute: String = ""
+
+    private let service: MovieService
+    private let originPluginId: String
+    private let name: String
+    private let targets: [String]
+
+    private var began = false
+    private var frozen = false
+    private var beginDate: Date?
+    private var dedupedCount = 0
+    private var seenCodes: Set<String> = []
+    private var seenIds: [String: Set<String>] = [:]
+    private var contributedTargets: Set<String> = []
+
+    /// Per-source pagination cursor (the origin included,
+    /// seeded from the handed page 1).
+    private struct Cursor {
+        var route: String
+        var page: Int
+        var totalPages: Int
+        var exhausted: Bool
+    }
+    private var cursors: [String: Cursor] = [:]
+
+    private enum TargetState {
+        case pending
+        case settled(ActorContribution?)
+    }
+    private var targetStates: [String: TargetState] = [:]
+    private var releaseIndex = 0
+    private var targetTasks: [String: Task<Void, Never>] = [:]
+    private var budgetTask: Task<Void, Never>?
+    private var isLoadingMore = false
+
+    init(service: MovieService, originPluginId: String, name: String) {
+        self.service = service
+        self.originPluginId = originPluginId
+        self.name = name
+        self.targets = ActorMerge.targets(for: originPluginId)
+    }
+
+    /// Seed with the origin's page-1 outcome (the shells load it with
+    /// today's exact call and error handling) and start the targets.
+    /// nil page + originFailed=true is the origin-error entry.
+    func begin(originFirstPage: ListPage?, originFailed: Bool) {
+        guard !began else { return }
+        began = true
+        self.originFailed = originFailed
+        beginDate = Date()
+        DiagLog.log("actor", "merge begin origin=\(originPluginId) name=\(name) targets=\(targets.joined(separator: ","))")
+        if let page = originFirstPage {
+            cursors[originPluginId] = Cursor(route: originRoute,
+                                             page: page.pagination.currentPage,
+                                             totalPages: max(page.pagination.totalPages, 1),
+                                             exhausted: false)
+            appendBlock(pluginId: originPluginId, movies: page.items, isOrigin: true)
+        } else {
+            cursors[originPluginId] = Cursor(route: originRoute, page: 1, totalPages: 1, exhausted: true)
+        }
+        // §13.3: an empty normalized query never runs the
+        // merge at all — the page is exactly today's.
+        guard !ActorName.normalize(name).isEmpty else {
+            settled = true
+            logSettled()
+            onChange?()
+            return
+        }
+        for target in targets {
+            targetStates[target] = .pending
+            targetTasks[target] = Task { [weak self] in
+                guard let self else { return }
+                await self.resolveTarget(target)
+            }
+        }
+        budgetTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(45))
+            guard let self, !Task.isCancelled else { return }
+            self.enforceTotalBudget()
+        }
+        onChange?()
+    }
+
+    /// Lockstep pagination (§13.5): the next page of EVERY
+    /// non-exhausted source in parallel (each under the same
+    /// 20 s ceiling; a failed page marks that source
+    /// exhausted, non-fatally, per the house discipline),
+    /// then the new rows append in canonical block order
+    /// under the same dedupe rules. Pagination defers until
+    /// the merge has settled — page-N rows never precede an
+    /// unreleased page-1 block (see the guard in the body).
+    /// In the finished-solo outcome this reduces to exactly
+    /// today's origin-only loadMore.
+    func loadMore() async {
+        // Ordered release governs pagination too (§13.1g,
+        // gate fix F-A5): while the merge is unsettled, some
+        // page-1 block may still be unreleased — a settled
+        // target's cursor is installed at settle time, BEFORE
+        // its block necessarily released — and a page-N append
+        // could land ahead of that block, or dedupe against a
+        // seen-set missing the block's codes and invert the
+        // first-occurrence winner rule (the page-2 copy would
+        // survive and the page-1 copy drop). Once settled,
+        // every block is released by construction
+        // (finishIfSettled requires releaseIndex ==
+        // targets.count), so pagination proceeds under the
+        // complete seen-set and the winner rule holds across
+        // pages.
+        guard began, !frozen, !isLoadingMore, settled else { return }
+        let orderedIds = [originPluginId] + targets
+        var fetchList: [(pluginId: String, route: String, page: Int)] = []
+        for pluginId in orderedIds {
+            guard let cursor = cursors[pluginId], !cursor.exhausted,
+                  cursor.page >= 1, cursor.page < cursor.totalPages else { continue }
+            if pluginId != originPluginId, !contributedTargets.contains(pluginId) { continue }
+            fetchList.append((pluginId: pluginId, route: cursor.route, page: cursor.page + 1))
+        }
+        guard !fetchList.isEmpty else { return }
+        isLoadingMore = true
+        defer { isLoadingMore = false }
+        var results: [String: ListPage?] = [:]
+        await withTaskGroup(of: (String, ListPage?).self) { group in
+            for entry in fetchList {
+                group.addTask {
+                    let page = await self.fetchPageWithCeiling(entry)
+                    return (entry.pluginId, page)
+                }
+            }
+            for await (pluginId, page) in group {
+                results[pluginId] = page
+            }
+        }
+        guard !frozen else { return }
+        for pluginId in orderedIds {
+            guard fetchList.contains(where: { $0.pluginId == pluginId }) else { continue }
+            if let fetched = results[pluginId], let page = fetched {
+                cursors[pluginId]?.page = page.pagination.currentPage
+                cursors[pluginId]?.totalPages = max(page.pagination.totalPages, 1)
+                appendBlock(pluginId: pluginId, movies: page.items, isOrigin: pluginId == originPluginId)
+            } else {
+                cursors[pluginId]?.exhausted = true
+            }
+        }
+        DiagLog.log("actor", "merge more total=\(rows.count)")
+        onChange?()
+    }
+
+    /// §13.1g: a film Detail was pushed — discard everything late.
+    func freeze() {
+        guard !frozen else { return }
+        frozen = true
+        for task in targetTasks.values { task.cancel() }
+        budgetTask?.cancel()
+    }
+
+    // MARK: Target resolution
+
+    private struct TargetResult {
+        var contribution: ActorContribution?
+        var outcome: String
+        var hits: Int
+    }
+
+    private func resolveTarget(_ pluginId: String) async {
+        let started = Date()
+        let result = await runTargetWithCeiling(pluginId)
+        guard !frozen else { return }
+        guard let state = targetStates[pluginId], case .pending = state else { return }
+        DiagLog.log("actor", "merge source=\(pluginId) outcome=\(result.outcome) hits=\(result.hits) ms=\(Self.ms(since: started))")
+        targetStates[pluginId] = .settled(result.contribution)
+        if let contribution = result.contribution {
+            contributedTargets.insert(pluginId)
+            cursors[pluginId] = Cursor(route: contribution.route,
+                                       page: contribution.firstPage.pagination.currentPage,
+                                       totalPages: max(contribution.firstPage.pagination.totalPages, 1),
+                                       exhausted: false)
+        }
+        releaseReadyBlocks()
+        finishIfSettled()
+        onChange?()
+    }
+
+    /// One target under its 20 s ceiling (§13.5), enforced
+    /// with the task-group race idiom of §2.5: the resolution
+    /// races a sleep that throws `timedOut`; the loser is
+    /// cancelled. Never throws — timeout is an outcome.
+    private func runTargetWithCeiling(_ pluginId: String) async -> TargetResult {
+        do {
+            return try await withThrowingTaskGroup(of: TargetResult.self) { group in
+                group.addTask {
+                    let detailed = await self.service.actorContributionDetailed(pluginId: pluginId, name: self.name)
+                    return TargetResult(contribution: detailed.contribution, outcome: detailed.outcome, hits: detailed.hits)
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 20_000_000_000)
+                    throw MovieServiceError.timedOut
+                }
+                let first = try await group.next()!
+                group.cancelAll()
+                return first
+            }
+        } catch {
+            return TargetResult(contribution: nil, outcome: "timeout", hits: 0)
+        }
+    }
+
+    /// One pagination fetch under the same 20 s ceiling;
+    /// nil on timeout or any failure (the caller marks the
+    /// source exhausted, non-fatally).
+    private func fetchPageWithCeiling(_ entry: (pluginId: String, route: String, page: Int)) async -> ListPage? {
+        do {
+            return try await withThrowingTaskGroup(of: ListPage.self) { group in
+                group.addTask {
+                    try await self.service.list(pluginId: entry.pluginId, slug: entry.route,
+                                                filters: ListFilters(), page: entry.page)
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 20_000_000_000)
+                    throw MovieServiceError.timedOut
+                }
+                let first = try await group.next()!
+                group.cancelAll()
+                return first
+            }
+        } catch {
+            return nil
+        }
+    }
+
+    /// The 45 s total merge budget (§13.5): any target still
+    /// unsettled is treated as settled-empty for release
+    /// purposes and its late result is discarded (its state
+    /// is already settled when the completion lands, so the
+    /// completion drops it without a second log line).
+    private func enforceTotalBudget() {
+        guard !frozen, !settled else { return }
+        var forced = false
+        for target in targets {
+            guard let state = targetStates[target], case .pending = state else { continue }
+            DiagLog.log("actor", "merge source=\(target) outcome=timeout hits=0 ms=\(Self.ms(since: beginDate ?? Date()))")
+            targetStates[target] = .settled(nil)
+            targetTasks[target]?.cancel()
+            forced = true
+        }
+        if forced {
+            releaseReadyBlocks()
+            finishIfSettled()
+            onChange?()
+        }
+    }
+
+    // MARK: Ordered release + dedupe
+
+    /// Ordered release (§13.1g): target blocks append whole,
+    /// in canonical order — a block appends only when it AND
+    /// every earlier target block have settled (resolved,
+    /// failed, or timed out). The origin's rows published in
+    /// `begin`, the moment the origin settled.
+    private func releaseReadyBlocks() {
+        while releaseIndex < targets.count {
+            let target = targets[releaseIndex]
+            guard let state = targetStates[target], case .settled(let contribution) = state else { return }
+            releaseIndex += 1
+            guard let contribution else { continue }
+            if target == "topxx", let avatar = contribution.avatarUrl {
+                avatarUrl = avatar
+            }
+            appendBlock(pluginId: target, movies: contribution.firstPage.items, isOrigin: false)
+        }
+    }
+
+    /// Appends one source block at the end under the §13.5
+    /// dedupe rules: the ORIGIN's rows are authoritative and
+    /// never deduped against each other (their codes only
+    /// seed the seen-set); a target block drops an incoming
+    /// row whose code is already seen (from the origin or an
+    /// earlier block) and counts it, first occurrence within
+    /// the block winning; rows whose code is nil are never
+    /// deduped. Every block is also deduped by id within its
+    /// source — row identity is plugin+id, so a repeated id
+    /// is never a distinct row.
+    private func appendBlock(pluginId: String, movies: [Movie], isOrigin: Bool) {
+        var ids = seenIds[pluginId] ?? []
+        var appended = 0
+        for movie in movies {
+            guard ids.insert(movie.id).inserted else { continue }
+            if isOrigin {
+                if let code = BaseCode.extract(movieId: movie.id, title: movie.title) {
+                    seenCodes.insert(code)
+                }
+            } else if let code = BaseCode.extract(movieId: movie.id, title: movie.title) {
+                guard seenCodes.insert(code).inserted else {
+                    dedupedCount += 1
+                    continue
+                }
+            }
+            rows.append(ActorFilmRow(pluginId: pluginId, movie: movie))
+            appended += 1
+        }
+        seenIds[pluginId] = ids
+        if appended > 0 { noteContribution(pluginId) }
+    }
+
+    /// Contributors are always named origin-first (when it
+    /// contributed), then in canonical order (§13.1a) —
+    /// maintained as a re-derived order, so an origin that
+    /// first contributes on a later page still leads.
+    private func noteContribution(_ pluginId: String) {
+        guard !contributors.contains(pluginId) else { return }
+        var present = Set(contributors)
+        present.insert(pluginId)
+        var ordered: [String] = []
+        if present.contains(originPluginId) { ordered.append(originPluginId) }
+        for id in ActorMerge.canonicalOrder where id != originPluginId && present.contains(id) {
+            ordered.append(id)
+        }
+        contributors = ordered
+    }
+
+    private func finishIfSettled() {
+        guard !settled, releaseIndex >= targets.count else { return }
+        settled = true
+        budgetTask?.cancel()
+        logSettled()
+    }
+
+    private func logSettled() {
+        let names = contributors.isEmpty ? "none" : contributors.joined(separator: ",")
+        DiagLog.log("actor", "merge settled total=\(rows.count) contributors=\(names) deduped=\(dedupedCount) ms=\(Self.ms(since: beginDate ?? Date()))")
+    }
+
+    private static func ms(since start: Date) -> Int {
+        Int(Date().timeIntervalSince(start) * 1000)
     }
 }
 

@@ -67,6 +67,20 @@ enum DebridError: LocalizedError {
 /// else is flagged `useCompatEngine` and the resolver screen routes
 /// it to the KSPlayer (FFmpeg) surface, which opens MKV/AVI
 /// natively.
+/// Phase events for the torrent wait line (spec §5.3):
+/// emitted ONLY by `DebridResolver.resolve(hash:onPhase:)` —
+/// the probe-only and provider-pinned entry points stay
+/// silent. Tokens are the providers' DiagLog log tokens
+/// (e.g. ["torbox", "premiumize"]), not the tvOS-only
+/// `Provider` enum, so this type exists identically in both
+/// cores; shells map tokens to display names with their own
+/// tables.
+enum DebridPhaseEvent: Sendable, Equatable {
+    case probing
+    case downloading(providers: [String])
+    case finished
+}
+
 enum DebridResolver {
     // MARK: Provider switch types (L-T13, 1.3.1 — tvOS adaptation)
 
@@ -134,12 +148,14 @@ enum DebridResolver {
     /// instead of an endless spinner.
     private static let budget: TimeInterval = 900
 
-    static func resolve(hash: String) async throws -> StreamInfo {
+    static func resolve(hash: String, onPhase: (@Sendable (DebridPhaseEvent) -> Void)? = nil) async throws -> StreamInfo {
         // v1.22.15 (B-2): phase logging for the silent debrid
         // subsystem (H-1, V-14). Log lines only — provider +
         // phase + outcome kind, error kind as NSError
         // domain#code; never tokens, URLs, hashes or raw error
         // text (DiagLog law). No flow, order or budget changes.
+        onPhase?(.probing)
+        defer { onPhase?(.finished) }
         let clean = hash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard clean.count >= 32 else {
             DiagLog.log("debrid", "provider=all phase=resolve outcome=invalid-hash")
@@ -151,6 +167,15 @@ enum DebridResolver {
             throw DebridError.noToken
         }
         DiagLog.log("debrid", "provider=all phase=resolve outcome=start")
+        // P5 (spec §5.1): RD's probe has returned 403
+        // disabled_endpoint on every call since L-T15 — the
+        // automatic path no longer probes or resolves through
+        // RD at all. The token, the Settings fields and the
+        // provider functions are retained (a manual pin still
+        // runs RD's flow); only the automatic legs are out.
+        if !rd.isEmpty {
+            DiagLog.log("debrid", "provider=rd phase=probe outcome=skipped reason=disabled-endpoint")
+        }
         var lastError: Error = DebridError.noToken
         var attempted: Set<String> = []
 
@@ -163,14 +188,6 @@ enum DebridResolver {
             do { return try await resolveTorBox(hash: clean, token: tb) }
             catch {
                 DiagLog.log("debrid", "provider=torbox phase=resolve-cached outcome=error kind=\((error as NSError).domain)#\((error as NSError).code)")
-                lastError = error
-            }
-        }
-        if !rd.isEmpty, await rdIsAvailable(hash: clean, token: rd) {
-            attempted.insert("rd")
-            do { return try await resolveRD(hash: clean, token: rd) }
-            catch {
-                DiagLog.log("debrid", "provider=rd phase=resolve-cached outcome=error kind=\((error as NSError).domain)#\((error as NSError).code)")
                 lastError = error
             }
         }
@@ -197,29 +214,80 @@ enum DebridResolver {
             }
         }
 
-        // Phase 2 — nobody has it cached: the proven v1.21 chain
-        // shape (each flow with its own full budget), in the
-        // owner's priority order TorBox → Real-Debrid →
-        // Premiumize. Providers already attempted in phase 1 are
-        // not re-run: their flow is identical, only slower.
-        if !tb.isEmpty && !attempted.contains("tb") {
+        // Phase 2 — nobody has it cached (P2, spec §5.2):
+        // candidates are the configured providers not attempted
+        // in Phase 1, RD excluded (P5). Two candidates RACE —
+        // both flows start together, each keeping its own
+        // 900 s budget anchored at Phase-2 entry; the first
+        // success wins and returns immediately, the loser is
+        // cancelled locally (its server-side transfer continues
+        // account-side and may serve a later play via the
+        // Phase-1 cache probe). Both failing throws
+        // Premiumize's error — the same error the old serial
+        // order (TorBox → Premiumize) surfaced last. One
+        // candidate runs alone. `DebridError.downloading` from
+        // a leg is that leg's failure. The `attempted` rule is
+        // preserved verbatim: a provider whose Phase-1 cached
+        // flow ran and failed does NOT join Phase 2.
+        let phase2Start = Date()
+        var phase2Tokens: [String] = []
+        if !tb.isEmpty && !attempted.contains("tb") { phase2Tokens.append("torbox") }
+        if !pm.isEmpty { phase2Tokens.append("premiumize") }
+        if !phase2Tokens.isEmpty {
+            DiagLog.log("debrid", "provider=all phase=phase2 mode=\(phase2Tokens.count > 1 ? "race" : "single") providers=\(phase2Tokens.joined(separator: ","))")
+            onPhase?(.downloading(providers: phase2Tokens))
+        }
+        if phase2Tokens.count == 2 {
+            let box = DebridPhase2RaceBox(providers: phase2Tokens)
+            let outcome = await withTaskCancellationHandler {
+                await withCheckedContinuation { (continuation: CheckedContinuation<DebridPhase2RaceBox.Outcome, Never>) in
+                    box.arm(continuation)
+                    let torboxTask = Task {
+                        do {
+                            let stream = try await resolveTorBox(hash: clean, token: tb)
+                            box.succeed(stream)
+                        } catch {
+                            DiagLog.log("debrid", "provider=torbox phase=resolve outcome=error kind=\((error as NSError).domain)#\((error as NSError).code)")
+                            if let remaining = box.fail(provider: "torbox", error: error) {
+                                onPhase?(.downloading(providers: remaining))
+                            }
+                        }
+                    }
+                    let premiumizeTask = Task {
+                        do {
+                            let stream = try await resolvePremiumize(hash: clean, token: pm,
+                                                                      deadline: phase2Start.addingTimeInterval(budget))
+                            box.succeed(stream)
+                        } catch {
+                            DiagLog.log("debrid", "provider=premiumize phase=resolve outcome=error kind=\((error as NSError).domain)#\((error as NSError).code)")
+                            if let remaining = box.fail(provider: "premiumize", error: error) {
+                                onPhase?(.downloading(providers: remaining))
+                            }
+                        }
+                    }
+                    box.attach(tasks: [torboxTask, premiumizeTask])
+                }
+            } onCancel: {
+                box.cancel()
+            }
+            switch outcome {
+            case .success(let stream):
+                return stream
+            case .failed(let failures):
+                lastError = failures["premiumize"] ?? lastError
+            case .cancelled:
+                throw CancellationError()
+            }
+        } else if phase2Tokens == ["torbox"] {
             do { return try await resolveTorBox(hash: clean, token: tb) }
             catch {
                 DiagLog.log("debrid", "provider=torbox phase=resolve outcome=error kind=\((error as NSError).domain)#\((error as NSError).code)")
                 lastError = error
             }
-        }
-        if !rd.isEmpty && !attempted.contains("rd") {
-            do { return try await resolveRD(hash: clean, token: rd) }
-            catch {
-                DiagLog.log("debrid", "provider=rd phase=resolve outcome=error kind=\((error as NSError).domain)#\((error as NSError).code)")
-                lastError = error
-            }
-        }
-        if !pm.isEmpty {
+        } else if phase2Tokens == ["premiumize"] {
             do {
                 return try await resolvePremiumize(hash: clean, token: pm,
-                                                    deadline: Date().addingTimeInterval(budget))
+                                                    deadline: phase2Start.addingTimeInterval(budget))
             } catch {
                 DiagLog.log("debrid", "provider=premiumize phase=resolve outcome=error kind=\((error as NSError).domain)#\((error as NSError).code)")
                 lastError = error
@@ -232,8 +300,8 @@ enum DebridResolver {
     /// NEXT-D D5 (tvOS-only divergence, 1.3.0): PROBE-ONLY
     /// resolve for the Detail backdrop preview. Runs the same
     /// Phase-1 cache probes as `resolve(hash:)` (TorBox
-    /// checkcached → RD instantAvailability → Premiumize
-    /// directdl), and when a provider reports the title cached
+    /// checkcached → Premiumize directdl — RD dropped, §5.1),
+    /// and when a provider reports the title cached
     /// it resolves through that provider's normal flow, exactly
     /// like Phase 1. It NEVER reaches the Phase-2 download
     /// chain: when no provider reports the title cached it
@@ -269,16 +337,10 @@ enum DebridResolver {
             }
         }
         if Task.isCancelled { return nil }
-        if !rd.isEmpty, await rdIsAvailable(hash: clean, token: rd) {
-            if Task.isCancelled { return nil }
-            do {
-                return try await resolveRD(hash: clean, token: rd)
-            } catch is CancellationError {
-                return nil
-            } catch {
-                // Same fall-through as TorBox above.
-            }
-        }
+        // P5 tvOS delta (spec §5.1): the RD leg is dropped —
+        // resolveCachedOnly never probes RD (its endpoint is
+        // disabled); a manual provider pin still runs RD's
+        // flow through resolve(hash:provider:).
         if Task.isCancelled { return nil }
         if !pm.isEmpty {
             // premiumizeDirectDL IS the probe: it returns the
@@ -320,8 +382,12 @@ enum DebridResolver {
         if rd.isEmpty {
             probes.append(ProviderProbe(provider: .realDebrid, state: .notConfigured))
         } else {
-            probes.append(ProviderProbe(provider: .realDebrid,
-                                        state: await rdCacheState(hash: clean, token: rd)))
+            // P5 tvOS delta (spec §5.1): RD's row is reported
+            // as .probeError WITHOUT a network call — the same
+            // visible state as today's real 403 from the
+            // disabled endpoint, at zero network cost.
+            DiagLog.log("debrid", "provider=rd phase=probe outcome=skipped reason=disabled-endpoint")
+            probes.append(ProviderProbe(provider: .realDebrid, state: .probeError))
         }
         if Task.isCancelled { return probes }
         if pm.isEmpty {
@@ -910,5 +976,107 @@ enum DebridResolver {
         let best = valid.max(by: { $0.bytes < $1.bytes })!
         DiagLog.log("debrid", "provider=shared phase=pick outcome=ok")
         return (best.id, best.path)
+    }
+}
+/// Resume-once box for the Phase-2 provider race (spec §5.2):
+/// the first leg to succeed resumes the waiting resolve at
+/// once and cancels the loser locally; a leg failure resumes
+/// only when it was the last leg standing. Two unstructured
+/// tasks + this box is the house race idiom (TVNetProbe's DNS
+/// race / TVSourceProbe) — a throwing task group would cancel
+/// its sibling and its exit would await a loser stuck in a
+/// long request. The NSLock is the whole confinement story,
+/// so the `@unchecked Sendable` states exactly that.
+private final class DebridPhase2RaceBox: @unchecked Sendable {
+    enum Outcome {
+        case success(StreamInfo)
+        case failed([String: Error])
+        case cancelled
+    }
+
+    private let lock = NSLock()
+    private let providers: [String]
+    private var continuation: CheckedContinuation<Outcome, Never>?
+    private var resumed = false
+    private var failures: [String: Error] = [:]
+    private var tasks: [Task<Void, Never>] = []
+
+    init(providers: [String]) {
+        self.providers = providers
+    }
+
+    /// Called once, before either leg is created — a
+    /// happens-before edge. If cancellation already resumed
+    /// the box, the continuation is resumed on the spot
+    /// (the PrefetchJoinBox setContinuation pattern).
+    func arm(_ continuation: CheckedContinuation<Outcome, Never>) {
+        lock.lock()
+        if resumed {
+            lock.unlock()
+            continuation.resume(returning: .cancelled)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func attach(tasks: [Task<Void, Never>]) {
+        lock.lock()
+        self.tasks = tasks
+        let alreadyResumed = resumed
+        lock.unlock()
+        if alreadyResumed { tasks.forEach { $0.cancel() } }
+    }
+
+    func succeed(_ stream: StreamInfo) {
+        lock.lock()
+        guard !resumed else { lock.unlock(); return }
+        resumed = true
+        let continuation = self.continuation
+        self.continuation = nil
+        let tasks = self.tasks
+        lock.unlock()
+        tasks.forEach { $0.cancel() }
+        continuation?.resume(returning: .success(stream))
+    }
+
+    /// Records one leg's failure. Returns the surviving
+    /// provider tokens when the race continues (so the caller
+    /// can re-emit the phase event naming the survivor), nil
+    /// when the race is over — either this failure was the
+    /// last leg's (resumed here with every failure) or a
+    /// winner already resumed the box.
+    func fail(provider: String, error: Error) -> [String]? {
+        lock.lock()
+        failures[provider] = error
+        let remaining = providers.filter { failures[$0] == nil }
+        if remaining.isEmpty {
+            guard !resumed else { lock.unlock(); return nil }
+            resumed = true
+            let continuation = self.continuation
+            self.continuation = nil
+            let allFailures = failures
+            lock.unlock()
+            continuation?.resume(returning: .failed(allFailures))
+            return nil
+        }
+        let alreadyResumed = resumed
+        lock.unlock()
+        return alreadyResumed ? nil : remaining
+    }
+
+    /// Outer cancellation: cancel both legs locally and
+    /// resume as cancelled (the caller throws
+    /// CancellationError).
+    func cancel() {
+        lock.lock()
+        guard !resumed else { lock.unlock(); return }
+        resumed = true
+        let continuation = self.continuation
+        self.continuation = nil
+        let tasks = self.tasks
+        lock.unlock()
+        tasks.forEach { $0.cancel() }
+        continuation?.resume(returning: .cancelled)
     }
 }

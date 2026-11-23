@@ -544,15 +544,24 @@ struct StreamInfo: Codable {
     /// resolved file's container is one AVFoundation cannot open
     /// (MKV/AVI/…). Plugin payloads decode it as false.
     var useCompatEngine: Bool = false
+    /// Ranked alternate stream URLs for the same title
+    /// (spec §3.2: the missav plugin emits the ranked surrit
+    /// candidates beyond the primary as `alternateURLs`); the
+    /// pre-flight walk tries them in order when the primary
+    /// is refused. Additive + defaulted, decode-if-present —
+    /// plugins that don't emit it decode [] (Phase 2 pattern).
+    var alternateURLs: [String] = []
 
-    enum CodingKeys: String, CodingKey { case url, headers, subtitles, images, isEmbed, postBody, requiresProxy, useCompatEngine }
+    enum CodingKeys: String, CodingKey { case url, headers, subtitles, images, isEmbed, postBody, requiresProxy, useCompatEngine, alternateURLs }
 
     init(url: String = "", headers: [String: String] = [:],
          subtitles: [SubtitleTrack] = [], images: [String] = [], isEmbed: Bool = false,
-         postBody: String? = nil, requiresProxy: Bool = false, useCompatEngine: Bool = false) {
+         postBody: String? = nil, requiresProxy: Bool = false, useCompatEngine: Bool = false,
+         alternateURLs: [String] = []) {
         self.url = url; self.headers = headers; self.subtitles = subtitles
         self.images = images; self.isEmbed = isEmbed; self.postBody = postBody
         self.requiresProxy = requiresProxy; self.useCompatEngine = useCompatEngine
+        self.alternateURLs = alternateURLs
     }
 
     init(from decoder: Decoder) throws {
@@ -565,6 +574,7 @@ struct StreamInfo: Codable {
         postBody = try c.decodeIfPresent(String.self, forKey: .postBody) ?? nil
         requiresProxy = try c.decodeIfPresent(Bool.self, forKey: .requiresProxy) ?? false
         useCompatEngine = try c.decodeIfPresent(Bool.self, forKey: .useCompatEngine) ?? false
+        alternateURLs = try c.decodeIfPresent([String].self, forKey: .alternateURLs) ?? []
     }
 
     var streamURL: URL? { url.isEmpty ? nil : URL(string: url) }
@@ -634,11 +644,14 @@ struct SearchRoute: Hashable {
 /// Navigation route to an actor filmography screen (Phase 2):
 /// pushed by a routed cast chip of a FULL-scope plugin only.
 /// `route` is the plugin-native actor slug the plugin's list
-/// endpoint consumes (see CastEntry); the filmography is
-/// source-native — the same name in another plugin is a
-/// different, unrelated route (no cross-plugin merging, owner
-/// ruling). Carries no portrait: almost no source supplies
-/// one, and the screens render the no-photo header by default.
+/// endpoint consumes (see CastEntry), and the route stays the
+/// ORIGIN source's own. Since 1.3.6 (SPEC-136-FALLBACK §13,
+/// owner ruling 2026-11-22) the page the chip opens merges
+/// the other actor-capable sources' filmographies INSIDE
+/// the page — the merge never happens at the chip, and this
+/// route's meaning is unchanged. Carries no portrait: almost
+/// no source supplies one, and the screens render the
+/// no-photo header by default.
 struct ActorRoute: Hashable {
     let pluginId: String
     let name: String
@@ -664,6 +677,88 @@ enum ActorScope {
 
     static func isFull(pluginId: String) -> Bool {
         fullPlugins.contains(pluginId)
+    }
+}
+
+enum FallbackCatalog {
+    /// Plugins whose titles are indexed by a base catalogue code and whose
+    /// failure can start a fallback. (Plan §2, RESEARCH-SOURCE-HEALTH.)
+    static let origins: Set<String> = ["missav", "123av", "njav", "avdbapi"]
+    /// Plugins whose resolved playlist is pre-flighted (§3): their known
+    /// failure mode is a playlist-level refusal. 123av is excluded — its
+    /// failure is page-level transport, and its resolved streams come from
+    /// embed wrappers where a playlist pre-flight is meaningless.
+    static let preflightSet: Set<String> = ["missav", "njav", "avdbapi"]
+    /// Ordered fallback targets per origin (health order per
+    /// RESEARCH-SOURCE-HEALTH: the sources most likely to actually play
+    /// first). JavGuru joins this table when its plugin ships (post-probe
+    /// build); jav.spa is excluded permanently (helvid-walled playback —
+    /// RESEARCH-NJAV addendum).
+    static func targets(for origin: String) -> [String] {
+        switch origin {
+        case "missav":  return ["123av", "njav", "avdbapi"]
+        case "123av":   return ["missav", "njav", "avdbapi"]
+        case "njav":    return ["123av", "missav", "avdbapi"]
+        case "avdbapi": return ["123av", "missav", "njav"]
+        default:        return []
+        }
+    }
+}
+
+// MARK: - Cross-source actor merge (spec §13, 1.3.6)
+
+enum ActorMerge {
+    /// The actor-capable sources, in the ONE canonical order used for
+    /// target sequencing, dedupe priority, and header naming (§13.1a).
+    /// This is ActorScope.fullPlugins as an ordered list — a different
+    /// set from FallbackCatalog (§2.1): topxx is actor-capable but not
+    /// a fallback origin; avdbapi is a fallback origin but SEARCH-ONLY
+    /// for actors and never merges (§13.13).
+    static let canonicalOrder: [String] = ["missav", "123av", "njav", "topxx"]
+
+    /// Merge targets for an actor page: every actor-capable source
+    /// except the page's origin, in canonical order.
+    static func targets(for origin: String) -> [String] {
+        canonicalOrder.filter { $0 != origin }
+    }
+}
+
+/// One row of the merged filmography: a film plus the source that
+/// contributed it. Row identity on both shells is
+/// "\(pluginId)#\(movie.id)" — Movie.id is unique only within its
+/// own plugin, so the bare id can never key a merged list.
+struct ActorFilmRow {
+    let pluginId: String
+    let movie: Movie
+}
+
+enum ActorName {
+    /// Case fold + diacritic fold, every punctuation character becomes
+    /// a space, whitespace runs collapse to one space, ends trimmed.
+    /// TOKEN ORDER IS SIGNIFICANT and preserved. No substring, prefix,
+    /// edit-distance, or word-order-insensitive matching exists
+    /// anywhere in this feature.
+    static func normalize(_ raw: String) -> String {
+        let folded = raw.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+        var spaced = ""
+        spaced.reserveCapacity(folded.count)
+        for scalar in folded.unicodeScalars {
+            if CharacterSet.punctuationCharacters.contains(scalar) {
+                spaced.append(" ")
+            } else {
+                spaced.unicodeScalars.append(scalar)
+            }
+        }
+        return spaced.split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+            .joined(separator: " ")
+    }
+
+    /// The gate. An empty normalized form never matches anything,
+    /// including another empty form.
+    static func matches(_ a: String, _ b: String) -> Bool {
+        let na = normalize(a), nb = normalize(b)
+        return !na.isEmpty && na == nb
     }
 }
 

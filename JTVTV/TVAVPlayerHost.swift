@@ -737,8 +737,12 @@ struct TVAVPlayerHost: UIViewControllerRepresentable {
                             capturedPosition: (now.isFinite && now > 0) ? now : nil)
                     })
                 }
+                // §1A (1.3.6): the menu title carries the
+                // PLAYING plugin's name once (rows are episode
+                // names and cannot).
+                let playingName = session.playingPluginName
                 let switchMenu = UIMenu(
-                    title: "Đổi nguồn",
+                    title: playingName.isEmpty ? "Đổi nguồn" : "Đổi nguồn · \(playingName)",
                     image: UIImage(systemName: "arrow.triangle.2.circlepath"),
                     children: switchChildren)
                 children.append(switchMenu)

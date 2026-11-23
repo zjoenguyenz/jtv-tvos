@@ -591,8 +591,15 @@ struct TVSearchResultsView: View {
             totalPages = max(result.pagination.totalPages, 1)
         } catch {
             guard gen == loadGeneration else { return }
-            loadError = "Tìm kiếm thất bại"
-            DiagLog.log("search", "results failed plugin=\(pluginId) kind=\((error as NSError).domain)#\((error as NSError).code)")
+            // L-15: cancellation is not an error — a
+            // torn-down instance stays silent instead of
+            // surfacing a failure.
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                DiagLog.log("search", "results cancelled plugin=\(pluginId)")
+            } else {
+                loadError = "Tìm kiếm thất bại"
+                DiagLog.log("search", "results failed plugin=\(pluginId) kind=\((error as NSError).domain)#\((error as NSError).code)")
+            }
         }
         guard gen == loadGeneration else { return }
         isLoading = false
