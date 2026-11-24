@@ -459,10 +459,30 @@ struct TVActorView: View {
 
     @ViewBuilder
     private var gridZone: some View {
-        if isLoading && rows.isEmpty {
-            ProgressView()
-                .tint(.white)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        if (isLoading || !didLoad) && rows.isEmpty {
+            // L-T37 hardening (gate Round 1, Lens 3 Finding
+            // 1+2): this branch must own a focusable element
+            // from the first frame. A bare ProgressView left
+            // the whole surface without a focus owner for the
+            // entire page-1 fetch — and for the pre-.task
+            // frames and the cancelled-reload state, which
+            // share this branch now that its condition also
+            // covers !didLoad — and a Menu press with no
+            // seated focus can fall through to the system
+            // (the app leaves the foreground) instead of
+            // reaching this surface's arbiter. The Quay lại
+            // chip is the same focus holder the running-at-0
+            // and empty branches below already use, in the
+            // same waiting-state layout.
+            VStack(alignment: .leading, spacing: 22) {
+                ProgressView()
+                    .tint(.white)
+                backChipRow
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .focusSection()
+            .prefersDefaultFocus(true, in: focusNS)
         } else if let loadError, rows.isEmpty && mergeFullySettled {
             // Audit P-4: the actor grid's failure uses the
             // shared error surface with the A-9 default-focus
@@ -751,35 +771,51 @@ struct TVActorView: View {
         // this reload's mirrors.
         mergeCoordinator?.freeze()
         // Fresh coordinator per reload (§13.8). Its onChange
-        // mirrors the published state into this view's @State;
-        // the capture list binds the @State wrappers directly
-        // (not the view value), so no view ↔ coordinator
-        // retain cycle forms through the mergeCoordinator
-        // storage — and the coordinator itself is captured
-        // WEAKLY (gate fix F-A2): the closure lives ON the
-        // coordinator, so a strong capture would close a
+        // mirrors the published state into this view's @State
+        // through the six Bindings captured below (L-T36 fix —
+        // see the note at the capture). The coordinator itself
+        // is captured WEAKLY (gate fix F-A2): the closure lives
+        // ON the coordinator, so a strong capture would close a
         // coordinator → closure → coordinator self-retain
         // cycle and leak one coordinator per visit; the
-        // view's @State storage is the sole strong owner.
+        // view's @State storage is the sole strong owner. The
+        // Bindings reference only their own storage slots,
+        // never the coordinator's, so they close no cycle.
         // The mirrors reset with the new coordinator — a
         // retry reload is a FULL reload (§13.1f): the grid
         // resets and focus returns to the first card.
         let coordinator = ActorMergeCoordinator(service: service, originPluginId: pluginId, name: name)
         coordinator.originRoute = route
-        coordinator.onChange = { [weak coordinator, rowsBox = _rows, contributorsBox = _contributors,
-                                  avatarBox = _mergedAvatarUrl, settledBox = _mergeSettled,
-                                  fullySettledBox = _mergeFullySettled,
-                                  failedBox = _originFailed] in
-            guard let coordinator,
-                  let rowsBox, let contributorsBox, let avatarBox,
-                  let settledBox, let fullySettledBox, let failedBox
-            else { return }
-            rowsBox.wrappedValue = coordinator.rows
-            contributorsBox.wrappedValue = coordinator.contributors
-            avatarBox.wrappedValue = coordinator.avatarUrl
-            settledBox.wrappedValue = coordinator.settled
-            fullySettledBox.wrappedValue = coordinator.fullySettled
-            failedBox.wrappedValue = coordinator.originFailed
+        // L-T36: the mirror must write through Bindings, NOT
+        // through the @State wrappers captured as values. The
+        // PR 1 SDK-27 shape captured the six wrappers as
+        // optionals and unwrapped them at closure entry; on
+        // device that mirror never landed — the coordinator
+        // settled with the full merged filmography (owner log
+        // 2026-11-24: merge settled totals 24–36, origin
+        // itself a contributor) while this view stayed at
+        // rows=[] and the actor page rendered empty (every
+        // visit logged `list … count=0`). A Binding resolves
+        // the view's live storage at WRITE time, so the
+        // write reaches the installed view whenever the
+        // coordinator publishes — the same write-time
+        // resolution that makes iOS's mirrorMergeState()
+        // work; reload() additionally mirrors explicitly
+        // after begin(), exactly as iOS does.
+        let rowsBinding = $rows
+        let contributorsBinding = $contributors
+        let avatarBinding = $mergedAvatarUrl
+        let settledBinding = $mergeSettled
+        let fullySettledBinding = $mergeFullySettled
+        let failedBinding = $originFailed
+        coordinator.onChange = { [weak coordinator] in
+            guard let coordinator else { return }
+            rowsBinding.wrappedValue = coordinator.rows
+            contributorsBinding.wrappedValue = coordinator.contributors
+            avatarBinding.wrappedValue = coordinator.avatarUrl
+            settledBinding.wrappedValue = coordinator.settled
+            fullySettledBinding.wrappedValue = coordinator.fullySettled
+            failedBinding.wrappedValue = coordinator.originFailed
         }
         mergeCoordinator = coordinator
         rows = []
@@ -794,10 +830,15 @@ struct TVActorView: View {
                                                 filters: ListFilters(), page: 1)
             guard gen == loadGeneration else { return }
             // The coordinator id-dedupes the origin block as
-            // it appends (replacing uniquedById()); begin()
-            // publishes synchronously, so the mirrored rows
-            // already carry the deduped count for this line.
+            // it appends (replacing uniquedById()). Mirror
+            // explicitly before the log line (iOS ActorView's
+            // shape, L-T36): the line reads THIS view's rows,
+            // so it stays the on-device witness that the
+            // mirror landed — after the L-T36 fix it must
+            // read the origin's real count, never 0 against
+            // a settled merge.
             coordinator.begin(originFirstPage: result, originFailed: false)
+            mirrorMergeState()
             DiagLog.log("actor", "list plugin=\(pluginId) count=\(rows.count) totalPages=\(max(result.pagination.totalPages, 1))")
         } catch {
             guard gen == loadGeneration else { return }
@@ -829,12 +870,31 @@ struct TVActorView: View {
                 // origin — contributed rows win over the error
                 // surface.
                 coordinator.begin(originFirstPage: nil, originFailed: true)
+                mirrorMergeState()
             }
         }
         if gen == loadGeneration {
             isLoading = false
             didLoad = true
         }
+    }
+
+    /// L-T36: the explicit mirror, iOS ActorView's shape —
+    /// copies the coordinator's published state into this
+    /// view's @State through the CURRENT view value, whose
+    /// wrappers resolve the installed view's storage at
+    /// write time. reload() calls it synchronously after
+    /// begin() (both branches); the coordinator's onChange
+    /// covers every later publication through the Bindings
+    /// captured in reload().
+    private func mirrorMergeState() {
+        guard let coordinator = mergeCoordinator else { return }
+        rows = coordinator.rows
+        contributors = coordinator.contributors
+        mergedAvatarUrl = coordinator.avatarUrl
+        mergeSettled = coordinator.settled
+        mergeFullySettled = coordinator.fullySettled
+        originFailed = coordinator.originFailed
     }
 
     /// §13.5 lockstep pagination, owned by the coordinator

@@ -1,5 +1,5 @@
 // =============================================================================
-// Hentai Hub plugin v1.0.2 — ONE combined plugin, THREE source adapters.
+// Hentai Hub plugin v1.0.5 — ONE combined plugin, THREE source adapters.
 // Built 2026-11-18 from the measured source hunt (HENTAI-SOURCE-HUNT.md).
 // The owner ordered every quality hentai source that verifies folded
 // into a single plugin; catalogues stay per-source (labelled rails,
@@ -84,7 +84,8 @@ function getManifest() {
     return JSON.stringify({
         "id": "hentaihub",
         "name": "Hentai Hub",
-        "version": "1.0.2",
+        "version": "1.0.7",
+        "maxChainParses": 5,
         "baseUrl": "https://hstream.moe",
         "iconUrl": "https://hstream.moe/images/cropped-HS-1-270x270.webp",
         "isEnabled": true,
@@ -872,6 +873,8 @@ function parseMovieDetail(html, url) {
 // every hop, parseDetailResponse second. Both dispatch by content.
 // =============================================================================
 
+var hsDomainCursor = 0;
+
 // hstream player/api JSON -> direct MP4 + subtitles (verified chain).
 function hsStreamFromApi(text) {
     try {
@@ -879,7 +882,11 @@ function hsStreamFromApi(text) {
         if (!data || !data.stream_url) return null;
         var domains = (data.stream_domains && data.stream_domains.length ? data.stream_domains : data.asia_stream_domains) || [];
         if (!domains.length) return null;
-        var base = domains[0] + "/" + data.stream_url;
+        // Mirror rotation (v1.0.7): the first listed mirror's TLS is cut
+        // from some networks while its siblings serve the identical path;
+        // start from the next mirror on each resolve so one dead mirror
+        // costs at most one failed play instead of every play.
+        var base = domains[hsDomainCursor++ % domains.length] + "/" + data.stream_url;
         return {
             url: base + "/x264.720p.mp4",
             isEmbed: false,
@@ -1249,10 +1256,42 @@ function hhResolveStep(html, url) {
                 var sm = qs.match(/[?&]s=([^&]+)/);
                 var srt = "";
                 if (sm) { var dec = b64Decode(sm[1]); if (dec && dec.indexOf("http") === 0) srt = dec; }
+                // 1.0.5 c4 device probe: on a watch-started resolve
+                // only (the armed stash below proves this resolve
+                // began at a watch page), test whether the file
+                // host serves the unsigned MP4 named by field 1 of
+                // the vid param's base64 decode. If it does, this
+                // parse terminates the chain here. Any absent arm,
+                // missing/undecodable vid, or invalid candidate
+                // falls through to the unchanged 1.0.4 player hop.
+                if (_hhPow && _hhPow.stage === "embed" && _hhPow.sawWatch === true && _hhPow.embedUrl === u) {
+                    var vidM = qs.match(/[?&]vid=([^&]+)/);
+                    var cand = vidM ? (b64Decode(vidM[1]).split("|")[0] || "") : "";
+                    if (/^https?:\/\/([a-z0-9-]+\.)*1hanime\.com\/[^\s?#]+\.mp4$/i.test(cand)) {
+                        // Consume the stash outright (_hhPow = null):
+                        // this return is terminal, both parse entries
+                        // return a non-null hhResolveStep result
+                        // without touching _hhPow again in this call
+                        // frame, and null leaves no armed sawWatch
+                        // marker (or stale playerUrl) for a later
+                        // resolve to inherit.
+                        _hhPow = null;
+                        return { url: cand, isEmbed: false, headers: { "Referer": "https://nhplayer.com/", "User-Agent": DESKTOP_UA }, subtitles: srt ? [{ lang: "en", url: srt, label: "English" }] : [] };
+                    }
+                }
                 var pUrl = "https://nhplayer.com" + qs;
                 if (!(_hhPow && _hhPow.embedUrl === u && _hhPow.stage !== "embed")) {
                     if (_hhPow && _hhPow.stage === "embed" && _hhPow.embedUrl === u) { _hhPow.stage = "player"; }
                     else { _hhPow = { stage: "player", sawWatch: false }; }
+                } else {
+                    // Kept stash from a finished chain: this hop
+                    // starts a fresh chain attempt, so the watch
+                    // marker that chain left behind is spent —
+                    // the same rule failedFor follows below. Only
+                    // the stage-"embed" flip above (the marker the
+                    // current resolve's own watch parse just set)
+                    // may carry sawWatch into a chain.
+                    _hhPow.sawWatch = false;
                 }
                 _hhPow.embedUrl = u;
                 _hhPow.playerUrl = pUrl;
@@ -1272,10 +1311,24 @@ function hhResolveStep(html, url) {
 // hhEmbedHop plus the chain-state note for a resolve that starts
 // at a watch page (one hop longer — its PoW chain cannot fit the
 // resolver budget, so its core step will take the fallback).
-function hhHopTracked(html, url) {
+// The note is RESOLVE-scoped (v1.0.4): only a parse made by the
+// resolver itself (inResolve — the embed entry point) may set
+// it. The same watch page parsed to build a detail screen is
+// not a resolve; the marker it used to leave behind survived in
+// the shared stash and poisoned the later play resolve of the
+// same title, whose own chain starts at the embed page with a
+// full budget (device-proven: HH-TRACE code w1 on a fresh
+// resolve). A detail parse instead drops an unconsumed marker
+// for its own title, so a play tapped from that detail starts
+// with a clean marker either way.
+function hhHopTracked(html, url, inResolve) {
     var cfg = hhEmbedHop(html, url);
     if (cfg && cfg.url && cfg.url.indexOf("nhplayer.com/v/") !== -1 && (url || "").indexOf("nhplayer.com") === -1) {
-        _hhPow = { stage: "embed", sawWatch: true, embedUrl: cfg.url, srt: "", playerUrl: "" };
+        if (inResolve) {
+            _hhPow = { stage: "embed", sawWatch: true, embedUrl: cfg.url, srt: "", playerUrl: "" };
+        } else if (_hhPow && _hhPow.stage === "embed" && _hhPow.embedUrl === cfg.url) {
+            _hhPow = null;
+        }
     }
     return cfg;
 }
@@ -1332,7 +1385,7 @@ function parseEmbedResponse(html, url) {
             if (st) return JSON.stringify(st);
         }
         if (html.indexOf("nhplayer.com") !== -1 || html.indexOf("player.php?vid=") !== -1 || (url || "").indexOf("nhplayer") !== -1) {
-            var hh = hhHopTracked(html, url);
+            var hh = hhHopTracked(html, url, true);
             if (hh) return JSON.stringify(hh);
         }
         if ((url || "").indexOf("haho.moe") !== -1 || html.indexOf("haho.moe") !== -1) {

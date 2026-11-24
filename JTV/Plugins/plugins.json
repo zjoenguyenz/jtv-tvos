@@ -4,7 +4,7 @@
     {
       "id": "missav",
       "name": "MissAV",
-      "version": "1.1.4",
+      "version": "1.1.7",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod01.js",
       "iconUrl": "https://missav.media/favicon.ico",
       "adult": true,
@@ -31,16 +31,16 @@
     {
       "id": "sextop1",
       "name": "Sextop1",
-      "version": "2.0.3",
+      "version": "2.0.4",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod04.js",
-      "iconUrl": "https://sextop1.cash/favicon.ico",
+      "iconUrl": "https://sextop1.farm/favicon.ico",
       "adult": true,
-      "baseUrl": "https://sextop1.cash"
+      "baseUrl": "https://sextop1.farm"
     },
     {
       "id": "topxx",
       "name": "TopXX",
-      "version": "1.0.2",
+      "version": "1.0.3",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod05.js",
       "iconUrl": "https://topxx.vip/assets/images/header/logo.png",
       "adult": true,
@@ -67,7 +67,7 @@
     {
       "id": "njav",
       "name": "NJAV",
-      "version": "1.0.7",
+      "version": "1.0.8",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod08.js",
       "iconUrl": "https://www.njav.com/favicon.ico",
       "adult": true,
@@ -103,11 +103,30 @@
     {
       "id": "hentaihub",
       "name": "Hentai Hub",
-      "version": "1.0.2",
+      "version": "1.0.7",
+      "maxChainParses": 5,
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod15.js",
       "iconUrl": "https://hstream.moe/images/cropped-HS-1-270x270.webp",
       "adult": true,
       "baseUrl": "https://hstream.moe"
+    },
+    {
+      "id": "javguru",
+      "name": "JavGuru",
+      "version": "1.0.0",
+      "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod16.js",
+      "iconUrl": "https://jav.guru/favicon.ico",
+      "adult": true,
+      "baseUrl": "https://jav.guru"
+    },
+    {
+      "id": "javsnap",
+      "name": "JavSnap",
+      "version": "1.0.0",
+      "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod17.js",
+      "iconUrl": "https://javsnap.com/assets/client/icon/favicon.ico",
+      "adult": true,
+      "baseUrl": "https://javsnap.com"
     }
   ]
 }

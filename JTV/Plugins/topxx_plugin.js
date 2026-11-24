@@ -6,7 +6,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "topxx",
         "name": "TopXX",
-        "version": "1.0.2",
+        "version": "1.0.3",
         "baseUrl": "https://topxx.vip",
         "iconUrl": "https://topxx.vip/assets/images/header/logo.png",
         "isEnabled": true,
@@ -84,7 +84,10 @@ function getUrlList(slug, filtersJson) {
         } else if (slug.indexOf('country-') === 0) {
             finalPath = "/countries/" + slug.replace('country-', '') + "/movies";
         } else if (slug.indexOf('actor-') === 0) {
-            return getUrlSearch(slug.replace('actor-', ''), filtersJson);
+            // Real per-actor endpoint (Phase 0 verified). The old fallback
+            // to getUrlSearch was broken: /movies/latest ignores ?q= and
+            // returns the whole latest catalogue instead of the actor's films.
+            finalPath = "/actors/" + slug.replace('actor-', '') + "/movies";
         } else {
             finalPath = "/genres/" + slug + "/movies";
         }

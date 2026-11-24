@@ -12,7 +12,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "njav",
         "name": "NJAV",
-        "version": "1.0.7",
+        "version": "1.0.8",
         "baseUrl": "https://www.njav.com",
         "referrer": "https://www.njav.com/",
         "iconUrl": "https://www.njav.com/favicon.ico",
@@ -92,8 +92,17 @@ function getUrlList(slug, filtersJson) {
         path = "en/" + path;
     }
 
-    // Ensure trailing slash (NJAV requires trailing slash on category pages)
-    if (path.charAt(path.length - 1) !== '/') {
+    // Actor filmography pages answer ONLY at the slash-less URL
+    // (/en/actor/<Name>?page=N); the trailing-slash form 404s (Phase 0,
+    // verified for 3 actresses). Detect a specific-actor route (a name
+    // segment after en/actor/) and keep it slash-less; the actor INDEX
+    // (en/actor/ with no name) stays a normal category page.
+    var actorPath = path.replace(/\/+$/, '');
+    var isActorRoute = /^en\/actor\/[^\/]+$/.test(actorPath);
+    if (isActorRoute) {
+        path = actorPath.replace(/ /g, '%20');
+    } else if (path.charAt(path.length - 1) !== '/') {
+        // Ensure trailing slash (NJAV requires trailing slash on category pages)
         path = path + '/';
     }
 
@@ -412,10 +421,52 @@ function parseMovieDetail(htmlContent, pageUrl) {
             return items.join(", ");
         };
 
+        // Current detail markup (Phase 0): the <dt>/<dd> layout is gone;
+        // fields now render as <div><span>Actresses:</span>
+        // <span class="genre"><a href="actor/<Name>">Name</a></span></div>,
+        // and the page's JSON-LD carries the same actors as Person entries
+        // with /en/actor/<Name> urls. Capture from those and emit the
+        // shared markdown convention [name](/en/actor/<Name>) so a cast
+        // tap can route to the actor's filmography.
+        var extractActorsCurrent = function() {
+            var items = [];
+            var seen = {};
+            var pushActor = function(name, routeName) {
+                var n = PluginUtils.cleanText(name || "");
+                if (!n || seen[n]) return;
+                seen[n] = true;
+                var route = "/en/actor/" + encodeURIComponent(routeName || n);
+                items.push("[" + n + "](" + route + ")");
+            };
+            var blockM = htmlContent.match(/<span[^>]*>\s*Actresses:\s*<\/span>\s*<span[^>]*>([\s\S]*?)<\/span>/i);
+            if (blockM) {
+                var lr = /<a[^>]+href=["'](?:https?:\/\/www\.njav\.com\/en\/)?actor\/([^"']+)["'][^>]*>([^<]+)<\/a>/gi;
+                var lm;
+                while ((lm = lr.exec(blockM[1])) !== null) {
+                    var routeName = lm[1];
+                    try { routeName = decodeURIComponent(routeName); } catch (e) { }
+                    pushActor(lm[2], routeName);
+                }
+            }
+            if (items.length === 0) {
+                var ldM = htmlContent.match(/"actor"\s*:\s*\[([\s\S]*?)\]/);
+                if (ldM) {
+                    var pr = /"name"\s*:\s*"([^"]+)"[\s\S]*?"url"\s*:\s*"https?:\/\/www\.njav\.com\/en\/actor\/([^"]+)"/g;
+                    var pm;
+                    while ((pm = pr.exec(ldM[1])) !== null) {
+                        var rn = pm[2];
+                        try { rn = decodeURIComponent(rn); } catch (e) { }
+                        pushActor(pm[1], rn);
+                    }
+                }
+            }
+            return items.join(", ");
+        };
+
         var releaseDate = getField("Release date") || getField("Release") || getField("Released");
         var studio      = getField("Maker")  || getField("Studio") || getField("Label");
         var director    = getField("Director");
-        var casts       = getLinksField("Actresses") || getLinksField("Actress") || extractFromLinks("actor");
+        var casts       = extractActorsCurrent() || getLinksField("Actresses") || getLinksField("Actress") || extractFromLinks("actor");
         var genres      = getLinksField("Genres")    || getLinksField("Genre")   || extractFromLinks("genre");
         var series      = getField("Series") || extractFromLinks("series");
 

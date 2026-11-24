@@ -6,7 +6,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "missav",
         "name": "MissAV",
-        "version": "1.1.4",
+        "version": "1.1.7",
         "baseUrl": "https://missav.media",
         "referrer": "https://missav123.com/",
         "iconUrl": "https://missav.media/favicon.ico",
@@ -103,10 +103,32 @@ function getFilterConfig() {
 // URL GENERATION
 // =============================================================================
 
+// Catalogue mirrors (v1.1.5): missav.media / missav.live / missav123.com are
+// interchangeable front-ends on ONE backend — identical catalogues and
+// identical stream UUIDs on title pages (RESEARCH-MISSAV §1–§2). The plugin
+// contract has no fetch-failure callback: the app fetches the URL we return
+// and never reports the outcome back. Rotation is therefore attempt-based —
+// every URL we hand out takes the NEXT mirror in the list, so a dead mirror
+// costs at most one failed load (the app's retry, or the next navigation,
+// lands on another mirror) instead of every browse dying with the first
+// domain. Playback is unaffected by which mirror served a page: the stream
+// URL is always rebuilt on surrit.com from the extracted UUID.
+var MISSAV_CATALOG_MIRRORS = [
+    "https://missav.media",
+    "https://missav.live",
+    "https://missav123.com"
+];
+var _missavMirrorCursor = 0;
+function missavCatalogBase() {
+    var base = MISSAV_CATALOG_MIRRORS[_missavMirrorCursor % MISSAV_CATALOG_MIRRORS.length];
+    _missavMirrorCursor++;
+    return base;
+}
+
 function getUrlList(slug, filtersJson) {
     var filters = JSON.parse(filtersJson || "{}");
     var page = filters.page || 1;
-    var baseUrl = "https://missav.media";
+    var baseUrl = missavCatalogBase();
 
     // If slug is empty (default), use 'vi/new'
     var path = slug || "vi/new";
@@ -133,16 +155,16 @@ function getUrlList(slug, filtersJson) {
 function getUrlSearch(keyword, filtersJson) {
     var filters = JSON.parse(filtersJson || "{}");
     var page = filters.page || 1;
-    return "https://missav.media/vi/search/" + encodeURIComponent(keyword) + "?page=" + page;
+    return missavCatalogBase() + "/vi/search/" + encodeURIComponent(keyword) + "?page=" + page;
 }
 
 function getUrlDetail(slug) {
     if (slug.indexOf("http") === 0) return slug;
-    if (slug.indexOf("/") === 0) return "https://missav.media" + slug;
-    return "https://missav.media/vi/" + slug;
+    if (slug.indexOf("/") === 0) return missavCatalogBase() + slug;
+    return missavCatalogBase() + "/vi/" + slug;
 }
 
-function getUrlCategories() { return "https://missav.media/vi/genres"; }
+function getUrlCategories() { return missavCatalogBase() + "/vi/genres"; }
 function getUrlCountries() { return ""; } // Not supported
 function getUrlYears() { return ""; } // Not supported
 
@@ -152,16 +174,24 @@ function getUrlYears() { return ""; } // Not supported
 
 var PluginUtils = {
     /**
-     * Strip prefix missav_media- (hoặc bất kỳ prefix dạng domain_) khỏi CSS class names.
+     * Strip các prefix dạng missav<domain>- khỏi CSS class names.
      * Ví dụ: class="missav_media-thumbnail missav_media-group" -> class="thumbnail group"
      * Điều này đảm bảo parser hoạt động với cả HTML cũ và mới.
      */
     normalizeHtml: function (html) {
         if (!html) return "";
-        // Strip missav_media- prefix trong class attributes
+        // Strip prefix missav<domain>- trong class attributes. Các dạng
+        // theo quy ước domain (dấu chấm -> "_"): missav_media- (.media),
+        // missav_live-, missav_ws-, missav123_com- và missav123com-
+        // (missav123.com — domain chứa số nên hai dạng của nó KHÔNG bắt
+        // đầu bằng "missav_"). Cùng họ prefix trên các mirror chị em từ
+        // v1.1.5, khi trang có thể do mirror khác phục vụ.
+        // Match neo ở đầu token class (đầu chuỗi hoặc sau khoảng trắng)
+        // để không cắt nhầm class chỉ chứa "missav" bên trong một từ
+        // dài hơn không liên quan (vd notmissav_media- phải giữ nguyên).
         // Pattern: tìm class="..." rồi strip prefix bên trong
         return html.replace(/class="([^"]*)"/g, function (fullMatch, classValue) {
-            var normalized = classValue.replace(/missav_media-/g, '');
+            var normalized = classValue.replace(/(^|\s)(?:missav[0-9]*_[a-z0-9]+|missav[0-9]+[a-z0-9]*)-/g, '$1');
             return 'class="' + normalized + '"';
         });
     },
@@ -219,6 +249,136 @@ var PluginUtils = {
         return url;
     }
 };
+
+// =============================================================================
+// STREAM UUID EXTRACTION (shared by parseMovieDetail & parseDetailResponse)
+// =============================================================================
+
+// Strategy 1 (v1.1.5 repair): pull the UUID out of the eval()-packed word
+// list. Measured layout (2026-11-22, live title pages): the five UUID
+// segments are stored as [12,4,4,4,8]-char hex pieces in REVERSED
+// tail-to-head order — e.g. parts [..., '8863672dd564', '93a8', '4a3f',
+// '3863', '4e7443d3', ...] reassemble to 4e7443d3-3863-4a3f-93a8-
+// 8863672dd564. The pre-1.1.5 filter (/^[0-9a-f]{8,12}$/) caught only the
+// 12- and 8-char end pieces (2 of 5), below the >=5 threshold, so S1
+// silently yielded nothing (DIAG-MISSAV-2026-11-22). The matcher below
+// accepts the measured reversed run, the legacy forward run
+// [8,4,4,4,12], and — as a last resort — the original legacy behaviour
+// (first five {8,12}-hex pieces in array order). Anchoring on the
+// 12/8-char end pieces keeps random 4-char hex words in the list from
+// forming a false run.
+function missavEvalUuid(html) {
+    var evalMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?'([^']+)'\.split\('\|'\)/i);
+    if (!evalMatch) return "";
+    var parts = evalMatch[1].split('|');
+    // Confirm it's the video source eval (not some other packed block)
+    var hasSurrit = false;
+    for (var i = 0; i < parts.length; i++) {
+        if (parts[i] === 'surrit' || parts[i] === 'sixyik') { hasSurrit = true; break; }
+    }
+    if (!hasSurrit) return "";
+
+    var isHex = function (s) { return /^[0-9a-f]+$/.test(s); };
+    for (var i = 0; i + 4 < parts.length; i++) {
+        var a = parts[i], b = parts[i + 1], c = parts[i + 2], d = parts[i + 3], e = parts[i + 4];
+        if (!isHex(a) || !isHex(b) || !isHex(c) || !isHex(d) || !isHex(e)) continue;
+        // Legacy forward layout: [8,4,4,4,12] in segment order
+        if (a.length === 8 && b.length === 4 && c.length === 4 && d.length === 4 && e.length === 12) {
+            return a + '-' + b + '-' + c + '-' + d + '-' + e;
+        }
+        // Measured layout: [12,4,4,4,8] stored tail-to-head -> reverse
+        if (a.length === 12 && b.length === 4 && c.length === 4 && d.length === 4 && e.length === 8) {
+            return e + '-' + d + '-' + c + '-' + b + '-' + a;
+        }
+    }
+    // Legacy fallback (pre-2026-11 pages): first five {8,12}-hex pieces
+    var uuidParts = [];
+    for (var j = 0; j < parts.length; j++) {
+        if (/^[0-9a-f]{8,12}$/.test(parts[j])) uuidParts.push(parts[j]);
+    }
+    if (uuidParts.length >= 5) {
+        return uuidParts[0] + '-' + uuidParts[1] + '-' + uuidParts[2] + '-' + uuidParts[3] + '-' + uuidParts[4];
+    }
+    return "";
+}
+
+// Deep-scan candidate ranking (v1.1.5): every distinct UUID in the page,
+// best first. The real stream UUID repeats 100+x per page while decoys
+// (measured on sister-mirror pages: a second UUID appearing exactly x1)
+// sit at the bottom — so frequency is the primary key, replacing the old
+// first-match-in-document-order pick, which would take a decoy placed
+// earlier in the page. A candidate whose nearby context mentions
+// surrit/m3u8 outranks raw frequency ties. The existing blacklist context
+// filter still applies. Attempt budget: at most MISSAV_MAX_UUID_CANDIDATES
+// distinct candidates (the most frequent ones) get context evaluation —
+// measured pages carry <=2 distinct UUIDs and the real one is by
+// construction among the most frequent, so 8 bounds worst-case string
+// work on ad-heavy pages without ever excluding a plausible candidate.
+var MISSAV_MAX_UUID_CANDIDATES = 8;
+// v1.1.6 (SPEC-136 §3.2): how many ranked alternates parseDetailResponse
+// emits as alternateURLs for the app-layer pre-flight — capped at 4, so
+// primary + alternates = at most 5 pre-flight tries.
+var MISSAV_MAX_ALTERNATE_URLS = 4;
+var MISSAV_UUID_BLACKLIST = ["snaptrckr", "user_uuid", "popunder", "banner", "monitoring", "crypto", "randomUUID", "generateUUID"];
+
+function missavRankedUuids(html) {
+    var uuidRegex = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+    var stats = {};
+    var order = [];
+    var match;
+    while ((match = uuidRegex.exec(html)) !== null) {
+        var u = match[0].toLowerCase();
+        if (!stats[u]) {
+            stats[u] = { uuid: u, count: 0, first: match.index, positions: [] };
+            order.push(u);
+        }
+        stats[u].count++;
+        if (stats[u].positions.length < 3) stats[u].positions.push(match.index);
+    }
+    // Frequency first, then document order; cap the evaluated set (budget).
+    var ranked = order.map(function (u) { return stats[u]; });
+    ranked.sort(function (x, y) {
+        if (y.count !== x.count) return y.count - x.count;
+        return x.first - y.first;
+    });
+    if (ranked.length > MISSAV_MAX_UUID_CANDIDATES) {
+        ranked = ranked.slice(0, MISSAV_MAX_UUID_CANDIDATES);
+    }
+    var candidates = [];
+    for (var i = 0; i < ranked.length; i++) {
+        var s = ranked[i];
+        var isBad = false;
+        var hasStreamContext = false;
+        for (var p = 0; p < s.positions.length; p++) {
+            var idx = s.positions[p];
+            var context = html.substring(Math.max(0, idx - 120), Math.min(html.length, idx + 120));
+            if (p === 0) {
+                for (var j = 0; j < MISSAV_UUID_BLACKLIST.length; j++) {
+                    if (context.indexOf(MISSAV_UUID_BLACKLIST[j]) !== -1) { isBad = true; break; }
+                }
+                if (isBad) break;
+            }
+            if (context.indexOf('surrit') !== -1 || context.indexOf('m3u8') !== -1) {
+                hasStreamContext = true;
+            }
+        }
+        if (isBad) continue;
+        s.streamContext = hasStreamContext;
+        candidates.push(s);
+    }
+    // Stream-context candidates first; frequency decides inside each tier.
+    candidates.sort(function (x, y) {
+        if (x.streamContext !== y.streamContext) return x.streamContext ? -1 : 1;
+        if (y.count !== x.count) return y.count - x.count;
+        return x.first - y.first;
+    });
+    return candidates;
+}
+
+function missavBestUuid(html) {
+    var candidates = missavRankedUuids(html);
+    return candidates.length ? candidates[0].uuid : "";
+}
 
 function parseListResponse(html) {
     // Normalize HTML: strip missav_media- prefix từ CSS class
@@ -621,15 +781,88 @@ function parseMovieDetail(html, pageUrl) {
             return items.join(", ");
         };
 
+        // v1.1.7 (L-20): plain-at-extraction variants for the
+        // fields the app renders VERBATIM (director ->
+        // MovieDetail.director, genres ->
+        // MovieDetail.category). getField/getMultiField
+        // manufacture the "[text](route)" markdown from link
+        // text and route that are still SEPARATE values at
+        // extraction time; these variants return the cleaned
+        // link text directly, per item, instead of encoding
+        // to markdown and parsing it back. By construction a
+        // name containing square brackets survives byte-exact,
+        // a route containing ")" cannot corrupt the text, and
+        // an empty/whitespace anchor yields an empty
+        // contribution (skipped in multi-field joins; the
+        // single field falls back to "") — no "[](/route)"
+        // can ever be synthesised on the plain paths. Casts
+        // keep getMultiField unchanged: the app parses the
+        // [Name](route) convention back into routes.
+        var getPlainField = function (labelKey) {
+            // Same field-block scan as getField; only the
+            // linked branch differs (returns the text itself).
+            var regex = new RegExp("<span>" + labelKey + ":<\\/span>([\\s\\S]*?)<\\/div>", "i");
+            var match = html.match(regex);
+            if (!match) return "";
+
+            var content = match[1];
+            // Linked value: the cleaned link text IS the value.
+            var linkMatch = content.match(/<a[^>]+href="([^"]+)"[^>]*>([^<]+)<\/a>/i);
+            if (linkMatch) {
+                return PluginUtils.cleanText(linkMatch[2]);
+            }
+            // Check for <time> tag (e.g. release date)
+            var timeMatch = content.match(/<time[^>]*>([^<]+)<\/time>/i);
+            if (timeMatch) {
+                return PluginUtils.cleanText(timeMatch[1]);
+            }
+            // Check for <span class="font-medium"> (e.g. code, title)
+            var spanMatch = content.match(/<span[^>]*>([^<]+)<\/span>/i);
+            if (spanMatch) {
+                return PluginUtils.cleanText(spanMatch[1]);
+            }
+            // Fallback to text (strip all tags)
+            return PluginUtils.cleanText(content.replace(/<[^>]+>/g, ""));
+        };
+
+        var getPlainMultiField = function (labelKey) {
+            // Same field-block scan as getMultiField; items
+            // collect the cleaned link text, never markdown.
+            var regexStart = new RegExp("<span>" + labelKey + ":<\\/span>", "i");
+            var matchStart = html.match(regexStart);
+            if (!matchStart) return "";
+
+            // Look ahead for closing div of the text-secondary container
+            var startIndex = matchStart.index + matchStart[0].length;
+            var searchArea = html.substring(startIndex);
+            var divEnd = searchArea.indexOf("</div>");
+            if (divEnd === -1) divEnd = searchArea.length;
+
+            var content = searchArea.substring(0, divEnd);
+
+            // Extract all links: plain text per item; an empty
+            // anchor contributes nothing and is skipped.
+            var items = [];
+            var linkRegex = /<a[^>]+href="([^"]+)"[^>]*>([^<]+)<\/a>/g;
+            var linkMatch;
+            while ((linkMatch = linkRegex.exec(content)) !== null) {
+                var text = PluginUtils.cleanText(linkMatch[2]);
+                if (text && !text.includes("<img")) {
+                    items.push(text);
+                }
+            }
+            return items.join(", ");
+        };
+
         // 2. Extract Metadata
         var code = getField("Mã số") || getField("Code");
         var releaseDate = getField("Ngày phát hành") || getField("Release date");
         var studio = getField("nhà sản xuất") || getField("Maker");
-        var director = getField("Giám đốc") || getField("Director");
+        var director = getPlainField("Giám đốc") || getPlainField("Director");
         var label = getField("Nhãn") || getField("Label");
 
         var casts = getMultiField("Nữ diễn viên") || getMultiField("Actresses");
-        var genres = getMultiField("thể loại") || getMultiField("Genre") || getMultiField("Genres");
+        var genres = getPlainMultiField("thể loại") || getPlainMultiField("Genre") || getPlainMultiField("Genres");
         var series = getMultiField("Loạt") || getMultiField("Series");
 
         // 3. Fallback/Original Metadata (if above fails)
@@ -674,35 +907,11 @@ function parseMovieDetail(html, pageUrl) {
         var streamUrl = "";
         var uuid = "";
 
-        // Strategy 1: Extract from eval() obfuscated code (new pattern)
-        // The source URL is now hidden inside eval(function(p,a,c,k,e,d){...})
-        // Look for the split('|') array which contains UUID parts and domain
-        var evalMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?'([^']+)'\.split\('\|'\)/i);
-        if (evalMatch) {
-            var parts = evalMatch[1].split('|');
-            // Look for 'surrit' or 'sixyik' in parts to confirm it's the video source eval
-            var hasSurrit = false;
-            for (var ei = 0; ei < parts.length; ei++) {
-                if (parts[ei] === 'surrit' || parts[ei] === 'sixyik') {
-                    hasSurrit = true;
-                    break;
-                }
-            }
-            if (hasSurrit) {
-                // Find UUID parts (5 hex segments) in the array
-                var uuidParts = [];
-                for (var ei = 0; ei < parts.length; ei++) {
-                    if (parts[ei].match(/^[0-9a-f]{8,12}$/)) {
-                        uuidParts.push(parts[ei]);
-                    }
-                }
-                // Try to reconstruct UUID from parts array
-                // Pattern: fa80d6f9|e876|491d|877c|f56188cab276
-                if (uuidParts.length >= 5) {
-                    uuid = uuidParts[0] + '-' + uuidParts[1] + '-' + uuidParts[2] + '-' + uuidParts[3] + '-' + uuidParts[4];
-                }
-            }
-        }
+        // Strategy 1: Extract from eval() obfuscated code
+        // The source URL is hidden inside eval(function(p,a,c,k,e,d){...});
+        // the fragment layout is handled by missavEvalUuid (v1.1.5 repair —
+        // the packed pieces are now stored reversed, [12,4,4,4,8]).
+        uuid = missavEvalUuid(html);
 
         // Strategy 2: Check for direct Surrit/Sixyik/Nineyu/Fourhoi patterns
         if (!uuid) {
@@ -726,26 +935,12 @@ function parseMovieDetail(html, pageUrl) {
             }
         }
 
-        // Strategy 4: Deep Scan for UUID (fallback)
+        // Strategy 4: Deep Scan for UUID (fallback) — v1.1.5: frequency-
+        // ranked candidates via missavBestUuid (a decoy UUID appearing
+        // once can no longer beat the real one by sitting earlier in
+        // the page).
         if (!uuid && !streamUrl) {
-            var uuidRegex = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
-            var matches = html.match(uuidRegex) || [];
-            var blacklist = ["snaptrckr", "user_uuid", "popunder", "banner", "monitoring", "crypto", "randomUUID", "generateUUID"];
-
-            for (var i = 0; i < matches.length; i++) {
-                var u = matches[i];
-                var isBad = false;
-                var idx = html.indexOf(u);
-                if (idx !== -1) {
-                    var context = html.substring(Math.max(0, idx - 80), Math.min(html.length, idx + 80));
-                    for (var j = 0; j < blacklist.length; j++) {
-                        if (context.indexOf(blacklist[j]) !== -1) {
-                            isBad = true; break;
-                        }
-                    }
-                }
-                if (!isBad) { uuid = u; break; }
-            }
+            uuid = missavBestUuid(html);
         }
 
         if (uuid) {
@@ -805,24 +1000,9 @@ function parseDetailResponse(html) {
     var uuid = "";
     var streamUrl = "";
 
-    // Strategy 1: Decode eval() obfuscated code
-    var evalMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?'([^']+)'\.split\('\|'\)/i);
-    if (evalMatch) {
-        var parts = evalMatch[1].split('|');
-        var hasSurrit = false;
-        for (var i = 0; i < parts.length; i++) {
-            if (parts[i] === 'surrit' || parts[i] === 'sixyik') { hasSurrit = true; break; }
-        }
-        if (hasSurrit) {
-            var uuidParts = [];
-            for (var i = 0; i < parts.length; i++) {
-                if (parts[i].match(/^[0-9a-f]{8,12}$/)) uuidParts.push(parts[i]);
-            }
-            if (uuidParts.length >= 5) {
-                uuid = uuidParts[0] + '-' + uuidParts[1] + '-' + uuidParts[2] + '-' + uuidParts[3] + '-' + uuidParts[4];
-            }
-        }
-    }
+    // Strategy 1: Decode eval() obfuscated code (v1.1.5 repair — shared
+    // helper, reversed [12,4,4,4,8] fragment layout)
+    uuid = missavEvalUuid(html);
 
     // Strategy 2: Direct domain scan
     if (!uuid) {
@@ -833,28 +1013,50 @@ function parseDetailResponse(html) {
         if (m) uuid = m[1];
     }
 
-    // Strategy 3: Deep UUID scan (fallback)
+    // Strategy 3: Deep UUID scan (fallback) — v1.1.5: frequency-ranked
+    // candidates via missavBestUuid (decoy-proof; see helper).
     if (!uuid) {
-        var matches = html.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) || [];
-        var blacklist = ["snaptrckr", "user_uuid", "popunder", "banner", "monitoring", "crypto", "randomUUID", "generateUUID"];
-        for (var i = 0; i < matches.length; i++) {
-            var u = matches[i];
-            var isBad = false;
-            var idx = html.indexOf(u);
-            if (idx !== -1) {
-                var ctx = html.substring(Math.max(0, idx - 80), Math.min(html.length, idx + 80));
-                for (var j = 0; j < blacklist.length; j++) {
-                    if (ctx.indexOf(blacklist[j]) !== -1) { isBad = true; break; }
-                }
-            }
-            if (!isBad) { uuid = u; break; }
-        }
+        uuid = missavBestUuid(html);
     }
 
     if (uuid) {
         streamUrl = "https://surrit.com/" + uuid + "/playlist.m3u8";
     }
 
+    // v1.1.6 (SPEC-136 §3.2): ranked alternate candidates for the
+    // app-layer pre-flight. When the primary's playlist is refused, the
+    // app walks [url] + alternateURLs in order; the alternates are the
+    // other plausible stream UUIDs on the page, in missavRankedUuids
+    // order, the primary itself excluded, capped at
+    // MISSAV_MAX_ALTERNATE_URLS. Every candidate is a surrit playlist
+    // URL and shares this response's headers object — the app sends
+    // the same headers for primary and alternates alike. The list is
+    // present but empty when extraction found a single candidate, and
+    // also empty on the failure shape below (no candidate survived).
+    var alternateURLs = [];
+    if (uuid) {
+        var rankedForAlternates = missavRankedUuids(html);
+        for (var ai = 0; ai < rankedForAlternates.length && alternateURLs.length < MISSAV_MAX_ALTERNATE_URLS; ai++) {
+            var candUuid = rankedForAlternates[ai].uuid;
+            if (candUuid === uuid.toLowerCase()) continue;
+            alternateURLs.push("https://surrit.com/" + candUuid + "/playlist.m3u8");
+        }
+    }
+
+    // Failure shape (unchanged contract): when no candidate survives,
+    // url stays "" — the shared resolve-failure signal across the
+    // plugin set is the EMPTY URL (the exact JSON shape differs per
+    // plugin — vlxx adds isEmbed/headers, njav's bare fallback is
+    // {"url":""} — but StreamInfo's defaulting decoder makes them
+    // app-equivalent). The app reads an empty url
+    // as "no playable link" and surfaces its error state instead of
+    // handing the player an unresolvable address. NOTE: a UUID that
+    // extracts cleanly but whose playlist the source refuses
+    // (403/BucketPunish) cannot be detected here — the plugin contract
+    // gives plugins no fetch capability, so that pre-flight belongs to
+    // the app layer (RESEARCH-MISSAV R2); since v1.1.6 the ranked
+    // candidate order such a pre-flight should try crosses the bridge
+    // as alternateURLs above (SPEC-136 §3.2).
     return JSON.stringify({
         url: streamUrl,
         headers: {
@@ -862,7 +1064,8 @@ function parseDetailResponse(html) {
             "Referer": "https://missav123.com/",
             "Origin": "https://missav123.com"
         },
-        subtitles: []
+        subtitles: [],
+        alternateURLs: alternateURLs
     });
 }
 
