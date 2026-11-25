@@ -374,12 +374,22 @@ enum DebridResolver {
     /// the right shape; the probe-only path never records
     /// (probes do not feed reputation, FL-486).
     private static let servedLock = NSLock()
-    private static var _lastServedProvider: String?
+    /// Swift 6 fix (CI run #34): a nonisolated mutable static var
+    /// is rejected as non-concurrency-safe shared state, even
+    /// though every access was already under servedLock. The slot
+    /// now lives in a reference box held by a static let — the
+    /// SourceReputation idiom — and every access stays under the
+    /// same lock; only the storage shape changes, never the
+    /// semantics.
+    private final class LastServedBox: @unchecked Sendable {
+        var value: String?
+    }
+    private static let _lastServedProvider = LastServedBox()
     static var lastServedProvider: String? {
-        servedLock.withLock { _lastServedProvider }
+        servedLock.withLock { _lastServedProvider.value }
     }
     private static func noteServed(provider: String) {
-        servedLock.withLock { _lastServedProvider = provider }
+        servedLock.withLock { _lastServedProvider.value = provider }
     }
 
     /// Clears the remembered winner (gate fix, attempt 2):
@@ -387,7 +397,7 @@ enum DebridResolver {
     /// attempt starts from a clean slate — the property above
     /// is get-only to the rest of the tree.
     static func clearLastServedProvider() {
-        servedLock.withLock { _lastServedProvider = nil }
+        servedLock.withLock { _lastServedProvider.value = nil }
     }
 
     /// NEXT-D D5 (tvOS-only divergence, 1.3.0): PROBE-ONLY
