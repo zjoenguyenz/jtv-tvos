@@ -238,6 +238,14 @@ enum DebridResolver {
         var phase2Tokens: [String] = []
         if !tb.isEmpty && !attempted.contains("tb") { phase2Tokens.append("torbox") }
         if !pm.isEmpty { phase2Tokens.append("premiumize") }
+        // Source reputation (DESIGN §3.3 surface 2): the same
+        // candidate list, stable-sorted by the learned ordering
+        // key (providers keyed as "debrid:<provider>"). The
+        // Phase-2 race itself, provider pins and RD's exclusion
+        // from the automatic path are untouched; Phase 1 above
+        // has no candidate list (two hard-coded probes) and is
+        // untouched. No reputation data = today's order exactly.
+        phase2Tokens = SourceReputation.shared.sortedByReputation(phase2Tokens, surface: "debrid-phase2") { "debrid:\($0)" }
         if !phase2Tokens.isEmpty {
             DiagLog.log("debrid", "provider=all phase=phase2 mode=\(phase2Tokens.count > 1 ? "race" : "single") providers=\(phase2Tokens.joined(separator: ","))")
             onPhase?(.downloading(providers: phase2Tokens))
@@ -349,8 +357,37 @@ enum DebridResolver {
     /// inside the race legs just before they hand their
     /// stream to the box.
     private static func logServed(provider: String, stream: StreamInfo) {
+        noteServed(provider: provider)
         let url = URL(string: stream.url)
         DiagLog.log("debrid", "provider=\(provider) phase=resolve outcome=served scheme=\(url?.scheme ?? "?") host=\(url?.host ?? "?")")
+    }
+
+    // MARK: - Served-provider plumbing (source reputation, DESIGN §3.2)
+
+    /// The provider that served the most recent debrid stream.
+    /// Minimal plumbing: logServed (every success exit of the
+    /// automatic resolve) and the provider-pinned resolve record
+    /// the winner here, so the player shell can attribute the
+    /// stream's play outcome (first frame / terminal death) to
+    /// the provider pseudo-id "debrid:<provider>". Playback is
+    /// one stream at a time, so a single remembered winner is
+    /// the right shape; the probe-only path never records
+    /// (probes do not feed reputation, FL-486).
+    private static let servedLock = NSLock()
+    private static var _lastServedProvider: String?
+    static var lastServedProvider: String? {
+        servedLock.withLock { _lastServedProvider }
+    }
+    private static func noteServed(provider: String) {
+        servedLock.withLock { _lastServedProvider = provider }
+    }
+
+    /// Clears the remembered winner (gate fix, attempt 2):
+    /// TVPlayerSession.beginAttempt calls this so every new
+    /// attempt starts from a clean slate — the property above
+    /// is get-only to the rest of the tree.
+    static func clearLastServedProvider() {
+        servedLock.withLock { _lastServedProvider = nil }
     }
 
     /// NEXT-D D5 (tvOS-only divergence, 1.3.0): PROBE-ONLY
@@ -478,20 +515,27 @@ enum DebridResolver {
         case .torbox:
             let token = DebridTokens.torbox
             guard !token.isEmpty else { throw DebridError.noToken }
-            return try await resolveTorBox(hash: clean, token: token)
+            let stream = try await resolveTorBox(hash: clean, token: token)
+            noteServed(provider: provider.logToken)
+            return stream
         case .realDebrid:
             let token = DebridTokens.rd
             guard !token.isEmpty else { throw DebridError.noToken }
-            return try await resolveRD(hash: clean, token: token)
+            let stream = try await resolveRD(hash: clean, token: token)
+            noteServed(provider: provider.logToken)
+            return stream
         case .premiumize:
             let token = DebridTokens.premiumize
             guard !token.isEmpty else { throw DebridError.noToken }
             if let hit = try? await premiumizeDirectDL(hash: clean, token: token) {
+                noteServed(provider: provider.logToken)
                 return hit
             }
             if Task.isCancelled { throw CancellationError() }
-            return try await resolvePremiumize(hash: clean, token: token,
-                                               deadline: Date().addingTimeInterval(budget))
+            let stream = try await resolvePremiumize(hash: clean, token: token,
+                                                     deadline: Date().addingTimeInterval(budget))
+            noteServed(provider: provider.logToken)
+            return stream
         }
     }
 

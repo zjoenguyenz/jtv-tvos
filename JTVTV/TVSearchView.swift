@@ -434,7 +434,11 @@ struct TVSearchView: View {
         do {
             let page = try await service.search(pluginId: pid, keyword: term, page: 1)
             guard gen == generation else { return }
-            serverPage = page.pagination.currentPage
+            // FL-489: this view OWNS its counter — page 1 was
+            // requested, so the counter is 1; the parser-reported
+            // currentPage never overwrites it (totalPages is
+            // still adopted from the parser).
+            serverPage = 1
             serverTotalPages = max(page.pagination.totalPages, 1)
             var shown = Set(results.map(\.id))
             var exact: [Movie] = []
@@ -462,13 +466,23 @@ struct TVSearchView: View {
         guard !term.isEmpty, !isLoadingMore, serverPage >= 1, serverPage < serverTotalPages else { return }
         let gen = generation
         isLoadingMore = true
+        let requestedPage = serverPage + 1
         do {
-            let page = try await service.search(pluginId: activeId, keyword: term, page: serverPage + 1)
+            let page = try await service.search(pluginId: activeId, keyword: term, page: requestedPage)
             guard gen == generation else { isLoadingMore = false; return }
             var shown = Set(results.map(\.id))
-            results.append(contentsOf: page.items.filter { shown.insert($0.id).inserted })
-            serverPage = page.pagination.currentPage
-            serverTotalPages = max(page.pagination.totalPages, 1)
+            let newItems = page.items.filter { shown.insert($0.id).inserted }
+            results.append(contentsOf: newItems)
+            // FL-489: counter = the REQUESTED page, never the
+            // parser-reported currentPage; a page adding ZERO
+            // new items ends this list's pagination (totalPages
+            // clamped to the counter so the guard closes).
+            serverPage = requestedPage
+            if newItems.isEmpty {
+                serverTotalPages = requestedPage
+            } else {
+                serverTotalPages = max(page.pagination.totalPages, 1)
+            }
         } catch {
             DiagLog.log("search", "loadMore failed kind=\((error as NSError).domain)#\((error as NSError).code)")
         }
@@ -723,7 +737,11 @@ struct TVSearchResultsView: View {
             let result = try await service.search(pluginId: pluginId, keyword: query, page: 1)
             guard gen == loadGeneration else { return }
             items = result.items.uniquedById()
-            page = result.pagination.currentPage
+            // FL-489: this view OWNS its counter — page 1 was
+            // requested, so the counter is 1; the parser-reported
+            // currentPage never overwrites it (totalPages is
+            // still adopted from the parser).
+            page = 1
             totalPages = max(result.pagination.totalPages, 1)
         } catch {
             guard gen == loadGeneration else { return }
@@ -746,13 +764,23 @@ struct TVSearchResultsView: View {
         guard didLoad, !isLoading, !isLoadingMore, page >= 1, page < totalPages else { return }
         let gen = loadGeneration
         isLoadingMore = true
+        let requestedPage = page + 1
         do {
-            let result = try await service.search(pluginId: pluginId, keyword: query, page: page + 1)
+            let result = try await service.search(pluginId: pluginId, keyword: query, page: requestedPage)
             guard gen == loadGeneration else { isLoadingMore = false; return }
             let known = Set(items.map(\.id))
-            items.append(contentsOf: result.items.filter { !known.contains($0.id) })
-            page = result.pagination.currentPage
-            totalPages = max(result.pagination.totalPages, 1)
+            let newItems = result.items.filter { !known.contains($0.id) }
+            items.append(contentsOf: newItems)
+            // FL-489: counter = the REQUESTED page, never the
+            // parser-reported currentPage; a page adding ZERO
+            // new items ends this list's pagination (totalPages
+            // clamped to the counter so the guard closes).
+            page = requestedPage
+            if newItems.isEmpty {
+                totalPages = requestedPage
+            } else {
+                totalPages = max(result.pagination.totalPages, 1)
+            }
         } catch {
             DiagLog.log("search", "results loadMore failed kind=\((error as NSError).domain)#\((error as NSError).code)")
         }

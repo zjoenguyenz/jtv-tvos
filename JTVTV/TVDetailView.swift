@@ -150,7 +150,9 @@ struct TVDetailView: View {
         DiagLog.log("detail", "body plugin=\(pluginId) movie=\(movie.id) backdrop=\(DiagLog.urlForLog(backdropURL))")
         return ZStack {
             if let detail {
-                TVBackdropView(urlString: backdropURL, fallbackTitle: movie.title,
+                TVBackdropView(urlString: backdropURL,
+                               headers: (detail.sourcePageURL ?? movie.sourcePageURL).map { ["Referer": $0] } ?? [:],
+                               fallbackTitle: movie.title,
                                previewStream: previewStream,
                                previewGeneration: previewGeneration,
                                onPreviewRetired: { _ in
@@ -307,6 +309,7 @@ struct TVDetailView: View {
     private func headerBand(_ detail: MovieDetail) -> some View {
         HStack(alignment: .bottom, spacing: 34) {
             TVRemoteImage(urlString: detail.posterUrl.isEmpty ? movie.posterUrl : detail.posterUrl,
+                          headers: (detail.sourcePageURL ?? movie.sourcePageURL).map { ["Referer": $0] } ?? [:],
                           bucket: 960)
                 .frame(width: 184, height: 276)
                 .clipShape(RoundedRectangle(cornerRadius: theme.posterRadius, style: .continuous))
@@ -1026,6 +1029,21 @@ struct TVDetailView: View {
     /// panel's shortlist (iOS §1.5). Single-server non-javhd
     /// titles: empty (no auto-selection, panel falls back to
     /// allEpisodes — unchanged).
+    /// Source reputation (DESIGN §3.3 surface 4): seed the
+    /// shortlist's initial candidate order with the same stable
+    /// sort the other surfaces use. Every candidate in a
+    /// shortlist belongs to this detail's ONE plugin, so all
+    /// ordering keys are equal and the sort is the identity —
+    /// today's order is reproduced exactly, and the session's
+    /// live auto-measure still governs picks within the session
+    /// (that mechanism is untouched). The torrenthub branch
+    /// keeps its own server-rank rule for the same reason: its
+    /// candidates share the torrenthub key, so a reputation
+    /// sort there is the identity too.
+    private func repSeeded(_ list: [Episode]) -> [Episode] {
+        SourceReputation.shared.sortedByReputation(list, surface: "switch-shortlist") { _ in pluginId }
+    }
+
     private func switchShortlist(current: Episode, detail: MovieDetail) -> [Episode] {
         if pluginId == "javhd" {
             // L-T23 (1.3.3): AUTO-SELECTION candidates for the
@@ -1059,7 +1077,7 @@ struct TVDetailView: View {
             for server in detail.servers where server.id != currentServer?.id {
                 for episode in server.episodes { add(episode) }
             }
-            return Array(list.prefix(12))
+            return repSeeded(Array(list.prefix(12)))
         }
         if pluginId != "torrenthub" {
             // L-T30 (1.3.4): AUTO-SELECTION candidates for
@@ -1113,7 +1131,7 @@ struct TVDetailView: View {
                     list.append(correspondent)
                 }
             }
-            return Array(list.prefix(12))
+            return repSeeded(Array(list.prefix(12)))
         }
         // torrenthub (unchanged): all servers ranked ⭐-named
         // first → "MediaFusion" → rest, episodes flattened,

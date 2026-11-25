@@ -199,7 +199,9 @@ private struct TVHistoryRow: View {
             onSelect()
         } label: {
             HStack(spacing: 24) {
-                TVRemoteImage(urlString: record.movie.posterUrl, bucket: 480)
+                TVRemoteImage(urlString: record.movie.posterUrl,
+                              headers: record.movie.sourcePageURL.map { ["Referer": $0] } ?? [:],
+                              bucket: 480)
                     .frame(width: 108, height: 162)
                     .clipShape(RoundedRectangle(cornerRadius: theme.posterRadius, style: .continuous))
                 VStack(alignment: .leading, spacing: 10) {

@@ -140,7 +140,11 @@ final class TVHomeStore {
                     items[sectionId] = movies.uniquedById()
                     sectionErrors[sectionId] = nil
                     if !movies.isEmpty {
-                        ImageCacheManager.shared.prefetch(urlStrings: movies.map(\.posterUrl))
+                        // FL-488: a section's movies were all
+                        // served by the one list page — its URL
+                        // rides the prefetch as their Referer.
+                        ImageCacheManager.shared.prefetch(urlStrings: movies.map(\.posterUrl),
+                                                          headers: movies.first?.sourcePageURL.map { ["Referer": $0] } ?? [:])
                     }
                 case .failure(let error):
                     // Per-section errors publish per section,
@@ -429,7 +433,9 @@ private struct TVHeroCard: View {
             ZStack {
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
                     .fill(theme.cardFill)
-                TVRemoteImage(urlString: movie.displayBackdrop, bucket: 1920,
+                TVRemoteImage(urlString: movie.displayBackdrop,
+                              headers: movie.sourcePageURL.map { ["Referer": $0] } ?? [:],
+                              bucket: 1920,
                               failed: $imageFailed, retryToken: retryToken)
                 if imageFailed {
                     theme.backgroundGradient

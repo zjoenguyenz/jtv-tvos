@@ -196,6 +196,35 @@ final class MovieService: ObservableObject {
             || path.hasSuffix(".html") || path.hasSuffix(".htm") || path.hasSuffix(".php")
     }
 
+    /// Engine-side form encoding for fetch-spec postFields (§3.3):
+    /// sorted keys, RFC 3986 unreserved set literal, every other
+    /// UTF-8 byte as uppercase %XX.
+    private static func formEncode(_ fields: [String: String]) -> String {
+        func enc(_ s: String) -> String {
+            var out = ""
+            for byte in s.utf8 {
+                // The unreserved test is on the BYTE (gate fix,
+                // R1): Character.isLetter/isNumber would pass
+                // UTF-8 bytes >= 0x80 whose Latin-1 code point is
+                // a letter/number through literally; §3.3 wants
+                // every non-ASCII byte as %XX.
+                let unreserved = (byte >= 65 && byte <= 90)        // A-Z
+                    || (byte >= 97 && byte <= 122)                 // a-z
+                    || (byte >= 48 && byte <= 57)                  // 0-9
+                    || byte == 45 || byte == 46                    // - .
+                    || byte == 95 || byte == 126                   // _ ~
+                if unreserved {
+                    out.append(Character(UnicodeScalar(byte)))
+                } else {
+                    out += String(format: "%%%02X", byte)
+                }
+            }
+            return out
+        }
+        return fields.keys.sorted().map { "\(enc($0))=\(enc(fields[$0] ?? ""))" }
+            .joined(separator: "&")
+    }
+
     /// L-16 (1.3.6): the resolve-duration line's outcome
     /// vocabulary for a finished resolution.
     private static func chainOutcomeLabel(_ resolution: PlaybackResolution) -> String {
@@ -241,7 +270,15 @@ final class MovieService: ObservableObject {
             throw MovieServiceError.noURL
         }
         let text = try await fetchPage(url)
-        let parsed = await engine.parseList(text: text)
+        var parsed = await engine.parseList(text: text)
+        // FL-488 root fix: stamp the serving page URL onto
+        // every returned movie, so its image loads can send
+        // that page as the Referer (see Movie.sourcePageURL).
+        parsed.items = parsed.items.map { movie in
+            var stamped = movie
+            stamped.sourcePageURL = url
+            return stamped
+        }
         // Metadata overlay (1.22.20): the cache stores the
         // RAW parse; the overlay merge applies at return,
         // so an overlay landing mid-session takes effect
@@ -259,7 +296,13 @@ final class MovieService: ObservableObject {
             throw MovieServiceError.noURL
         }
         let text = try await fetchPage(url)
-        let parsed = await engine.parseSearch(text: text)
+        var parsed = await engine.parseSearch(text: text)
+        // FL-488 root fix: same serving-page stamp as list().
+        parsed.items = parsed.items.map { movie in
+            var stamped = movie
+            stamped.sourcePageURL = url
+            return stamped
+        }
         storeListPage(parsed, forKey: cacheKey)
         return MetadataOverlay.merged(parsed)
     }
@@ -313,7 +356,11 @@ final class MovieService: ObservableObject {
         async let parsedDetail = engine.parseMovieDetail(text: text, url: url)
         async let parsedStream = engine.parseStream(text: text, url: url)
         let (detail, stream) = await (parsedDetail, parsedStream)
-        guard let detail else { throw MovieServiceError.emptyDetail }
+        guard var detail else { throw MovieServiceError.emptyDetail }
+        // FL-488 root fix: stamp the detail page URL the record
+        // was parsed from — detail-derived images (poster,
+        // backdrop) send it as their Referer.
+        detail.sourcePageURL = url
         // Metadata overlay (1.22.20): merged here, at
         // construction — detailStreams only swaps the
         // server list afterwards, so the merged display
@@ -499,8 +546,8 @@ final class MovieService: ObservableObject {
     /// Resolves an episode tap following the plugin episode semantics:
     /// direct media -> native player; manga chapter API -> images;
     /// embed page -> plugin embed/detail parser, else webview sniffer.
-    func resolveEpisode(_ request: PlaybackRequest, onDebridPhase: (@Sendable (DebridPhaseEvent) -> Void)? = nil) async throws -> PlaybackResolution {
-        try await resolveEpisode(request, joiningPrefetch: true, onDebridPhase: onDebridPhase)
+    func resolveEpisode(_ request: PlaybackRequest, probeOnly: Bool = false, onDebridPhase: (@Sendable (DebridPhaseEvent) -> Void)? = nil) async throws -> PlaybackResolution {
+        try await resolveEpisode(request, joiningPrefetch: true, probeOnly: probeOnly, onDebridPhase: onDebridPhase)
     }
 
     /// L-T12 (1.3.1) PROBE-ONLY façade for the Detail backdrop
@@ -601,7 +648,24 @@ final class MovieService: ObservableObject {
         // default is a canary — if it ever reaches a log, an
         // exit was missed.
         var chainOutcome = "error kind=unannotated"
-        defer { DiagLog.log("resolve", "duration plugin=\(pluginId) ms=\(Int(Date().timeIntervalSince(chainStart) * 1000)) outcome=\(chainOutcome)") }
+        defer {
+            let resolveMs = Int(Date().timeIntervalSince(chainStart) * 1000)
+            DiagLog.log("resolve", "duration plugin=\(pluginId) ms=\(resolveMs) outcome=\(chainOutcome)")
+            // Source reputation (DESIGN §3.2): this defer is the
+            // ONE choke point that sees (pluginId, elapsed ms,
+            // terminal outcome) for every resolve — feed the
+            // resolve stats here. Numbers only: resolve data
+            // orders within a tier via resolveEmaMs and counts
+            // resolveFailures; it never makes a tier by itself.
+            // Probes never feed (FL-486 discipline, gate fix
+            // R1): the preview façade resolves with
+            // probeOnly == true and must leave no trace in the
+            // table — not even resolve stats.
+            if !probeOnly {
+                SourceReputation.shared.recordResolve(key: pluginId, ms: resolveMs,
+                                                      success: !chainOutcome.hasPrefix("error"))
+            }
+        }
         let target = request.episode.id
         guard !target.isEmpty else {
             DiagLog.log("resolve", "error plugin=\(pluginId) empty target")
@@ -821,6 +885,9 @@ final class MovieService: ObservableObject {
             throw error
         }
         var lastEmbedURL = target
+        // Fetch-spec §3.5: signature of the last followed SPEC
+        // step (legacy steps never enter the guard).
+        var lastSpecSignature = ""
         // Embed-chain parse budget: 4 by default (the historical
         // bound). A plugin may declare a larger need in its
         // manifest (maxChainParses — hentaihub's watch-started
@@ -874,7 +941,12 @@ final class MovieService: ObservableObject {
             // the very page we already fetched. Refetching it changes
             // nothing — hand it to the sniffing webview now, keeping
             // the plugin's step headers for the page load.
-            if step.url == currentURL, let pageURL = URL(string: step.url) {
+            // Fetch-spec H1: a step with refetch=true is exempt —
+            // it falls through to the follow block below and the
+            // same URL is fetched again (the cookie pass: the
+            // first GET sets a session cookie, the second GET
+            // with it returns the real page).
+            if step.url == currentURL, !step.refetch, let pageURL = URL(string: step.url) {
                 var pageHeaders = step.headers
                 if pageHeaders.isEmpty { pageHeaders = currentHeaders }
                 DiagLog.log("resolve", "route=embed via=self-embed url=\(DiagLog.urlForLog(step.url))")
@@ -888,8 +960,61 @@ final class MovieService: ObservableObject {
                 currentHeaders = (await defaultHeaders(for: pluginId)).merging(step.headers) { _, new in new }
             }
             do {
-                if let body = step.postBody, !body.isEmpty {
-                    payload = try await Net.fetchTextPOST(currentURL, body: body, headers: currentHeaders)
+                // Fetch-spec dispatch (DESIGN §3.2/§4.3 H2). A step
+                // with NO spec fields reduces to the legacy rule
+                // bit-for-bit: POST iff a non-empty postBody, via
+                // fetchTextPOST with contentType nil (its legacy
+                // Content-Type branch). Spec steps resolve method /
+                // body / Content-Type explicitly and are covered by
+                // the consecutive-identical-spec loop guard (§3.5).
+                let isSpec = step.fetchMethod != nil || step.postFields != nil
+                    || step.postContentType != nil || step.refetch
+                // An unrecognised fetchMethod value is treated as
+                // nil — the legacy rule — and never throws (§3.2).
+                let methodToken = step.fetchMethod?.uppercased()
+                let explicitMethod = (methodToken == "GET" || methodToken == "POST") ? methodToken : nil
+                let wantsPost = explicitMethod == "POST"
+                    || (explicitMethod == nil
+                        && (step.postBody?.isEmpty == false || step.postFields?.isEmpty == false))
+                // Body + Content-Type resolution (§3.2, gate fix
+                // R1): postBody raw wins; else postFields encoded
+                // per postContentType ("json" -> JSON serialisation
+                // with sorted keys; anything else -> form
+                // encoding). An empty postContentType is treated
+                // as absent — verbatim applies to non-empty
+                // strings only — so the legacy Content-Type rule
+                // (headers map, then form default) decides.
+                let specMime: String? = {
+                    guard let ct = step.postContentType, !ct.isEmpty else { return nil }
+                    switch ct.lowercased() {
+                    case "form": return "application/x-www-form-urlencoded"
+                    case "json": return "application/json"
+                    default: return ct
+                    }
+                }()
+                let specBody: String = {
+                    if let raw = step.postBody { return raw }
+                    guard let fields = step.postFields else { return "" }
+                    if step.postContentType?.lowercased() == "json" {
+                        let data = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])
+                        return data.flatMap { String(data: $0, encoding: .utf8) } ?? Self.formEncode(fields)
+                    }
+                    return Self.formEncode(fields)
+                }()
+                if isSpec {
+                    let signature = (wantsPost ? "POST" : "GET") + "\n" + currentURL + "\n"
+                        + specBody + "\n"
+                        + (step.postContentType ?? "")
+                    if signature == lastSpecSignature {
+                        DiagLog.log("resolve", "spec loop-guard plugin=\(pluginId) hop=\(hopIndex + 1)")
+                        break
+                    }
+                    lastSpecSignature = signature
+                    DiagLog.log("resolve", "spec plugin=\(pluginId) hop=\(hopIndex + 1) method=\(wantsPost ? "POST" : "GET") host=\(URL(string: currentURL)?.host ?? "?") refetch=\(step.refetch ? 1 : 0)")
+                }
+                if wantsPost {
+                    payload = try await Net.fetchTextPOST(currentURL, body: specBody,
+                                                          headers: currentHeaders, contentType: specMime)
                 } else {
                     payload = try await Net.fetchText(currentURL, headers: currentHeaders)
                 }
@@ -2031,10 +2156,16 @@ final class ActorMergeCoordinator {
         beginDate = Date()
         DiagLog.log("actor", "merge begin origin=\(originPluginId) name=\(name) targets=\(targets.joined(separator: ","))")
         if let page = originFirstPage {
+            // FL-489: the coordinator OWNS its counter — the
+            // origin's first page was REQUESTED as page 1 (the
+            // shells' exact call), so the cursor is 1; the
+            // parser-reported pagination.currentPage must never
+            // overwrite it (totalPages is still adopted). A
+            // first page that added no items ends this target.
             cursors[originPluginId] = Cursor(route: originRoute,
-                                             page: page.pagination.currentPage,
+                                             page: 1,
                                              totalPages: max(page.pagination.totalPages, 1),
-                                             exhausted: false)
+                                             exhausted: page.items.isEmpty)
             appendBlock(pluginId: originPluginId, movies: page.items, isOrigin: true)
         } else {
             cursors[originPluginId] = Cursor(route: originRoute, page: 1, totalPages: 1, exhausted: true)
@@ -2122,11 +2253,23 @@ final class ActorMergeCoordinator {
         }
         guard !frozen else { return }
         for pluginId in orderedIds {
-            guard fetchList.contains(where: { $0.pluginId == pluginId }) else { continue }
+            guard let requested = fetchList.first(where: { $0.pluginId == pluginId }) else { continue }
             if let fetched = results[pluginId], let page = fetched {
-                cursors[pluginId]?.page = page.pagination.currentPage
+                // FL-489: the cursor becomes the REQUESTED page
+                // (the parser's currentPage never overwrites it;
+                // totalPages is still adopted). Stop rule (gate
+                // correction R1): the target ends when its OWN
+                // page comes back empty — NOT when the page adds
+                // no new merged rows: a page made entirely of
+                // other sources' titles says nothing about the
+                // target's later pages, and production paged on
+                // to totalPages there.
+                cursors[pluginId]?.page = requested.page
                 cursors[pluginId]?.totalPages = max(page.pagination.totalPages, 1)
                 appendBlock(pluginId: pluginId, movies: page.items, isOrigin: pluginId == originPluginId)
+                if page.items.isEmpty {
+                    cursors[pluginId]?.exhausted = true
+                }
             } else {
                 cursors[pluginId]?.exhausted = true
             }
@@ -2168,10 +2311,15 @@ final class ActorMergeCoordinator {
         targetStates[pluginId] = .settled(result.contribution)
         if let contribution = result.contribution {
             contributedTargets.insert(pluginId)
+            // FL-489: the target's first page was REQUESTED as
+            // page 1 (actorContributionDetailed's exact call), so
+            // the cursor is 1 — never the parser-reported
+            // currentPage (totalPages is still adopted). A first
+            // page with no items ends this target.
             cursors[pluginId] = Cursor(route: contribution.route,
-                                       page: contribution.firstPage.pagination.currentPage,
+                                       page: 1,
                                        totalPages: max(contribution.firstPage.pagination.totalPages, 1),
-                                       exhausted: false)
+                                       exhausted: contribution.firstPage.items.isEmpty)
         }
         releaseReadyBlocks()
         finishIfSettled()

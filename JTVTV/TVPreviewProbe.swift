@@ -123,7 +123,10 @@ enum TVPreviewProbe {
                 // MediaFusion / direct-URL episode: the C1
                 // route classifies it to .video with no network
                 // fetch (container suffix or MF credential host).
-                if let resolution = try? await service.resolveEpisode(request),
+                // probeOnly: a preview probe leaves no trace in
+                // the reputation table, not even resolve stats
+                // (FL-486 discipline, gate fix attempt 2).
+                if let resolution = try? await service.resolveEpisode(request, probeOnly: true),
                    case .video(let stream) = resolution {
                     DiagLog.log("preview", "probe rung=torrent-http outcome=video host=\(URL(string: stream.url)?.host ?? "?")")
                     return playable(stream, rung: "torrent-http")

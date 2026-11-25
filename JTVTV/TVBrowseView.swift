@@ -451,7 +451,13 @@ struct TVBrowseView: View {
             let result = try await service.list(pluginId: pluginId, slug: slug, filters: filters, page: 1)
             guard gen == loadGeneration else { return }
             items = result.items.uniquedById()
-            page = result.pagination.currentPage
+            // FL-489: this view OWNS its counter — page 1 was
+            // requested, so the counter is 1. The parser-reported
+            // pagination.currentPage must never overwrite it
+            // (a parser that mis-reports it shifted every later
+            // request and the list stalled at ~40 items);
+            // totalPages is still adopted from the parser.
+            page = 1
             totalPages = max(result.pagination.totalPages, 1)
         } catch {
             guard gen == loadGeneration else { return }
@@ -468,13 +474,25 @@ struct TVBrowseView: View {
         guard didLoad, !isLoading, !isLoadingMore, page >= 1, page < totalPages else { return }
         let gen = loadGeneration
         isLoadingMore = true
+        let requestedPage = page + 1
         do {
-            let result = try await service.list(pluginId: pluginId, slug: slug, filters: filters, page: page + 1)
+            let result = try await service.list(pluginId: pluginId, slug: slug, filters: filters, page: requestedPage)
             guard gen == loadGeneration else { isLoadingMore = false; return }
             let known = Set(items.map(\.id))
-            items.append(contentsOf: result.items.filter { !known.contains($0.id) })
-            page = result.pagination.currentPage
-            totalPages = max(result.pagination.totalPages, 1)
+            let newItems = result.items.filter { !known.contains($0.id) }
+            items.append(contentsOf: newItems)
+            // FL-489: the counter becomes the REQUESTED page,
+            // never the parser-reported currentPage. Stop rule:
+            // a page that adds ZERO new items (after dedupe)
+            // ends pagination for this list even if totalPages
+            // suggests more — totalPages is clamped to the
+            // counter so the loadMore guard closes.
+            page = requestedPage
+            if newItems.isEmpty {
+                totalPages = requestedPage
+            } else {
+                totalPages = max(result.pagination.totalPages, 1)
+            }
         } catch {
             // Non-fatal (iOS discipline): keep what's on screen.
             DiagLog.log("browse", "loadMore failed plugin=\(pluginId) slug=\(slug) kind=\((error as NSError).domain)#\((error as NSError).code)")

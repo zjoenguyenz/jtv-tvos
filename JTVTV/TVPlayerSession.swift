@@ -500,6 +500,12 @@ final class TVPlayerSession: ObservableObject {
         guard !isStopped else { return }
         attemptID += 1
         let attempt = attemptID
+        // Reputation (gate fix R1): a new attempt gets a clean
+        // serving-provider slate — DebridResolver.lastServedProvider
+        // may only be set by THIS attempt's own debrid serve
+        // (logServed), so a previous/interleaved play's provider
+        // can never be credited with this attempt's outcome.
+        DebridResolver.clearLastServedProvider()
         recordedSeekTarget = resumeTarget
         attemptStartDate = Date()
         resolveDoneDate = nil
@@ -1615,6 +1621,33 @@ final class TVPlayerSession: ObservableObject {
         return recordedSeekTarget
     }
 
+    // MARK: - Source reputation feeds (DESIGN §3.2)
+
+    /// On the hash path the serving plugin is torrenthub, but
+    /// the stream itself was served by a debrid provider — the
+    /// play outcome is ALSO recorded against the provider
+    /// pseudo-id DebridResolver remembered at its logServed
+    /// point. Nil for every non-hash play.
+    private var debridReputationKey: String? {
+        guard currentRequest.episode.id.hasPrefix("jtvhash:"),
+              let provider = DebridResolver.lastServedProvider else { return nil }
+        return "debrid:\(provider)"
+    }
+
+    private func recordPlaySuccess(firstFrameMs: Int) {
+        SourceReputation.shared.recordSuccess(key: playingPluginId, firstFrameMs: firstFrameMs)
+        if let debridReputationKey {
+            SourceReputation.shared.recordSuccess(key: debridReputationKey, firstFrameMs: firstFrameMs)
+        }
+    }
+
+    private func recordPlayFailure() {
+        SourceReputation.shared.recordFailure(key: playingPluginId)
+        if let debridReputationKey {
+            SourceReputation.shared.recordFailure(key: debridReputationKey)
+        }
+    }
+
     /// First frame on a surface. Emits the §6 firstframe line
     /// and, once per attempt, the computed press-to-firstframe
     /// aggregate JoeTV does not compute.
@@ -1636,6 +1669,10 @@ final class TVPlayerSession: ObservableObject {
         let resolveMs = resolveDoneDate.map { Int($0.timeIntervalSince(attemptStart) * 1000) } ?? 0
         let loadMs = resolveDoneDate.map { Int(now.timeIntervalSince($0) * 1000) } ?? 0
         DiagLog.log("player", "press-to-firstframe attempt=\(attempt) total=\(total) (resolve=\(resolveMs) load=\(loadMs))")
+        // Source reputation (DESIGN §3.2): first frame reached =
+        // a play success for the SERVING plugin, carrying the
+        // start-to-first-frame ms computed above.
+        recordPlaySuccess(firstFrameMs: ms)
     }
 
     /// The shared resume rule's outcome, reported by whichever
@@ -1653,6 +1690,9 @@ final class TVPlayerSession: ObservableObject {
     func itemFailed(attempt: Int, errorLabel: String) {
         guard attempt == attemptID, case .playing = phase else { return }
         DiagLog.log("player", "fail attempt=\(attempt) stage=load error=\(errorLabel)")
+        // Source reputation (DESIGN §3.2): a served stream died
+        // in the player — a play failure for the serving plugin.
+        recordPlayFailure()
         phase = .failed(TVPlayerFailure(
             stage: .load,
             message: "Nguồn phát bị lỗi. Thử lại hoặc đổi nguồn khác.",
@@ -1680,6 +1720,11 @@ final class TVPlayerSession: ObservableObject {
             return
         }
         DiagLog.log("player", "watchdog.fail attempt=\(attempt) surface=\(surface) waited=\(waitedSeconds)")
+        // Source reputation (DESIGN §3.2): the failure hook sits
+        // HERE — the terminal point, AFTER the auto-switch
+        // decision above — so a stall the auto-switch rescued
+        // is never recorded as a failure.
+        recordPlayFailure()
         phase = .failed(TVPlayerFailure(
             stage: .watchdog,
             message: "Nguồn không phát sau \(waitedSeconds) giây. Thử lại hoặc đổi nguồn khác.",

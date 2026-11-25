@@ -284,7 +284,12 @@ struct TVPosterCard: View {
         ZStack {
             RoundedRectangle(cornerRadius: theme.posterRadius, style: .continuous)
                 .fill(slotColor)
-            TVRemoteImage(urlString: movie.posterUrl, bucket: 720,
+            // FL-488: the movie's serving page rides as the
+            // Referer when it carries one; absent = today's
+            // host-root synthesis inside fetchBytes.
+            TVRemoteImage(urlString: movie.posterUrl,
+                          headers: movie.sourcePageURL.map { ["Referer": $0] } ?? [:],
+                          bucket: 720,
                           failed: $imageFailed, retryToken: retryToken)
         }
         .frame(width: width, height: width * 1.5)
@@ -437,7 +442,9 @@ struct TVLandscapeCard: View {
         ZStack {
             RoundedRectangle(cornerRadius: artRadius, style: .continuous)
                 .fill(theme.cardFill)
-            TVRemoteImage(urlString: record.movie.displayBackdrop, bucket: 720)
+            TVRemoteImage(urlString: record.movie.displayBackdrop,
+                          headers: record.movie.sourcePageURL.map { ["Referer": $0] } ?? [:],
+                          bucket: 720)
         }
         .frame(width: width, height: artHeight)
         .overlay {
@@ -581,6 +588,9 @@ struct TVChip: View {
 /// acceptable (content identity preserved).
 struct TVBackdropView: View {
     let urlString: String
+    /// FL-488: image headers (the serving page as Referer when
+    /// the caller has one); empty = today's behaviour.
+    var headers: [String: String] = [:]
     let fallbackTitle: String
     /// NEXT-D D2 (1.3.0, study §3.1 option (a)): the preview
     /// layer slot — a resolved preview stream fades in BETWEEN
@@ -599,11 +609,12 @@ struct TVBackdropView: View {
     /// the memberwise init, so the preview properties must be
     /// parameters here — with defaults, so call sites that pass
     /// no preview stay terse.
-    init(urlString: String, fallbackTitle: String,
+    init(urlString: String, headers: [String: String] = [:], fallbackTitle: String,
          previewStream: StreamInfo? = nil,
          previewGeneration: Int = 0,
          onPreviewRetired: ((String) -> Void)? = nil) {
         self.urlString = urlString
+        self.headers = headers
         self.fallbackTitle = fallbackTitle
         self.previewStream = previewStream
         self.previewGeneration = previewGeneration
@@ -630,7 +641,7 @@ struct TVBackdropView: View {
                 if urlString.isEmpty {
                     standIn
                 } else {
-                    TVRemoteImage(urlString: urlString, bucket: 1920, contentMode: .fill, failed: $imageFailed)
+                    TVRemoteImage(urlString: urlString, headers: headers, bucket: 1920, contentMode: .fill, failed: $imageFailed)
                         .frame(width: geo.size.width, height: geo.size.height)
                         .clipped()
                     if imageFailed {

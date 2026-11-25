@@ -638,7 +638,9 @@ struct TVActorView: View {
                         .multilineTextAlignment(.center)
                         .padding(40)
                 } else {
-                    TVRemoteImage(urlString: row.movie.displayBackdrop, bucket: 1920)
+                    TVRemoteImage(urlString: row.movie.displayBackdrop,
+                                  headers: row.movie.sourcePageURL.map { ["Referer": $0] } ?? [:],
+                                  bucket: 1920)
                 }
                 if let previewStream {
                     TVBackdropPreviewHost(
