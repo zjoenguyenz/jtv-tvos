@@ -112,7 +112,10 @@ struct TVCategoryView: View {
             }
         }
         .tvThemedBackground()
-        .onAppear { session.touch() }
+        .onAppear {
+            session.touch()
+            DiagLog.log("category", "tab appear plugin=\(plugins.activePluginId) depth=\(nav.path.count)")
+        }
         .task(id: plugins.activePluginId) { await load() }
     }
 
@@ -186,6 +189,8 @@ struct TVCategoryView: View {
         didLoad = true
         if p.isEmpty && c.isEmpty && co.isEmpty && y.isEmpty {
             DiagLog.log("category", "all lists empty plugin=\(pid)")
+        } else {
+            DiagLog.log("category", "tab load end plugin=\(pid) primary=\(p.count) categories=\(c.count) countries=\(co.count) years=\(y.count)")
         }
         isLoading = false
     }

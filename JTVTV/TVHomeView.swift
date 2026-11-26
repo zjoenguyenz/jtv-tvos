@@ -42,6 +42,23 @@ final class TVHomeStore {
     private var loadedAt: Date?
     private var generation = 0
 
+    /// L-T42 vòng 3 (1.3.19): the background rail fill — after
+    /// a source publishes, every horizontal rail is topped up
+    /// from its next pages in the background, so the rails are
+    /// already long when the user steps through them (log_8:
+    /// every publish was page 1 only — 12 cards a rail — and in
+    /// three sessions the owner never reached the focus-driven
+    /// append trigger; on iOS the same rails feel endless
+    /// because scrolling is continuous). One fill per published
+    /// plugin; a new load cancels it (and its generation guard
+    /// would drop its results anyway).
+    @ObservationIgnored private var fillTask: Task<Void, Never>?
+    /// Each horizontal rail is filled up to this many cards in
+    /// the background (≈4 pages of a 12-item source, 2 of a
+    /// 24-item one). Past it, the focus-driven append below
+    /// keeps paging the rail endlessly as the user walks it.
+    static let backgroundFillTarget = 48
+
     /// A-14 (1.3.9): per-plugin snapshots of a completed
     /// load. Switching A→B→A inside the freshness window
     /// restores A's snapshot instead of refetching every
@@ -171,6 +188,7 @@ final class TVHomeStore {
             // swap just landed on Home, in which shape. The
             // focus lines beside it say where focus went.
             DiagLog.log("home", "publish path=snapshot plugin=\(pid) sections=\(sections.count) items=\(items.values.reduce(0) { $0 + $1.count }) hero=\(heroMovie?.id ?? "nil") failed=\(sectionErrors.count)")
+            startBackgroundFill(plugins: plugins, service: service)
             return true
         }
         if loadedPluginId != pid {
@@ -204,6 +222,8 @@ final class TVHomeStore {
             sectionFinished = []
             sectionsLoadingMore = [:]
         }
+        fillTask?.cancel()
+        fillTask = nil
         isLoading = true
         let secs = await service.homeSections(pluginId: pid)
         // L-T44 (1.3.17, DESIGN §4.2.5): a superseded load
@@ -281,8 +301,12 @@ final class TVHomeStore {
                         // FL-488: a section's movies were all
                         // served by the one list page — its URL
                         // rides the prefetch as their Referer.
+                        // 1.3.19 (S-3): APPEND — the sections land
+                        // in parallel and must not evict each
+                        // other's pending warm-ups.
                         ImageCacheManager.shared.prefetch(urlStrings: movies.map(\.posterUrl),
-                                                          headers: movies.first?.sourcePageURL.map { ["Referer": $0] } ?? [:])
+                                                          headers: movies.first?.sourcePageURL.map { ["Referer": $0] } ?? [:],
+                                                          replace: false)
                     }
                 case .failure(let error):
                     // Per-section errors publish per section,
@@ -309,6 +333,7 @@ final class TVHomeStore {
             storeSnapshot(for: pid, hero: hero, at: Date())
             // L-T41 §5.3 (1.3.15): publish line, fresh path.
             DiagLog.log("home", "publish path=fresh plugin=\(pid) sections=\(sections.count) items=\(items.values.reduce(0) { $0 + $1.count }) hero=\(heroMovie?.id ?? "nil") failed=\(sectionErrors.count)")
+            startBackgroundFill(plugins: plugins, service: service)
             return true
         }
         // L-T44 (1.3.17, DESIGN §4.2.5): the last guard
@@ -334,15 +359,23 @@ final class TVHomeStore {
     /// same-generation page-1 republish in between drops
     /// the append instead of stitching a stale page onto
     /// fresh page 1.
-    func loadMoreSection(sectionId: String, plugins: PluginManager, service: MovieService) async {
-        guard let pid = loadedPluginId, pid == plugins.activePlugin?.id else { return }
-        guard let section = sections.first(where: { $0.id == sectionId }) else { return }
+    /// 1.3.19: `prefetchImages` is false for the background
+    /// fill — ImageCacheManager.prefetch REPLACES its pending
+    /// queue, so a background page must never evict the warm-up
+    /// of the posters the user is actually looking at; fill
+    /// cards load their own art when they scroll into view.
+    /// Returns whether the call appended at least one item.
+    @discardableResult
+    func loadMoreSection(sectionId: String, plugins: PluginManager, service: MovieService,
+                         prefetchImages: Bool = true) async -> Bool {
+        guard let pid = loadedPluginId, pid == plugins.activePlugin?.id else { return false }
+        guard let section = sections.first(where: { $0.id == sectionId }) else { return false }
         guard let current = sectionPages[sectionId],
-              let total = sectionTotalPages[sectionId] else { return }
-        guard current < total else { return }
-        guard !sectionFinished.contains(sectionId) else { return }
-        guard sectionErrors[sectionId] == nil else { return }
-        guard sectionsLoadingMore[sectionId] == nil else { return }
+              let total = sectionTotalPages[sectionId] else { return false }
+        guard current < total else { return false }
+        guard !sectionFinished.contains(sectionId) else { return false }
+        guard sectionErrors[sectionId] == nil else { return false }
+        guard sectionsLoadingMore[sectionId] == nil else { return false }
         let gen = generation
         sectionsLoadingMore[sectionId] = gen
         defer {
@@ -355,30 +388,109 @@ final class TVHomeStore {
         do {
             let result = try await service.list(pluginId: pid, slug: section.slug,
                                                 filters: ListFilters(), page: next)
-            guard gen == generation, loadedPluginId == pid else { return }
+            guard gen == generation, loadedPluginId == pid else { return false }
             guard sectionPages[sectionId] == current,
-                  (items[sectionId]?.count ?? 0) == countAtStart else { return }
+                  (items[sectionId]?.count ?? 0) == countAtStart else { return false }
             let existing = items[sectionId] ?? []
             var seen = Set(existing.map(\.id))
             let fresh = result.items.filter { seen.insert($0.id).inserted }
             if !fresh.isEmpty {
                 items[sectionId] = existing + fresh
-                ImageCacheManager.shared.prefetch(urlStrings: fresh.map(\.posterUrl),
-                                                  headers: fresh.first?.sourcePageURL.map { ["Referer": $0] } ?? [:])
+                if prefetchImages {
+                    ImageCacheManager.shared.prefetch(urlStrings: fresh.map(\.posterUrl),
+                                                      headers: fresh.first?.sourcePageURL.map { ["Referer": $0] } ?? [:])
+                }
             }
             sectionPages[sectionId] = next
             sectionTotalPages[sectionId] = max(sectionTotalPages[sectionId] ?? total, result.pagination.totalPages)
             if fresh.isEmpty {
                 sectionFinished.insert(sectionId)
             }
-            DiagLog.log("home", "rail append section=\(section.slug) page=\(next) added=\(fresh.count) total=\(items[sectionId]?.count ?? 0)")
+            DiagLog.log("home", "rail append section=\(section.slug) page=\(next) added=\(fresh.count) total=\(items[sectionId]?.count ?? 0)\(prefetchImages ? "" : " via=fill")")
+            return !fresh.isEmpty
         } catch {
             DiagLog.log("home", "rail append failed section=\(section.slug) page=\(next) kind=\((error as NSError).domain)#\((error as NSError).code)")
+            return false
+        }
+    }
+
+    /// Whether the section can still page (the same guards
+    /// loadMoreSection applies, minus the in-flight marker).
+    private func canPage(_ sectionId: String) -> Bool {
+        guard let current = sectionPages[sectionId],
+              let total = sectionTotalPages[sectionId] else { return false }
+        return current < total && !sectionFinished.contains(sectionId) && sectionErrors[sectionId] == nil
+    }
+
+    /// L-T42 vòng 3 (1.3.19): top up every horizontal rail of
+    /// the published plugin to `backgroundFillTarget` cards,
+    /// round-robin across rails (so the first rails don't hog
+    /// it), one page at a time, through the same loadMoreSection
+    /// door the focus trigger uses — FL-489 page ownership,
+    /// dedupe, the finish rule and the generation guards all
+    /// apply unchanged. Grid bands show a fixed 9 cells on Home
+    /// and are skipped. A failed page stops that rail only.
+    /// The fill gives the visible screen a head start (300 ms)
+    /// before its first request.
+    func startBackgroundFill(plugins: PluginManager, service: MovieService) {
+        fillTask?.cancel()
+        guard let pid = loadedPluginId else { return }
+        let gen = generation
+        let target = Self.backgroundFillTarget
+        let railIds = sections.filter { !$0.isGrid }.map(\.id)
+        let wanted = railIds.filter { (items[$0]?.count ?? 0) < target && canPage($0) }
+        guard !wanted.isEmpty else { return }
+        fillTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard let self, !Task.isCancelled, gen == self.generation, self.loadedPluginId == pid else { return }
+            let started = Date()
+            let before = self.items.values.reduce(0) { $0 + $1.count }
+            DiagLog.log("home", "rail fill start plugin=\(pid) rails=\(wanted.count) target=\(target) items=\(before)")
+            var active = wanted
+            var pages = 0
+            while !active.isEmpty {
+                var next: [String] = []
+                for sid in active {
+                    if Task.isCancelled || gen != self.generation || self.loadedPluginId != pid {
+                        DiagLog.log("home", "rail fill stopped plugin=\(pid) reason=superseded pages=\(pages)")
+                        return
+                    }
+                    let grew = await self.loadMoreSection(sectionId: sid, plugins: plugins, service: service,
+                                                          prefetchImages: false)
+                    if grew { pages += 1 }
+                    if grew, (self.items[sid]?.count ?? 0) < target, self.canPage(sid) {
+                        next.append(sid)
+                    }
+                }
+                active = next
+            }
+            guard gen == self.generation, self.loadedPluginId == pid else { return }
+            let after = self.items.values.reduce(0) { $0 + $1.count }
+            DiagLog.log("home", "rail fill done plugin=\(pid) pages=\(pages) items=\(before)->\(after) ms=\(Int(Date().timeIntervalSince(started) * 1000))")
         }
     }
 }
 
 // MARK: - Home view
+
+/// L-T47/L-T48 (1.3.19): whether Home's tab is the SELECTED tab
+/// of the root TabView. Home's own appear/disappear lag a tab
+/// change by up to a second (log_8: `tab selected=1` at
+/// 15:09:37.195, Home's disappear at 15:09:38.244), and a Home
+/// that is merely kept alive behind another tab must never run
+/// focus side effects — so every focus action on Home is gated
+/// on this AND on its own appear state AND on its stack being
+/// at root (`TVHomeView.homeVisible`). Set by TVRootView.
+private struct TVHomeTabSelectedKey: EnvironmentKey {
+    static let defaultValue = true
+}
+
+extension EnvironmentValues {
+    var tvHomeTabSelected: Bool {
+        get { self[TVHomeTabSelectedKey.self] }
+        set { self[TVHomeTabSelectedKey.self] = newValue }
+    }
+}
 
 struct TVHomeView: View {
     @EnvironmentObject private var plugins: PluginManager
@@ -389,143 +501,95 @@ struct TVHomeView: View {
     @Environment(TVHomeStore.self) private var store
     @Environment(TVNavPath.self) private var nav
     @Environment(\.tvTheme) private var theme
+    @Environment(\.tvHomeTabSelected) private var homeTabSelected
 
-    @Namespace private var focusNS
-    /// L-T41 (1.3.15): the content region's OWN landing
-    /// focus, inside the swapped region at last — the hero
-    /// carries it through its A-6/A-7 entryFocus, the way
-    /// Browse's first card carries that screen's. While no
-    /// hero exists (loading / empty / error), the landing
-    /// falls back to the active chip, which carries the
-    /// fallback binding through its own entryFocus so
-    /// `.defaultFocus` has a real view to land on.
+    // MARK: Focus model (1.3.19 — L-T47/L-T48 structural rework)
+    //
+    // The 1.3.15–1.3.18 landing machinery (a landing OBLIGATION
+    // with a 4-shot re-fire chain, a settle refresh, a W2 chip-
+    // edge guard, a 500 ms watchdog, and a Bool `chipFocused`
+    // binding that MIGRATED from chip to chip with the active
+    // plugin) is retired. log_8 convicts it twice over:
+    //  - every source switch bounced focus chip → PREVIOUS active
+    //    chip → back (15:09:11.887, 15:10:24.037, 15:10:42.979,
+    //    15:10:56.128): re-attaching the one Bool binding to a
+    //    different chip is a focus change SwiftUI resolves on its
+    //    own, and at 15:10:56 the bounce parked focus on missav's
+    //    chip long enough for missav's DWELL to fire and undo the
+    //    user's explicit vlxx select;
+    //  - every hero dead-press window (15:10:14.751–19.863,
+    //    15:10:44.649–46.566, 15:10:49.919–50.589) opened right
+    //    after a PROGRAMMATIC hero landing onto a just-published
+    //    content tree; every USER-driven hero gain in the log was
+    //    followed by a working press.
+    // The rework works WITH the focus engine instead:
+    //  - each chip has its OWN stable identity in ONE value-typed
+    //    FocusState (`chipFocus == plugin.id`) — nothing migrates;
+    //  - Home declares ONE default (`.defaultFocus` → the active
+    //    chip), which the engine uses whenever it has to place
+    //    focus by itself (a void, a vanished element);
+    //  - a source switch moves NOTHING: focus stays on the chip
+    //    the user is standing on — the tvOS top-tab idiom — and
+    //    one press down enters the new content;
+    //  - exactly two programmatic writes remain, each bounded
+    //    and each stopping at the first sign of the user: the
+    //    COLD landing (launch / PIN return, where the TabView
+    //    parks focus on the tab bar — the 1.3.18 park-override,
+    //    proven in log_8) and the RETURN landing to the header /
+    //    hero the user pushed from;
+    //  - one narrow rescue for the tab-bar trap (three dead
+    //    presses on the tab bar within 2 s while Home is visible).
+    @FocusState private var chipFocus: String?
     @FocusState private var heroFocused: Bool
-    @FocusState private var chipFocused: Bool
-    /// L-T41 return landing (1.3.17, DESIGN §2.2.1): the
-    /// section headers' shared entryFocus — a header is
-    /// focused exactly when this holds its slug. Home
-    /// writes it ONLY from fireLandingShot() (a return
-    /// obligation's shot), the same single-write-point
-    /// discipline as the hero/chip bindings; the engine
-    /// writes it back on every real header gain/loss,
-    /// which is what feeds the headers' focus hooks.
+    /// The section headers' shared value binding — written ONLY
+    /// by the return landing.
     @FocusState private var headerFocusSlug: String?
-    /// L-T41 (1.3.15, gate R1 Lens 1): where focus
-    /// physically sits, as the hooks report it — true while
-    /// any chip on the rail holds focus, false once a
-    /// content element (hero / header / card) gains it.
-    /// Read from OBSERVED focus (the hooks), never from
-    /// chipFocused: the binding migrates between chips as
-    /// the active plugin changes (a rebind produces no
-    /// focus event and is not guaranteed to rewrite the
-    /// newly attached binding), while the hooks fire on
-    /// real focus gains — including the gain of the chip
-    /// the user just selected, whose focus at that moment
-    /// still lives in its own internal state. In 1.3.15
-    /// this was the hand-off's guard; since vòng 2 it is
-    /// diagnostic state (the arm lines log it) and the
-    /// watchdog's rail memory — the obligation's decisions
-    /// read the tracker, which names the exact element.
-    @State private var focusOnRail = false
-    /// L-T41 vòng 2 (1.3.16, DIAGNOSIS-2 §7.2): the landing
-    /// is an OBLIGATION, not the 1.3.15 one-shot arm. The
-    /// diagnosis convicted the old shape: a single
-    /// unconfirmed `heroFocused = true` write whose arm was
-    /// closed unconditionally by settleHeroHandOff() in the
-    /// same turn the load returned — before the new hero
-    /// view existed — and the tree had no resetFocus and no
-    /// watchdog, so a missed shot stranded focus (tab bar /
-    /// nowhere) until Menu. Now: an obligation opens on a
-    /// designed landing (first appear, a user switch, any
-    /// settled load, the watchdog) and is discharged ONLY
-    /// by a confirmed focus gain — of the target itself
-    /// (discharged-by-gain) or of any other live Home
-    /// element (closed-by-user-takeover: focus is provably
-    /// alive in this scope, the landing is no longer ours
-    /// to deliver). While it is open, a bounded chain
-    /// re-issues the landing write at +0/+150/+500/+1200 ms
-    /// (the measured cold-landing tail is 1.1–1.4 s); a
-    /// settle can open or refresh the obligation but can
-    /// NEVER close it. `landingGeneration` tokenises the
-    /// chain: opening or closing bumps it, so a stale chain
-    /// can never fire for a dead obligation.
-    @State private var landingOwed = false
-    @State private var landingPreferChip = false
-    @State private var landingGeneration = 0
-    /// L-T41 return landing (1.3.17, DESIGN §2.2.3): the
-    /// open obligation's concrete target element, when it
-    /// was opened as a RETURN (a pop-back / tab return to
-    /// the element the user pushed from). Non-nil only
-    /// while a return obligation is open: openLanding-
-    /// Obligation sets it from its `returning` argument
-    /// (nil for every other open) and closeLanding-
-    /// Obligation clears it after logging. While set, it
-    /// outranks the live hero/chip rule in landingTarget.
-    @State private var landingReturnDescriptor: String?
-    /// The first appear of this view instance opens the
-    /// launch landing. Later appears open a RETURN
-    /// obligation when a push recorded its origin element
-    /// (pendingReturnElement, DESIGN §2.2.4); an appear
-    /// with nothing recorded opens nothing — the engine's
-    /// own restore owns those, and the watchdog below is
-    /// the net if the restore fails. (1.3.16 deliberately
-    /// opened nothing on later appears and let the settle
-    /// side effect aim at the hero; the evidence session
-    /// showed that shot missing 5/5 — DESIGN §2.1.)
-    @State private var didOpenInitialLanding = false
-    /// L-T41 return landing (1.3.17, DESIGN §2.2.2): the
-    /// element the user is about to push FROM — recorded
-    /// by the header's action and the hero/cards' onSelect
-    /// closures in the same turn as the push, consumed by
-    /// the NEXT appear (the pop-back or tab return) to
-    /// open the return obligation, then cleared. A plain
-    /// element descriptor, the same strings the hooks log
-    /// ("header section=<slug>", "hero movie=<id>",
-    /// "card movie=<id>").
+
+    /// First appear of this view instance (launch, PIN return —
+    /// the gate rebuilds the root) runs the cold landing.
+    @State private var didColdLanding = false
+    /// The element the user is about to push FROM ("header
+    /// section=<slug>" / "hero movie=<id>" / "card movie=<id>"),
+    /// recorded with the push, consumed by the next appear.
     @State private var pendingReturnElement: String?
-    /// W2 debounce (1.3.17, DESIGN §3.2.1): a counter that
-    /// increments on EVERY focus hook event (gain or
-    /// loss). The chip-edge guard captures it when a chip
-    /// is lost and re-reads it 250 ms later — any focus
-    /// event in between (above all the next chip's gain)
-    /// proves the loss was a move, not a void, and the
-    /// pending edge dies silently.
+    /// Tokenises the landing tasks: any newer landing, a
+    /// disappear or a tab change kills the older one.
+    @State private var landingGeneration = 0
+    @State private var homeAppeared = false
+    /// Advances on EVERY focus hook event; the dwell captures it
+    /// at arm time and dies if anything moved.
     @State private var focusEventEpoch = 0
-    /// L-T45 dwell-to-switch (1.3.18, DESIGN §1.4): the
-    /// one pending chip dwell — the task sleeping out the
-    /// 600 ms threshold and the plugin it is armed for.
-    /// Focus sits on at most one chip, so one pending
-    /// dwell is the whole state. Arming and cancelling
-    /// log NOTHING (the absence discipline of the
-    /// chip-edge guard's pending edge); only a dwell that
-    /// actually fires writes its one line, at the fire.
+    /// L-T45 dwell-to-switch, revised (1.3.19, L-T48 (b)).
     @State private var dwellTask: Task<Void, Never>?
     @State private var dwellPluginId: String?
-    /// Watchdog state (DIAGNOSIS-2 §7.2.3): whether Home
-    /// is the appeared surface, its polling task, and the
-    /// last confirmed gain (element + time + whether it
-    /// sat on the chip rail) — the W2 chip-edge rule and
-    /// the watchdog's target selection both read the last
-    /// gain.
-    @State private var homeAppeared = false
-    @State private var watchdogTask: Task<Void, Never>?
-    @State private var lastGainElement = "none"
-    @State private var lastGainAt: Date?
-    @State private var lastGainWasChip = false
-    /// L-T41 §5.3 (1.3.15): the focus diagnostics owner —
-    /// the move-fail observer and the last focus owner the
-    /// hooks reported.
+    /// Gain times of the last few chip gains — the traversal
+    /// witness the dwell threshold reads.
+    @State private var recentChipGains: [Date] = []
+    /// Times of recent dead presses on the tab bar (rescue).
+    @State private var tabBarDeadPresses: [Date] = []
     @State private var focusTracker = TVHomeFocusTracker()
+    @State private var lastSilentSyncAt: Date?
+
+    /// Home is the surface the user is actually looking at.
+    private var homeVisible: Bool {
+        homeAppeared && homeTabSelected && nav.path.isEmpty
+    }
+
+    /// The chip the cold landing / rescue aims at: the active
+    /// plugin's, or the first visible one if the active id is
+    /// not (yet) on the rail.
+    private var landingChipId: String? {
+        let visible = plugins.visiblePlugins.map(\.id)
+        if visible.contains(plugins.activePluginId) { return plugins.activePluginId }
+        return visible.first
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             if plugins.visiblePlugins.isEmpty {
-                // L-T41 (1.3.15, gate R1 Lens 1): with no
-                // visible plugins the chip rail and content
-                // leave the tree, taking the only other
-                // landing declarations with them — this
-                // state's button carries the surface's
-                // declared landing itself.
+                // With no visible plugins the chip rail and
+                // content leave the tree; this state's button
+                // carries the surface's declared landing itself.
                 TVEmptyState(icon: "puzzlepiece.extension",
                              title: "Chưa có nguồn plugin",
                              actionTitle: "Đồng bộ ngay",
@@ -538,117 +602,77 @@ struct TVHomeView: View {
             }
         }
         .tvThemedBackground()
-        .focusScope(focusNS)
+        // The ONE default-focus declaration on Home: whenever the
+        // engine must place focus itself, it goes to the active
+        // chip — the top of the screen, never a half-built band.
+        .defaultFocus($chipFocus, landingChipId)
         .onAppear {
             session.touch()
             focusTracker.install()
-            // L-T46 (1.3.18, DESIGN §2.2): every Home
-            // appear starts with the user NOT yet holding
-            // focus in this appearance — the tracker's
-            // userHasTakenFocus resets here, beside the
-            // install, on the one appear path every Home
-            // entry (launch, PIN return, tab return,
-            // pop-back) funnels through.
             focusTracker.beginAppearance()
-            // L-T41 vòng 2 (1.3.16, DIAGNOSIS-2 §7.1):
-            // appear/disappear are logged so navigation
-            // windows can never again masquerade as focus
-            // windows in the log (the round-1 misread).
+            focusTracker.onTabBarMoveFail = { handleTabBarDeadPress() }
             homeAppeared = true
-            DiagLog.log("home", "appear")
-            if !didOpenInitialLanding {
-                didOpenInitialLanding = true
-                openLandingObligation(preferChip: false, reason: "appear")
+            DiagLog.log("home", "appear tabSelected=\(homeTabSelected) depth=\(nav.path.count)")
+            if !didColdLanding {
+                didColdLanding = true
+                runColdLanding()
+                logLanding(target: "chip")
             } else if let returning = pendingReturnElement, nav.path.isEmpty {
-                // L-T41 return landing (1.3.17, DESIGN
-                // §2.2.4): a later appear with a recorded
-                // push origin — a pop-back, or a tab return
-                // after leaving from a pushed page — opens
-                // the RETURN obligation aimed at that exact
-                // element (it is the element on screen at
-                // the restored scroll position, unlike the
-                // hero the 1.3.16 settle side effect aimed
-                // at). The .task settle that follows can
-                // only refresh this obligation, never
-                // re-target it (§2.2.5).
                 pendingReturnElement = nil
-                openLandingObligation(preferChip: false, reason: "return", returning: returning)
+                runReturnLanding(returning)
+                logLanding(target: "return element=\(returning)")
             }
-            startFocusWatchdog()
-            logLanding()
         }
         .onDisappear {
             homeAppeared = false
+            landingGeneration &+= 1
             DiagLog.log("home", "disappear")
-            watchdogTask?.cancel()
-            watchdogTask = nil
-            // L-T45 (1.3.18, DESIGN §1.4.6): a pending
-            // dwell dies with the surface — its deferred
-            // check also reads homeAppeared, but the
-            // explicit cancel keeps a dead dwell from
-            // sleeping on across a long absence.
             cancelChipDwell()
+            focusTracker.onTabBarMoveFail = nil
             focusTracker.uninstall()
+        }
+        .onChange(of: homeTabSelected) { _, selected in
+            // Leaving the tab kills every pending focus action
+            // at once (the appear/disappear pair lags the tab
+            // change by up to a second).
+            if !selected {
+                landingGeneration &+= 1
+                cancelChipDwell()
+            }
         }
         .task {
             if plugins.installed.isEmpty {
                 await plugins.syncAll()
-            } else {
+                lastSilentSyncAt = Date()
+            } else if lastSilentSyncAt.map({ Date().timeIntervalSince($0) > 300 }) ?? true {
+                // 1.3.19 (scan finding S-4): the silent source sync
+                // ran on EVERY Home appear — each pop-back from a
+                // Category/Detail and each tab return re-fetched
+                // plugins.json (log_8: 7 `[sync] start` lines in
+                // 3 minutes). Once per 5 minutes per Home instance
+                // is plenty; launch and PIN return (a new
+                // instance) still sync at once.
+                lastSilentSyncAt = Date()
                 Task { await plugins.syncAll(silent: true) }
             }
-            if await store.load(plugins: plugins, service: service) {
-                beginLandingObligation()
-            }
+            await store.load(plugins: plugins, service: service)
         }
-        .onChange(of: plugins.activePluginId) { _, _ in
-            // L-T41 vòng 2 (1.3.16): a user switch opens a
-            // landing obligation immediately (focus sits on
-            // the tapped chip — the designed parking spot —
-            // while the new source loads), and the settle
-            // below REFRESHES it when the load lands: the
-            // hero-id trigger alone misses a switch whose
-            // new hero carries the same movie id as the old
-            // one. The settle runs only if this load
-            // actually settled as the latest generation; a
-            // superseded load leaves the obligation for the
-            // winning load. A settle never CLOSES the
-            // obligation (DIAGNOSIS-2 §7.2.1) — only a
-            // confirmed gain does.
-            // L-T45 (1.3.18, DESIGN §1.4.6): ANY switch,
-            // from any cause (a select, another chip's
-            // dwell), kills a pending dwell — a dwell
-            // armed on chip P must never fire after the
-            // user has explicitly selected R and override
-            // the choice 600 ms later. (A dwell's own fire
-            // lands here too; it cleared its own state at
-            // the fire, so this cancel is a no-op for it.)
+        .onChange(of: plugins.activePluginId) { _, newId in
+            // L-T48 (b)/(c): a switch is a DATA change only —
+            // the new source loads, focus stays exactly where
+            // the user is (the chip). It may arrive from any
+            // cause (a chip select or dwell here, the Category
+            // tab's own chip rail while Home is hidden); none of
+            // them moves focus. `visible=` records which case
+            // the next log shows.
             cancelChipDwell()
-            openLandingObligation(preferChip: false, reason: "switch")
-            Task {
-                if await store.load(plugins: plugins, service: service) {
-                    beginLandingObligation()
-                }
-            }
-            logLanding()
-        }
-        .onChange(of: store.heroMovie?.id) { _, _ in
-            logLanding()
+            DiagLog.log("home", "switch plugin=\(newId) visible=\(homeVisible) tracker=\(focusTracker.current)")
+            Task { await store.load(plugins: plugins, service: service) }
         }
         .onChange(of: plugins.syncGeneration) { _, _ in
-            // A sync settle refreshes the obligation like
-            // any other settle (it is the freshest load,
-            // including when it won a switch race) — but
-            // refreshing only RE-ISSUES the landing write;
-            // the shot itself obeys the no-steal rule in
-            // fireLandingShot(), so a silent sync publish
-            // can never yank focus off a live content
-            // element the user is browsing (gate R1 Lens 1
-            // F5's concern, kept under the new shape).
-            Task {
-                if await store.load(plugins: plugins, service: service) {
-                    beginLandingObligation()
-                }
-            }
+            // A sync settle reloads data only (freshness rules
+            // in the store make it a no-op while fresh).
+            Task { await store.load(plugins: plugins, service: service) }
         }
     }
 
@@ -662,31 +686,19 @@ struct TVHomeView: View {
                            iconURL: plugin.manifest.iconUrl,
                            badge18: plugins.isAdult(plugin.id),
                            selected: plugin.id == plugins.activePluginId,
-                           // L-T41 (1.3.15): the ACTIVE chip
-                           // also carries the shared fallback
-                           // binding, so the content region's
-                           // .defaultFocus has a real view to
-                           // land on while no hero exists. Its
-                           // prefersDefaultFocus claim below is
-                           // unchanged — it remains the landing
-                           // whenever the content has no hero.
-                           entryFocus: plugin.id == plugins.activePluginId ? $chipFocused : nil,
-                           // L-T45 dwell-to-switch (1.3.18,
-                           // DESIGN §1.4.1): the chip's hook
-                           // is wrapped AT THIS CALL SITE —
-                           // TVChip itself is unchanged. The
-                           // standing focusHook runs FIRST
-                           // (it advances focusEventEpoch)
-                           // and the dwell note runs second,
-                           // so a dwell arm reads the epoch
-                           // AFTER its own gain's increment.
+                           // 1.3.19: a STABLE per-chip identity in
+                           // one value FocusState — this chip is
+                           // focused exactly when chipFocus holds
+                           // its id. Nothing re-binds on a switch.
+                           valueFocus: $chipFocus,
+                           focusID: plugin.id,
                            onFocusChange: { focused in
-                               focusHook("chip plugin=\(plugin.id)", rail: true)(focused)
+                               focusHook("chip plugin=\(plugin.id)")(focused)
                                noteChipDwell(pluginId: plugin.id, focused: focused)
                            }) {
+                        cancelChipDwell()
                         plugins.activePluginId = plugin.id
                     }
-                    .prefersDefaultFocus(plugin.id == plugins.activePluginId, in: focusNS)
                 }
             }
             .padding(.horizontal, 80)
@@ -697,26 +709,13 @@ struct TVHomeView: View {
 
     private var content: some View {
         ScrollView {
-            // L-T41 §5.2 (1.3.15): a plain VStack, not a
-            // LazyVStack — the band count is small (one hero
-            // + at most ~14 bands) and the real laziness
-            // lives INSIDE the rails (LazyHStack) and grids
-            // (LazyVGrid), which are untouched. A lazy stack
-            // only realizes a band when it is about to render,
-            // and on tvOS scrolling is a side effect of focus
-            // movement: an unrealized band is a focus target
-            // that does not exist yet, so the move down fails,
-            // nothing scrolls, and the band never realizes —
-            // the self-sustaining freeze of L-T41. Realizing
-            // every band at publish removes the trap.
+            // A plain VStack, not a LazyVStack (L-T41 §5.2): on
+            // tvOS scrolling is a side effect of focus movement,
+            // and an unrealized band is a focus target that does
+            // not exist yet. The real laziness lives INSIDE the
+            // rails (LazyHStack tails) and grids.
             VStack(alignment: .leading, spacing: 44) {
                 if let hero = store.heroMovie, let pid = plugins.activePlugin?.id {
-                    // L-T41 §5.1 (1.3.15): the hero is no
-                    // longer a single-leaf focus section of
-                    // its own — the content ScrollView's
-                    // section (below) frames the whole scroll
-                    // region, and the hero's landing is the
-                    // declared defaultFocus + hand-off pair.
                     heroBand(hero: hero, pluginId: pid)
                 }
                 if !history.continueWatching.isEmpty {
@@ -724,11 +723,7 @@ struct TVHomeView: View {
                         .focusSection()
                 }
                 // A-10 (1.3.9) + design pass D-5: the poster
-                // bands' long-press favourite toggle gets its
-                // ONE hint line here — every rail card and
-                // every grid cell below toggles favourite on
-                // long press, and the line is stated once for
-                // the whole screen, not repeated per band.
+                // bands' long-press hint, stated once.
                 if plugins.activePlugin != nil,
                    store.sections.contains(where: { !(store.items[$0.id] ?? []).isEmpty }) {
                     Text("Giữ lâu một thẻ để ghim / bỏ ghim yêu thích")
@@ -736,13 +731,9 @@ struct TVHomeView: View {
                         .foregroundStyle(theme.textDim)
                 }
                 ForEach(store.sections) { section in
-                    if let error = store.sectionErrors[section.id], (store.items[section.id] ?? []).isEmpty {
-                        // L-T41 (1.3.15, gate R1 Lens 1):
-                        // the all-error band holds ONE
-                        // focusable (the retry button) — no
-                        // section wrapper of its own; the
-                        // content ScrollView's section frames
-                        // it, like every other band.
+                    if store.sectionErrors[section.id] != nil, (store.items[section.id] ?? []).isEmpty {
+                        // The all-error band holds ONE focusable
+                        // (the retry button) — no section wrapper.
                         sectionBand(section)
                     } else if !(store.items[section.id] ?? []).isEmpty {
                         sectionBand(section)
@@ -750,12 +741,9 @@ struct TVHomeView: View {
                     }
                 }
                 if store.didLoad && store.sections.isEmpty && !store.isLoading {
-                    // One focusable (the reload button) —
-                    // no section wrapper, same rule as the
-                    // all-error band above.
                     TVEmptyState(icon: "film.stack", title: "Chưa có nội dung",
                                  actionTitle: "Tải lại",
-                                 action: { Task { if await store.load(plugins: plugins, service: service, force: true) { beginLandingObligation() } } },
+                                 action: { Task { await store.load(plugins: plugins, service: service, force: true) } },
                                  onFocusChange: focusHook("empty action=reload"))
                 }
                 if store.isLoading && store.sections.isEmpty {
@@ -767,173 +755,85 @@ struct TVHomeView: View {
             .padding(.horizontal, 80)
             .padding(.bottom, 48)
         }
-        // L-T41 §5.2 (1.3.15): the scroll region itself is a
-        // focus section, so the engine has a section frame
-        // spanning the whole content for the step from the
-        // pinned chip rail into and through the bands,
-        // instead of depending on each band's own section
-        // and realization state.
+        // The scroll region is one focus section, so the step
+        // from the pinned chip rail into the bands always has a
+        // section frame to search.
         .focusSection()
-        // L-T41 §5.1 (1.3.15): the content region's declared
-        // landing, the Browse A-6 shape — the hero whenever
-        // one exists, the active chip while it does not
-        // (loading / empty / error states included, so the
-        // landing exists for EVERY Home state).
-        .defaultFocus(store.heroMovie != nil ? $heroFocused : $chipFocused, true)
-        // L-T41 §5.1 (1.3.15) → vòng 2 (1.3.16): the
-        // hand-off, Browse's A-6 gate fix in shape — a
-        // defaultFocus declaration does not move focus that
-        // was ALREADY assigned, so when a hero lands (fresh
-        // publish or snapshot restore) while focus still
-        // sits on the chip rail, hand it to the hero
-        // explicitly. The 1.3.15 shape fired that hand-off
-        // ONCE and let the settle close the arm; vòng 2
-        // makes it one shot of the landing obligation's
-        // bounded chain (see openLandingObligation): this
-        // trigger is an extra shot opportunity while an
-        // obligation is owed, and fireLandingShot() applies
-        // the same no-steal rule as every shot, so a silent
-        // sync reload can never steal focus to a new hero.
-        // The post-load refresh in the activePluginId
-        // handler covers the same-hero-id switch this
-        // trigger cannot see.
-        .onChange(of: store.heroMovie?.id) { _, _ in
-            if landingOwed {
-                fireLandingShot()
-            }
-        }
     }
 
-    // MARK: - Focus diagnostics (L-T41 §5.3)
+    // MARK: - Focus diagnostics (L-T41 §5.3, kept)
 
-    /// One hook body for every focusable Home element:
-    /// a gain/lost line per transition (user-gesture pace,
-    /// never per-frame) plus the tracker's current-owner
-    /// note that the moveFail and landing lines read. Only
-    /// element kinds and ids are logged — the same
-    /// secrets-free discipline as every other DiagLog line.
-    /// A gain also records whether focus sits on the chip
-    /// rail (`rail`) — the hand-off's guard state — and,
-    /// since vòng 2, settles the landing obligation: a
-    /// confirmed gain is the ONLY thing that can discharge
-    /// it (see openLandingObligation).
-    private func focusHook(_ element: String, rail: Bool = false) -> (Bool) -> Void {
+    /// One hook body for every focusable Home element: a
+    /// gain/lost line per transition plus the tracker's
+    /// current-owner note that the moveFail and landing lines
+    /// read. Only element kinds and ids are logged.
+    private func focusHook(_ element: String) -> (Bool) -> Void {
         { focused in
-            // W2 debounce (1.3.17, DESIGN §3.2.1): every
-            // hook event, gain or loss, advances the epoch
-            // the chip-edge guard's deferred check reads.
             focusEventEpoch &+= 1
             if focused {
-                focusOnRail = rail
                 focusTracker.note(element)
-                lastGainElement = element
-                lastGainAt = Date()
-                lastGainWasChip = rail
                 DiagLog.log("focus", "home gain element=\(element)")
-                noteLandingGain(element)
             } else {
                 focusTracker.clear(if: element)
                 DiagLog.log("focus", "home lost element=\(element)")
-                noteLandingLoss(element)
             }
         }
     }
 
-    // MARK: - Dwell-to-switch (L-T45, 1.3.18)
+    // MARK: - Dwell-to-switch (L-T45 1.3.18, revised 1.3.19)
 
-    /// Kills the pending chip dwell, if any: the task is
-    /// cancelled and the armed plugin forgotten. The
-    /// deferred check ALSO re-reads dwellPluginId, so a
-    /// task that wakes anyway (a cancelled sleep swallows
-    /// its error and runs on) finds nothing armed for it
-    /// and dies silently. Called from the three designed
-    /// edges: the armed chip's own focus loss, ANY
-    /// activePluginId change, and Home's disappear.
     private func cancelChipDwell() {
         dwellTask?.cancel()
         dwellTask = nil
         dwellPluginId = nil
     }
 
-    /// L-T45 dwell-to-switch (1.3.18, DESIGN §1.4): in
-    /// the shipped tree a plugin switch ran ONLY from
-    /// the chip Button's action — focus resting on a chip
-    /// loaded nothing, so the owner's natural gesture
-    /// (land on a source's chip, press down into its
-    /// content) met an unloaded Home and dead presses
-    /// (123av three times in the evidence session; the
-    /// relay recorded zero requests). A chip that HOLDS
-    /// focus for the dwell threshold now switches itself.
-    /// The threshold is 600 ms (DESIGN §1.3): 1.7× the
-    /// slowest pure traversal step measured in the
-    /// evidence session (0.352 s), at most half the
-    /// shortest convicted intent dwell (1.252 s), for a
-    /// focus-to-content total of ~1.0–1.1 s with the
-    /// measured post-switch publish latency.
-    ///
-    /// GAIN of chip P: any pending dwell dies first —
-    /// even when P is the active chip. P == the active
-    /// plugin then stops here (no arm, no log: resting on
-    /// the loaded source's chip is not a switch request).
-    /// Otherwise the dwell arms: the epoch is captured
-    /// AFTER this gain's own hook increment (the call
-    /// site runs focusHook first), and a task sleeps out
-    /// the threshold.
-    ///
-    /// FIRE — only when ALL of these still hold at the
-    /// wake (the chip-edge guard's deferred-check shape,
-    /// DESIGN §1.4.4): this dwell is still the armed one
-    /// (not cancelled at any edge); the epoch is
-    /// unchanged since the arm (no gain or loss
-    /// intervened — leaving the chip, stepping to another
-    /// chip, or landing on the hero all move the epoch
-    /// and kill the dwell silently); the tracker still
-    /// names THIS chip as focus's owner; P is still not
-    /// the active plugin (a select during the wait has
-    /// already switched — never switch twice); Home is
-    /// still the appeared surface; and no category/detail
-    /// is pushed. The fire logs its ONE line and then
-    /// performs literally the chip Button's own
-    /// assignment — from there the standing switch
-    /// machinery (the onChange obligation, the load, the
-    /// settle refresh) does everything, exactly as for a
-    /// select, and focus stays parked on the chip while
-    /// the source loads, the designed parking spot.
-    ///
-    /// LOSS of chip P: if the pending dwell is P's, it is
-    /// cancelled outright (the epoch check would kill it
-    /// anyway; the explicit cancel keeps a dead task from
-    /// sleeping on through a long traversal).
-    ///
-    /// Declared limits (DESIGN §1.5): a press landing
-    /// BEFORE the fire still dies — no design loads a
-    /// source before any intent signal exists, and the
-    /// earlier signal (the dead press itself) is
-    /// direction-blind and was rejected for cause. A
-    /// ≥600 ms rest WITHOUT intent (a thinking pause on
-    /// an unloaded chip) fires a switch the user did not
-    /// ask for; the cost is one ordinary switch, nothing
-    /// is lost, and the dwell= column in the next device
-    /// log is the evidence the threshold is tuned by.
+    /// A chip that HOLDS focus switches the source by itself
+    /// (L-T45: the owner's natural gesture is land-on-chip,
+    /// press-down). 1.3.19 (L-T48 (b)): the dwell must not fire
+    /// on the last pause of a fast traversal — log_8 15:10:42.917
+    /// fired sayhentai after a 604 ms pause that ended a 7-chip,
+    /// ~2 s walk, and the load was thrown away 0.8 s later. The
+    /// rule, kept deliberately simple:
+    ///  - a chip reached by a SINGLE step (fewer than two other
+    ///    chip gains in the 1.2 s before it) switches after the
+    ///    proven 600 ms;
+    ///  - a chip reached at the end of a TRAVERSAL (two or more
+    ///    chip gains in the 1.2 s before it) must be held for
+    ///    1300 ms — longer than any end-of-walk hesitation the
+    ///    owner produced (≤ ~0.65 s in log_8), while a genuine
+    ///    stop still switches on its own within ~1.3 s, and
+    ///    Select switches at once either way.
+    /// Every log_8 dwell the owner meant (123av 15:09:11.811,
+    /// avdbapi 15:10:13.776, 123av 15:10:23.946, avdbapi
+    /// 15:10:49.572) was a single step and keeps its 600 ms.
+    /// FIRE conditions are the 1.3.18 ones (still the armed
+    /// dwell, no focus event since the arm, the tracker still
+    /// names this chip, not already active) plus Home visible.
     private func noteChipDwell(pluginId: String, focused: Bool) {
         if focused {
+            let now = Date()
+            let recent = recentChipGains.filter { now.timeIntervalSince($0) <= 1.2 }
+            recentChipGains = Array((recent + [now]).suffix(6))
             cancelChipDwell()
-            guard pluginId != plugins.activePluginId else { return }
+            guard pluginId != plugins.activePluginId, homeVisible else { return }
+            let traversal = recent.count >= 2
+            let threshold = traversal ? 1300 : 600
             dwellPluginId = pluginId
             let dwellEpoch = focusEventEpoch
-            let gainedAt = Date()
             dwellTask = Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(600))
-                guard dwellPluginId == pluginId,
+                try? await Task.sleep(for: .milliseconds(threshold))
+                guard !Task.isCancelled,
+                      dwellPluginId == pluginId,
                       focusEventEpoch == dwellEpoch,
                       focusTracker.current == "chip plugin=\(pluginId)",
                       pluginId != plugins.activePluginId,
-                      homeAppeared, nav.path.isEmpty
+                      homeVisible
                 else { return }
                 dwellTask = nil
                 dwellPluginId = nil
-                let dwellMs = Int(Date().timeIntervalSince(gainedAt) * 1000)
-                DiagLog.log("focus", "dwell switch plugin=\(pluginId) dwell=\(dwellMs)ms")
+                let dwellMs = Int(Date().timeIntervalSince(now) * 1000)
+                DiagLog.log("focus", "dwell switch plugin=\(pluginId) dwell=\(dwellMs)ms threshold=\(threshold)ms traversal=\(traversal ? "yes" : "no")")
                 plugins.activePluginId = pluginId
             }
         } else if dwellPluginId == pluginId {
@@ -941,469 +841,93 @@ struct TVHomeView: View {
         }
     }
 
-    // MARK: - Landing obligation (L-T41 vòng 2, DIAGNOSIS-2 §7.2)
+    // MARK: - Landings (1.3.19 — the two remaining writes)
 
-    /// The obligation's target, resolved LIVE at every
-    /// use: the hero whenever one is published, the active
-    /// chip otherwise — unless the obligation was opened
-    /// with a chip preference (the watchdog after a chip
-    /// loss, §7.2.3/§7.2.4: focus returns to where it was
-    /// last confirmed, not to a hero the user may have
-    /// been climbing away from).
-    private enum LandingTarget {
-        case hero
-        case chip
-        /// L-T41 return landing (1.3.17, DESIGN §2.2.3):
-        /// the obligation's target is one concrete element
-        /// — the one the user pushed from, named by its
-        /// hook descriptor. A gain discharges it only by
-        /// matching the descriptor exactly.
-        case returning(String)
-    }
-
-    private var landingTarget: LandingTarget {
-        if let landingReturnDescriptor {
-            return .returning(landingReturnDescriptor)
-        }
-        return (landingPreferChip || store.heroMovie == nil) ? .chip : .hero
-    }
-
-    /// The target as the arm/landing log lines name it:
-    /// "hero" / "chip" as before, "return element=<desc>"
-    /// for a return obligation (DESIGN §2.2.3/§2.2.6).
-    private var landingTargetLog: String {
-        switch landingTarget {
-        case .hero: return "hero"
-        case .chip: return "chip"
-        case .returning(let descriptor): return "return element=\(descriptor)"
-        }
-    }
-
-    /// Does this hook element descriptor name the element
-    /// the obligation currently targets? The hero matches
-    /// by kind (its movie id changes per publish); the chip
-    /// target matches ONLY the active plugin's chip — a
-    /// gain on a neighbouring chip is the user walking the
-    /// rail, not the landing arriving.
-    private func elementMatchesLandingTarget(_ element: String) -> Bool {
-        switch landingTarget {
-        case .hero:
-            return element.hasPrefix("hero")
-        case .chip:
-            return element == "chip plugin=\(plugins.activePluginId)"
-        case .returning(let descriptor):
-            return element == descriptor
-        }
-    }
-
-    /// Open (or refresh) the landing obligation and start
-    /// its bounded re-fire chain. Called by every designed
-    /// landing: first appear, a user switch, every settled
-    /// load (via beginLandingObligation), the watchdog and
-    /// the W2 chip-edge rule (the latter two with their own
-    /// event names). Refreshing restarts the schedule from
-    /// +0 — the settle is the moment the target view
-    /// actually exists, so the chain that matters starts
-    /// there.
-    private func openLandingObligation(preferChip: Bool, reason: String, returning: String? = nil) {
-        landingOwed = true
-        landingPreferChip = preferChip
-        landingReturnDescriptor = returning
+    /// COLD landing: launch and PIN return. The TabView parks
+    /// focus on the tab bar on a fresh root; this lands it on the
+    /// active chip. Shots at +0/+150/+500/+1200 ms (the measured
+    /// cold tail), each skipped the moment the user has touched
+    /// anything in this appearance (any Home gain or loss, or a
+    /// dead press on the tab bar) or Home stops being visible.
+    private func runColdLanding() {
         landingGeneration &+= 1
-        let event = reason == "watchdog" ? "watchdog-reopen" : "open"
-        DiagLog.log("focus", "arm event=\(event) target=\(landingTargetLog) reason=\(reason) focusOnRail=\(focusOnRail) tracker=\(focusTracker.current)")
-        runLandingChain(generation: landingGeneration)
-    }
-
-    /// A load that settled as the latest generation
-    /// (re)opens the obligation — the same-hero-id rescue
-    /// (the settled load may have republished the hero the
-    /// hero-id trigger cannot see) and the publish-moment
-    /// refresh in one. It NEVER closes the obligation:
-    /// that was the 1.3.15 defect (DIAGNOSIS-2 §1). A
-    /// SUPERSEDED load never reaches here — its caller saw
-    /// `false` and skipped the settle, leaving the
-    /// obligation for the winning load (N1).
-    /// L-T41 (1.3.17, DESIGN §2.2.5): a settle that finds
-    /// an obligation ALREADY OPEN may only REFRESH it —
-    /// restart the chain (bump the generation, run it
-    /// again, log `arm event=refresh`) — and must never
-    /// re-target it: the .task settle lands a few ms after
-    /// the pop-back appear that opened the return
-    /// obligation, and the old open-with-fresh-state shape
-    /// would have stomped the return target (and its
-    /// descriptor, and a watchdog/W2 obligation's chip
-    /// preference) with the standing hero rule. The target
-    /// is computed live at every shot anyway, so the
-    /// same-hero-id rescue and the switch path (whose
-    /// onChange opens first, with its own target) are
-    /// unaffected by the narrower settle.
-    private func beginLandingObligation() {
-        if landingOwed {
-            landingGeneration &+= 1
-            DiagLog.log("focus", "arm event=refresh target=\(landingTargetLog) reason=settle focusOnRail=\(focusOnRail) tracker=\(focusTracker.current)")
-            runLandingChain(generation: landingGeneration)
-        } else {
-            openLandingObligation(preferChip: false, reason: "settle")
-        }
-    }
-
-    /// The bounded re-fire chain (DIAGNOSIS-2 §7.2.2):
-    /// shots at +0/+150/+500/+1200 ms from the open,
-    /// covering the measured 1.1–1.4 s cold-landing tail.
-    /// The chain is tokenised by generation — an open or a
-    /// close bumps the generation and every stale chain
-    /// dies at its next checkpoint. If the schedule runs
-    /// out with the obligation still owed and focus still
-    /// not observably on the target, the obligation closes
-    /// as EXHAUSTED (logged, never silent): the watchdog
-    /// remains the net for a void that outlives the chain.
-    private func runLandingChain(generation gen: Int) {
+        let gen = landingGeneration
         Task { @MainActor in
-            let offsets: [Int] = [0, 150, 500, 1200]
             var elapsed = 0
-            for (index, offset) in offsets.enumerated() {
+            for (n, offset) in [0, 150, 500, 1200].enumerated() {
                 if offset > elapsed {
                     try? await Task.sleep(for: .milliseconds(offset - elapsed))
                     elapsed = offset
                 }
-                guard landingOwed, landingGeneration == gen else { return }
-                if index > 0 {
-                    DiagLog.log("focus", "arm event=refire n=\(index) target=\(landingTargetLog) tracker=\(focusTracker.current)")
-                }
-                fireLandingShot()
-            }
-            // A short grace past the last shot: the gain it
-            // produces lands on the next render pass, and a
-            // landing that arrives inside the grace is a
-            // delivery, not an exhaustion.
-            try? await Task.sleep(for: .milliseconds(300))
-            guard landingOwed, landingGeneration == gen else { return }
-            if elementMatchesLandingTarget(focusTracker.current) {
-                closeLandingObligation(event: "discharged-by-gain", detail: "observed")
-            } else {
-                closeLandingObligation(event: "exhausted", detail: "schedule-spent")
+                guard gen == landingGeneration, homeVisible,
+                      !focusTracker.userHasTakenFocus,
+                      let target = landingChipId else { return }
+                let engine = TVFocusProbe.engineFocus()
+                DiagLog.log("focus", "landing shot cold n=\(n) target=chip plugin=\(target) engine=\(engine.label) item=\(engine.description)")
+                chipFocus = target
             }
         }
     }
 
-    /// One landing shot: write the target's FocusState
-    /// binding — unless focus is already observably alive
-    /// somewhere the shot must not disturb:
-    /// - already ON the target → the landing has in fact
-    ///   arrived; discharge it as a gain (the hook normally
-    ///   beats the chain to this, the check covers a gain
-    ///   the hooks somehow missed);
-    /// - on a live CONTENT element that is not the target →
-    ///   the user is browsing inside Home; close as
-    ///   user-takeover WITHOUT firing (the no-steal rule —
-    ///   a settle or a sync publish must never yank focus
-    ///   off a card the user is standing on);
-    /// - on the chip rail, or nowhere the hooks can see →
-    ///   fire: rail→hero is the designed hand-off, and
-    ///   nowhere is exactly the void this chain exists to
-    ///   close.
-    /// L-T43 (1.3.17, DESIGN §1.2.2): ONE more gate, at
-    /// this single write point, for the case the hooks
-    /// CANNOT see — tracker reading "none" while the
-    /// ENGINE's focus sits on the TAB BAR. The tracker is
-    /// fed only by Home's hooks and the tab bar lives
-    /// outside Home's focus scope, so "none" conflates a
-    /// genuine void with the user standing on the shell's
-    /// menu; in the evidence session every watchdog firing
-    /// was that false positive, and settle/switch shots
-    /// share this same write point, so the gate belongs
-    /// here, not in the watchdog alone. On the tab bar the
-    /// shot is suppressed and the obligation CLOSES as
-    /// closed-focus-outside-scope: focus is alive and
-    /// belongs to the shell, and when the user comes back
-    /// down into Home the appear / return machinery takes
-    /// over. The asymmetry is deliberate (DESIGN §1.2.2):
-    /// .inWindow still fires — tracker-none with a live
-    /// in-window item is a hook-missed Home element or the
-    /// post-pop transient responder, where the rescue shot
-    /// proved harmless in the evidence log; only the tab
-    /// bar is a convicted harm. Do not "even this out".
-    /// L-T46 (1.3.18, DESIGN §2.3): the tab-bar branch is
-    /// refined, not repealed — it closes the obligation
-    /// ONLY when the tracker proves the user has taken
-    /// focus at some point in this appearance
-    /// (userHasTakenFocus). Before the first take, a
-    /// tab-bar reading is the shell's cold-start park, and
-    /// the shot fires through it under a park-override log
-    /// line; the window self-closes at the first gain,
-    /// after which the L-T43 protection covers the rest of
-    /// the appearance.
-    private func fireLandingShot() {
-        guard landingOwed else { return }
-        let current = focusTracker.current
-        if elementMatchesLandingTarget(current) {
-            closeLandingObligation(event: "discharged-by-gain", detail: "observed")
-            return
-        }
-        if current != "none", !current.hasPrefix("chip") {
-            closeLandingObligation(event: "closed-by-user-takeover", detail: "observed=\(current)")
-            return
-        }
-        if current == "none" {
-            let engine = TVHomeFocusTracker.engineFocus()
-            if engine.state == .onTabBar {
-                // L-T46 (1.3.18, DESIGN §2.3): the
-                // tab-bar reading alone cannot tell the
-                // shell's cold-start PARK — the user has
-                // not touched anything this appearance,
-                // and in the evidence session 1.3.17
-                // closed every launch and PIN-return
-                // obligation before his first gain,
-                // leaving focus on the menu until he
-                // pressed — from the user's genuinely
-                // standing on the tab bar (L-T43's
-                // convicted harm, the mid-session settle
-                // shot that dragged him off it). The
-                // tracker's userHasTakenFocus is exactly
-                // that distinction: SET → the 1.3.17 rule
-                // stands verbatim (close, no shot);
-                // CLEAR → this is the park: log the
-                // park-override and FALL THROUGH to the
-                // shot below, restoring the cold landing
-                // 1.3.16 had. The flag is read ONLY here
-                // — the watchdog and the chip-edge guard
-                // never consult it (DESIGN §2.4).
-                if focusTracker.userHasTakenFocus {
-                    closeLandingObligation(event: "closed-focus-outside-scope", detail: "engine=tabbar item=\(engine.description)")
-                    return
-                }
-                DiagLog.log("focus", "landing shot park-override engine=tabbar item=\(engine.description)")
-            }
-        }
-        switch landingTarget {
-        case .hero: heroFocused = true
-        case .chip: chipFocused = true
-        case .returning(let descriptor):
-            // DESIGN §2.2.3: the shot maps by descriptor
-            // prefix. A header is written through its slug
-            // binding; a hero through its Bool binding. A
-            // CARD has no binding to write — cards never
-            // took the A-6 opt-in — so a card return is
-            // delivered by the engine's own restore, whose
-            // gain discharges the obligation through the
-            // hooks (or closes it as a takeover if the
-            // restore lands elsewhere); the chain simply
-            // has no write to make for it.
-            if descriptor.hasPrefix("header section=") {
-                headerFocusSlug = String(descriptor.dropFirst("header section=".count))
-            } else if descriptor.hasPrefix("hero") {
-                heroFocused = true
-            }
-        }
-    }
-
-    /// Every close of the obligation funnels through here:
-    /// the state clears, the generation bumps (killing any
-    /// live chain), and the mutation is logged — the arm's
-    /// whole life is visible in the log (DIAGNOSIS-2 §7.1).
-    private func closeLandingObligation(event: String, detail: String) {
-        guard landingOwed else { return }
-        // The log line names the target that was owed, so
-        // it is read BEFORE the return descriptor clears.
-        let targetLog = landingTargetLog
-        landingOwed = false
-        landingReturnDescriptor = nil
+    /// RETURN landing after a pop / tab return: back onto the
+    /// header or hero the user pushed from. Usually the engine's
+    /// own restore delivers it first (then the user-has-focus
+    /// gate stops every shot); a card has no binding and is
+    /// always left to the restore. Shots at +150/+500 ms only.
+    private func runReturnLanding(_ descriptor: String) {
         landingGeneration &+= 1
-        DiagLog.log("focus", "arm event=\(event) target=\(targetLog) \(detail) tracker=\(focusTracker.current)")
-    }
-
-    /// A confirmed gain settles the obligation (the hook
-    /// calls this for every gain): the target's own gain
-    /// discharges it as delivered; any OTHER live Home
-    /// element's gain closes it as user-takeover — focus
-    /// is provably alive in this scope, so the landing is
-    /// no longer owed. ONE exception, the designed
-    /// intermediate: a gain of the ACTIVE chip while the
-    /// target is the hero does NOT close anything — the
-    /// engine parks focus on the chip first on every cold
-    /// start in the evidence log (3/3 launches gained a
-    /// chip before the hero), and that parking spot is
-    /// exactly what the re-fire chain exists to convert;
-    /// closing there would rebuild the one-shot dependency
-    /// the diagnosis convicted.
-    private func noteLandingGain(_ element: String) {
-        guard landingOwed else { return }
-        if elementMatchesLandingTarget(element) {
-            closeLandingObligation(event: "discharged-by-gain", detail: "element=\(element)")
-            return
-        }
-        if case .hero = landingTarget,
-           element == "chip plugin=\(plugins.activePluginId)" {
-            return
-        }
-        closeLandingObligation(event: "closed-by-user-takeover", detail: "element=\(element)")
-    }
-
-    /// The W2 chip-edge guard (DIAGNOSIS-2 §2.3): a chip
-    /// gain followed within ~0.3 s by focus reading NONE —
-    /// the climb off the top of the chip rail, where the
-    /// engine refused the press and the app contributed
-    /// nothing to the recovery (×3 in the round-1 evidence
-    /// log) — re-lands on the active chip.
-    /// DEFERRED DECISION (1.3.17, DESIGN §3.2): the
-    /// round-2 shape decided AT the loss hook, and its
-    /// tracker-none condition was true by construction
-    /// mid-traversal (the hook clears the tracker before
-    /// the next chip's gain can land), so at the user's
-    /// browsing speed the guard opened an obligation on
-    /// essentially EVERY chip-to-chip step — 20 firings in
-    /// one 3.7-minute session, each closed by the next gain
-    /// within 0–25 ms, and each +0 shot writing the ACTIVE
-    /// chip's binding while the user walked away from it.
-    /// The distinguishing evidence only exists AFTER a
-    /// wait, so the loss now records a pending edge (the
-    /// focus-event epoch at the loss) and decides 250 ms
-    /// later: the largest lost→gain gap in the evidence
-    /// session's chip traversals is ~25 ms, so 250 ms is a
-    /// 10× margin no traversal can reach, while the
-    /// genuine W2 voids lasted ≥1–2 s and are still caught
-    /// (total rescue latency ~250–400 ms, far inside the
-    /// watchdog's 1.5 s ceiling). The obligation opens
-    /// only if ALL of these still hold at the check: the
-    /// epoch is unchanged (no gain/loss intervened), the
-    /// tracker still reads none, the engine witness says
-    /// .nowhere (a climb onto the tab bar is a legitimate
-    /// exit, not a void — the §1 gate applies here too),
-    /// Home is still the appeared root, and no other
-    /// obligation is already working the void. Recording
-    /// or cancelling a pending edge logs NOTHING — the
-    /// absence of chip-edge lines during a traversal is
-    /// the closing evidence (DESIGN §3.2.3); only a
-    /// verified open logs, with the same line as before.
-    private func noteLandingLoss(_ element: String) {
-        guard element.hasPrefix("chip"),
-              element == lastGainElement,
-              let gainedAt = lastGainAt,
-              Date().timeIntervalSince(gainedAt) <= 0.3,
-              homeAppeared, nav.path.isEmpty
-        else { return }
-        let edgeEpoch = focusEventEpoch
+        let gen = landingGeneration
+        guard descriptor.hasPrefix("header section=") || descriptor.hasPrefix("hero") else { return }
         Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(250))
-            guard focusEventEpoch == edgeEpoch,
-                  focusTracker.current == "none",
-                  TVHomeFocusTracker.engineFocus().state == .nowhere,
-                  homeAppeared, nav.path.isEmpty,
-                  !landingOwed
-            else { return }
-            openLandingObligation(preferChip: true, reason: "chip-edge")
-        }
-    }
-
-    /// The focus-presence watchdog (DIAGNOSIS-2 §7.2.3):
-    /// while Home is the appeared root surface (no pushed
-    /// view covering it), a void that persists past ~1.5 s
-    /// re-opens the landing obligation ONCE per void
-    /// episode — target = the chip if the last confirmed
-    /// gain sat on the rail (the W2 shape), else the
-    /// standing hero/chip rule. The episode re-arms only
-    /// when focus is seen alive again, so a permanent void
-    /// costs one reland, not a log flood; and the worst
-    /// case for any void becomes ~1.5 s + the chain, never
-    /// an infinite freeze.
-    /// TWO-WITNESS VOID (1.3.17, DESIGN §1.2.3): a void
-    /// counts only when BOTH witnesses are empty at the
-    /// same tick — the hook tracker reads "none" AND the
-    /// engine classification says .nowhere. The round-2
-    /// watchdog asked only the tracker, which cannot see
-    /// the tab bar: all three of its firings in the
-    /// evidence session were tab-bar false positives (one
-    /// dragged the user off the tab bar onto the hero in
-    /// 39 ms — the owner's "lost menu bar" complaint,
-    /// L-T43). Tracker-none with the engine alive (tab bar
-    /// or in-window) is a STANDDOWN, not a void: the void
-    /// clock resets, and one line per tracker-none episode
-    /// records why the watchdog stayed its hand.
-    private func startFocusWatchdog() {
-        watchdogTask?.cancel()
-        watchdogTask = Task { @MainActor in
-            var voidSince: Date?
-            var relandedThisEpisode = false
-            var stoodDownThisEpisode = false
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(500))
-                if Task.isCancelled { return }
-                guard homeAppeared, nav.path.isEmpty else {
-                    voidSince = nil
-                    relandedThisEpisode = false
-                    stoodDownThisEpisode = false
-                    continue
-                }
-                if focusTracker.current != "none" {
-                    voidSince = nil
-                    relandedThisEpisode = false
-                    stoodDownThisEpisode = false
-                    continue
-                }
-                let engine = TVHomeFocusTracker.engineFocus()
-                if engine.state != .nowhere {
-                    voidSince = nil
-                    if !stoodDownThisEpisode {
-                        stoodDownThisEpisode = true
-                        DiagLog.log("focus", "watchdog standdown engine=\(engine.state == .onTabBar ? "tabbar" : "window") item=\(engine.description)")
-                    }
-                    continue
-                }
-                if voidSince == nil { voidSince = Date() }
-                if let since = voidSince,
-                   Date().timeIntervalSince(since) > 1.5,
-                   !relandedThisEpisode, !landingOwed {
-                    relandedThisEpisode = true
-                    DiagLog.log("focus", "watchdog reland after=\(String(format: "%.1f", Date().timeIntervalSince(since)))s lastGain=\(lastGainElement)")
-                    openLandingObligation(preferChip: lastGainWasChip, reason: "watchdog")
+            var elapsed = 0
+            for (n, offset) in [150, 500].enumerated() {
+                try? await Task.sleep(for: .milliseconds(offset - elapsed))
+                elapsed = offset
+                guard gen == landingGeneration, homeVisible,
+                      !focusTracker.userHasTakenFocus else { return }
+                DiagLog.log("focus", "landing shot return n=\(n) target=\(descriptor) engine=\(TVFocusProbe.engineFocus().label)")
+                if descriptor.hasPrefix("header section=") {
+                    headerFocusSlug = String(descriptor.dropFirst("header section=".count))
+                } else if store.heroMovie != nil {
+                    heroFocused = true
                 }
             }
         }
     }
 
-    /// The landing audit lines: which element SHOULD hold
-    /// focus after an (re)entry or a content swap vs the
-    /// owner the hooks actually reported. Samples at
-    /// +300 ms AND +1200 ms (DIAGNOSIS-2 §7.1): the +300 ms
-    /// sample alone misread cold landings (1.1–1.4 s) as
-    /// failures all through the evidence log — the late
-    /// sample separates landed-slow from landed-never.
-    /// Both sides are read at sample time (gate R1 Lens 3:
-    /// a target captured at trigger time can be stale for
-    /// the swap it audits).
-    /// L-T41 (1.3.17, DESIGN §2.2.6): while an obligation
-    /// is open, the audit names the OBLIGATION's target —
-    /// for a return obligation that is the descriptor the
-    /// landing is actually owed to, so a post-pop sample
-    /// reads `target=return element=header section=…`
-    /// against the restored element instead of the hero
-    /// rule that misread every pop-back window in the
-    /// evidence log. With no obligation open, the standing
-    /// hero/chip rule applies, as before.
-    private var landingAuditTarget: String {
-        if landingOwed { return landingTargetLog }
-        return store.heroMovie != nil ? "hero" : "chip"
+    /// L-T48 (d): the tab-bar trap (log_8 15:09:34.861–36.400:
+    /// four dead presses on `Trang_chủ` until he escaped by
+    /// changing tab). On the tab bar, Up (nothing above) or Left
+    /// on the first tab are normal dead presses, so one or two
+    /// prove nothing; THREE within 2 s while Home is the visible
+    /// tab means the user is pressing down and the engine is not
+    /// entering Home (the trap produced 3 in 0.98 s) — land on
+    /// the active chip once, and log it.
+    private func handleTabBarDeadPress() {
+        let now = Date()
+        tabBarDeadPresses = tabBarDeadPresses.filter { now.timeIntervalSince($0) <= 2.0 } + [now]
+        guard tabBarDeadPresses.count >= 3, homeVisible, let target = landingChipId else { return }
+        tabBarDeadPresses = []
+        DiagLog.log("focus", "tabbar-rescue target=chip plugin=\(target)")
+        chipFocus = target
     }
 
-    private func logLanding() {
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(300))
-            DiagLog.log("focus", "landing scope=home target=\(landingAuditTarget) actual=\(focusTracker.current) late=300ms")
-        }
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(1200))
-            DiagLog.log("focus", "landing scope=home target=\(landingAuditTarget) actual=\(focusTracker.current) late=1200ms")
+    /// The landing audit lines (kept): which element SHOULD hold
+    /// focus after an entry vs the owner the hooks reported, at
+    /// +300 ms and +1200 ms. Logged only while Home is visible.
+    private func logLanding(target: String) {
+        for late in [300, 1200] {
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(late))
+                guard homeVisible else { return }
+                DiagLog.log("focus", "landing scope=home target=\(target) actual=\(focusTracker.current) late=\(late)ms")
+            }
         }
     }
 
     private func heroBand(hero: Movie, pluginId: String) -> some View {
         TVHeroCard(movie: hero,
                    onSelect: {
-                       // L-T41 return landing (1.3.17,
-                       // DESIGN §2.2.2): record the push
-                       // origin so the pop-back appear can
-                       // aim the return obligation at it.
                        pendingReturnElement = "hero movie=\(hero.id)"
                        nav.push(.movie(MovieRoute(pluginId: pluginId, movie: hero, autoResume: false)))
                    },
@@ -1411,20 +935,15 @@ struct TVHomeView: View {
                    entryFocus: $heroFocused)
     }
 
-    /// One rail card (L-T42's append trigger rides its
-    /// focus hook, unchanged): gaining focus within the
-    /// last four cards of the rail asks the store for the
-    /// next page. Factored out of sectionBand in vòng 2 so
-    /// the eager head and the lazy tail build the identical
-    /// card — `globalIndex` is the card's index in the
-    /// section's full item list either way.
+    /// One rail card. The focus-driven append (L-T42) now fires
+    /// within the last 12 cards (was 4) — one card is one press,
+    /// so the next page is asked for a full screen ahead of the
+    /// end; the background fill has usually got there first.
     private func railCard(movie: Movie, pluginId pid: String, section: HomeSection,
                           globalIndex index: Int, totalCount: Int) -> some View {
         TVPosterCard(movie: movie, width: 240,
                      isFavorite: favorites.isFavorite(pluginId: pid, movieId: movie.id),
                      onSelect: {
-                         // Return-landing origin record
-                         // (DESIGN §2.2.2), as in heroBand.
                          pendingReturnElement = "card movie=\(movie.id)"
                          nav.push(.movie(MovieRoute(pluginId: pid, movie: movie)))
                      },
@@ -1433,7 +952,7 @@ struct TVHomeView: View {
                      },
                      onFocusChange: { focused in
                          focusHook("card movie=\(movie.id)")(focused)
-                         if focused == true, index >= totalCount - 4 {
+                         if focused == true, index >= totalCount - 12 {
                              Task { await store.loadMoreSection(sectionId: section.id, plugins: plugins, service: service) }
                          }
                      })
@@ -1496,11 +1015,7 @@ struct TVHomeView: View {
                 TVSectionHeader(title: section.title)
                 TVSectionErrorRow(message: error,
                                   onRetry: {
-                                      Task {
-                                          if await store.load(plugins: plugins, service: service, force: true) {
-                                              beginLandingObligation()
-                                          }
-                                      }
+                                      Task { await store.load(plugins: plugins, service: service, force: true) }
                                   },
                                   onFocusChange: focusHook("retry section=\(section.slug)"))
             }
@@ -1508,15 +1023,9 @@ struct TVHomeView: View {
             VStack(alignment: .leading, spacing: 18) {
                 TVSectionHeader(title: section.title,
                                 action: {
-                                    // L-T41 return landing
-                                    // (1.3.17, DESIGN §2.2.2):
-                                    // record the push origin —
-                                    // THIS header — so the
-                                    // pop-back appear opens the
-                                    // return obligation aimed
-                                    // at the element sitting at
-                                    // the restored scroll
-                                    // position.
+                                    // Record the push origin —
+                                    // THIS header — for the
+                                    // return landing on pop.
                                     pendingReturnElement = "header section=\(section.slug)"
                                     nav.push(.category(CategoryRoute(pluginId: pid, slug: section.slug,
                                                                      title: section.title, filters: ListFilters())))
@@ -1735,61 +1244,38 @@ private struct TVHeroCard: View {
     }
 }
 
-// MARK: - Focus tracker (L-T41 §5.3)
+// MARK: - Focus tracker (L-T41 §5.3, simplified 1.3.19)
 
-/// Owns Home's passive focus-movement-failure observer
-/// and the last focus owner the view's hooks reported.
+/// Owns Home's passive focus-movement-failure observer and the
+/// last focus owner the view's hooks reported.
 ///
 /// The observer is PASSIVE: it only listens for
-/// `UIFocusSystem.movementDidFailNotification` — the
-/// engine's own broadcast when a remote press finds no
-/// candidate in that direction — and writes one DiagLog
-/// line pairing the failure with BOTH witnesses: the
-/// engine's own `focusedItem` (vòng 2 — tab bar vs a Home
-/// view vs genuinely nowhere) and the element the hooks
-/// say held focus (`tracker=`). That pairing is the
-/// decisive evidence for this fault family; a press that
-/// produces neither a gain nor a moveFail line points at
-/// the input path instead. The tree forbids
-/// `.onMoveCommand` for this (an active handler can itself
-/// change focus behaviour); nothing here ever requests a
-/// focus update.
+/// `UIFocusSystem.movementDidFailNotification` — the engine's
+/// own broadcast when a remote press finds no candidate — and
+/// writes one DiagLog line pairing the failure with BOTH
+/// witnesses: the engine's `focusedItem` (TVFocusProbe) and the
+/// element the hooks say held focus (`tracker=`). A dead press
+/// whose engine reading is the TAB BAR is also handed to the
+/// view (`onTabBarMoveFail`) for the tab-bar rescue.
 ///
-/// Concurrency shape (the FL-495 discipline): all state
-/// is instance state of this one object, and EVERY access
-/// to it goes through `lock` — the hooks call in from
-/// SwiftUI callbacks, the observer block from the main
-/// queue — which is what the `@unchecked Sendable`
-/// conformance states. The codebase's own shape for
-/// lock-guarded shared state (DiagLog, SourceReputation).
-/// No static or global mutable state is introduced.
+/// `userHasTakenFocus` separates the shell's cold-start tab-bar
+/// PARK (nothing touched yet in this appearance) from the user
+/// actually holding focus: set by any Home gain, any Home loss
+/// that clears the owner, and any tab-bar dead press; reset by
+/// `beginAppearance()` on every Home appear. The cold and return
+/// landings stop at it.
+///
+/// Concurrency (the FL-495 discipline): all state is instance
+/// state behind `lock`, hence `@unchecked Sendable`.
 private final class TVHomeFocusTracker: @unchecked Sendable {
     private let lock = NSLock()
-    /// The element descriptor the hooks last reported as
-    /// focused ("hero movie=…", "chip plugin=…", …), or
-    /// "none" before the first gain / after its loss.
-    /// Read and written only under `lock`.
     private var _current = "none"
-    /// L-T46 (1.3.18, DESIGN §2.2): whether the user has
-    /// TAKEN focus at any point in the current Home
-    /// appearance — the witness that separates the
-    /// shell's cold-start tab-bar PARK (focus never
-    /// taken; the TabView simply placed it on the tab)
-    /// from the user genuinely standing on the tab bar
-    /// (taken inside Home, then walked up). Set by
-    /// exactly three events, all already flowing through
-    /// this tracker: S1 any Home gain (note), S2 any Home
-    /// loss that actually clears the current owner
-    /// (clear), S3 a moveFail whose engine reading is
-    /// .onTabBar (the observer in install). Reset by
-    /// exactly one: beginAppearance(), called beside
-    /// install() on every Home appear. Read at exactly
-    /// one place: the landing shot's tab-bar gate in
-    /// fireLandingShot — the watchdog and the chip-edge
-    /// guard never consult it (DESIGN §2.4). Same lock
-    /// as every other access (the FL-495 discipline).
     private var _userHasTakenFocus = false
     private var token: NSObjectProtocol?
+    /// Main-actor callback for a dead press on the tab bar;
+    /// set by the view on appear, cleared on disappear. Read
+    /// and written on the main actor only.
+    @MainActor var onTabBarMoveFail: (@MainActor () -> Void)?
 
     var current: String {
         lock.withLock { _current }
@@ -1799,8 +1285,6 @@ private final class TVHomeFocusTracker: @unchecked Sendable {
         lock.withLock { _userHasTakenFocus }
     }
 
-    /// The one reset (L-T46, DESIGN §2.2): a new Home
-    /// appearance begins with focus not yet taken.
     func beginAppearance() {
         lock.withLock { _userHasTakenFocus = false }
     }
@@ -1808,11 +1292,6 @@ private final class TVHomeFocusTracker: @unchecked Sendable {
     func note(_ element: String) {
         lock.withLock {
             _current = element
-            // S1: a gain proves focus has been inside
-            // Home in this appearance — including a gain
-            // a landing shot delivered, after which every
-            // later tab-bar reading is the user walking
-            // up, and the park-override window is closed.
             _userHasTakenFocus = true
         }
     }
@@ -1821,33 +1300,13 @@ private final class TVHomeFocusTracker: @unchecked Sendable {
         lock.withLock {
             if _current == element {
                 _current = "none"
-                // S2: a loss that actually clears the
-                // owner proves focus WAS in the user's
-                // hands inside Home — even when its
-                // destination is the tab bar, which is
-                // exactly how the convicted L-T43 drag
-                // began.
                 _userHasTakenFocus = true
             }
         }
     }
 
-    /// S3 (L-T46, DESIGN §2.2): a dead press whose
-    /// engine witness sits on the tab bar — the user is
-    /// pressing on the menu itself, possibly without
-    /// ever having entered Home content this appearance.
-    /// Called only from the moveFail observer in
-    /// install(), and only when its engine reading is
-    /// .onTabBar.
-    func noteTabBarMoveFail() {
-        lock.withLock { _userHasTakenFocus = true }
-    }
-
     func install() {
-        let shouldRegister = lock.withLock {
-            guard token == nil else { return false }
-            return true
-        }
+        let shouldRegister = lock.withLock { token == nil }
         guard shouldRegister else { return }
         let newToken = NotificationCenter.default.addObserver(
             forName: UIFocusSystem.movementDidFailNotification,
@@ -1855,103 +1314,17 @@ private final class TVHomeFocusTracker: @unchecked Sendable {
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            // L-T46 S3 (1.3.18, DESIGN §2.2): a dead
-            // press whose engine witness sits ON the tab
-            // bar marks the user as holding focus there —
-            // the witness for a user who never entered
-            // Home content this appearance but is walking
-            // the menu. The convicted L-T43 window opened
-            // with exactly this line 87 ms before the
-            // dragging shot, so the flag is set before
-            // that shot's gate reads it.
-            if Self.engineFocus().state == .onTabBar {
-                self.noteTabBarMoveFail()
+            MainActor.assumeIsolated {
+                let engine = TVFocusProbe.engineFocus()
+                let onTabBar = engine.state == .onTabBar
+                if onTabBar {
+                    self.lock.withLock { self._userHasTakenFocus = true }
+                }
+                DiagLog.log("focus", "moveFail focusedItem=\(engine.description) tracker=\(self.current)")
+                if onTabBar { self.onTabBarMoveFail?() }
             }
-            DiagLog.log("focus", "moveFail focusedItem=\(Self.focusedItemDescription()) tracker=\(self.current)")
         }
         lock.withLock { token = newToken }
-    }
-
-    /// Where the ENGINE says focus actually is at the
-    /// moment of the failed press — read from
-    /// `UIFocusSystem.focusedItem`, the UIKit-level witness
-    /// the hooks cannot be (DIAGNOSIS-2 §7.1): it
-    /// distinguishes the three states the tracker alone
-    /// cannot — focus on the TAB BAR (a tab-bar ancestor or
-    /// a tab title in the label), focus on a real view
-    /// inside Home, or genuinely nowhere (`nil`). The
-    /// 1.3.15 line tried to read the press DIRECTION out of
-    /// this notification's userInfo instead; that payload
-    /// does not exist (13/13 `dir=unknown` in the evidence
-    /// log), so the direction extraction is REMOVED, not
-    /// replaced — no line in this file guesses a direction
-    /// any more. Description only: item class, a tab-bar
-    /// marker when the item lives in one, and its
-    /// accessibility label (spaces folded, truncated) —
-    /// ids/labels only, the standing DiagLog discipline.
-    private static func focusedItemDescription() -> String {
-        engineFocus().description
-    }
-
-    /// L-T43 (1.3.17, DESIGN §1.2.1): the engine witness as
-    /// a CLASSIFICATION, shared by every consumer — the
-    /// moveFail line above (through the description), the
-    /// watchdog's void test and the landing shot's gate.
-    /// The round-2 machinery read only the hook-fed
-    /// tracker, which is blind to the tab bar (the TabView
-    /// lives in TVRootView, outside Home's focus scope):
-    /// focus sitting on a tab read as "none", and all
-    /// three watchdog firings in the evidence session were
-    /// false positives on the tab bar — one dragged the
-    /// user off it onto the hero in 39 ms. The classes:
-    /// `focusedItem == nil` → .nowhere (a genuine void);
-    /// a UITabBar ancestor → .onTabBar (focus is alive and
-    /// belongs to the shell); anything else → .inWindow (a
-    /// view the hooks do not track, or Home's own transient
-    /// responder). The description is the moveFail line's:
-    /// item class, the tabbar: marker, the folded label —
-    /// or "nil" for .nowhere.
-    enum EngineFocus {
-        case nowhere
-        case onTabBar
-        case inWindow
-    }
-
-    static func engineFocus() -> (state: EngineFocus, description: String) {
-        guard let window = activeKeyWindow(),
-              let item = UIFocusSystem(for: window)?.focusedItem
-        else { return (.nowhere, "nil") }
-        var desc = String(describing: type(of: item))
-        var onTabBar = false
-        if let view = item as? UIView {
-            var ancestor: UIView? = view
-            while let a = ancestor {
-                if a is UITabBar {
-                    onTabBar = true
-                    break
-                }
-                ancestor = a.superview
-            }
-            if onTabBar { desc = "tabbar:" + desc }
-            if let label = view.accessibilityLabel, !label.isEmpty {
-                let folded = label.replacingOccurrences(of: " ", with: "_")
-                desc += " label=\(String(folded.prefix(40)))"
-            }
-        }
-        return (onTabBar ? .onTabBar : .inWindow, desc)
-    }
-
-    private static func activeKeyWindow() -> UIWindow? {
-        for scene in UIApplication.shared.connectedScenes {
-            guard let windowScene = scene as? UIWindowScene,
-                  windowScene.activationState == .foregroundActive
-            else { continue }
-            if let key = windowScene.windows.first(where: { $0.isKeyWindow }) {
-                return key
-            }
-            return windowScene.windows.first
-        }
-        return nil
     }
 
     func uninstall() {

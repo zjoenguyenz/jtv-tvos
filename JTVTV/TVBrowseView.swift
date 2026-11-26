@@ -217,6 +217,14 @@ struct TVPosterGrid: View {
     /// focus. Default nil: every existing grid user is
     /// unchanged.
     var onCellFocusChange: ((Movie, Bool) -> Void)? = nil
+    /// 1.3.19 (L-T49): fires when the FIRST cell actually
+    /// appears — the moment its focus binding has a real view
+    /// behind it. Browse hands its landing to the first card
+    /// from here instead of from the items-arrived edge, which
+    /// could write the binding before the lazy grid had
+    /// realized the cell. Default nil: other grid users are
+    /// unchanged.
+    var onFirstCellAppear: (() -> Void)? = nil
 
     @EnvironmentObject private var favorites: FavoritesManager
     @Environment(TVNavPath.self) private var nav
@@ -256,6 +264,9 @@ struct TVPosterGrid: View {
                         },
                         entryFocus: movie.id == items.first?.id ? firstCellEntryFocus : nil
                     )
+                    .onAppear {
+                        if movie.id == items.first?.id { onFirstCellAppear?() }
+                    }
                 }
             }
             if isLoadingMore {
@@ -339,6 +350,14 @@ struct TVBrowseView: View {
     /// A-6 (1.3.9): the first card's entry focus — the
     /// screen's landing focus whenever items exist.
     @FocusState private var firstCardFocused: Bool
+    /// 1.3.19 (L-T49): the first-card hand-off is owed (items
+    /// arrived while focus sat on the filter button) and waits
+    /// for the first cell to appear.
+    @State private var firstCardHandOffOwed = false
+    /// Diagnostics: the element this screen's hooks last saw
+    /// holding focus ("filter", "card movie=<id>", "none").
+    @State private var focusedElement = "none"
+    @State private var appeared = false
 
     init(pluginId: String, slug: String, title: String, initialFilters: ListFilters) {
         self.pluginId = pluginId
@@ -374,12 +393,39 @@ struct TVBrowseView: View {
         // the first card explicitly. If the user has
         // moved focus anywhere else, filterFocused is
         // false and nothing is stolen.
+        // 1.3.19 (L-T49): the hand-off is now made from the
+        // first cell's own appearance (see TVPosterGrid's
+        // onFirstCellAppear) — the items-arrived edge only marks
+        // it owed. Writing the binding before the lazy grid had
+        // realized the cell could leave focus with no view at
+        // all inside this screen, and a screen with no focus
+        // never receives its own Menu press.
         .onChange(of: items.isEmpty) { wasEmpty, isEmpty in
             if wasEmpty, !isEmpty, filterFocused {
-                firstCardFocused = true
+                firstCardHandOffOwed = true
+                // Backstop: if the first cell's appearance was
+                // already delivered before this edge ran, make
+                // the hand-off once the grid has surely realized
+                // its first row.
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(400))
+                    handOffToFirstCardIfOwed()
+                }
             }
         }
-        .onAppear { session.touch() }
+        .onChange(of: filterFocused) { _, focused in
+            noteFocus("filter", focused)
+        }
+        .onAppear {
+            session.touch()
+            appeared = true
+            DiagLog.log("browse", "appear plugin=\(pluginId) slug=\(slug) depth=\(nav.path.count) items=\(items.count)")
+            verifyLanding(reason: "appear", after: 500)
+        }
+        .onDisappear {
+            appeared = false
+            DiagLog.log("browse", "disappear plugin=\(pluginId) slug=\(slug) items=\(items.count) page=\(page)")
+        }
         .task { if !didLoad { await reload() } }
         .onChange(of: filters) { _, _ in Task { await reload() } }
         .fullScreenCover(isPresented: $showFilters) {
@@ -389,10 +435,58 @@ struct TVBrowseView: View {
         // pops the owning stack straight to its root, exactly
         // like Detail's (see TVDetailView). While the filter
         // sheet is up, the sheet's own arbiter owns the press.
+        // It is installed on the screen's outermost view from
+        // the first frame, loading/empty/error states included;
+        // the TabView-level net in TVRootView catches the press
+        // if focus has somehow left this screen.
         .onExitCommand {
-            DiagLog.log("menu", "back-to-root surface=browse plugin=\(pluginId)")
+            DiagLog.log("menu", "back-to-root surface=browse plugin=\(pluginId) loading=\(isLoading) items=\(items.count) focus=\(focusedElement)")
             nav.popToRoot()
         }
+    }
+
+    private func noteFocus(_ element: String, _ focused: Bool) {
+        if focused {
+            focusedElement = element
+        } else if focusedElement == element {
+            focusedElement = "none"
+        }
+    }
+
+    /// 1.3.19 (L-T49): the screen's landing check. `after` ms
+    /// past the trigger, if this screen's hooks see no focus
+    /// AND the engine says focus is nowhere or on the tab bar,
+    /// focus is put back on the filter button (always present,
+    /// from the first frame) — so the screen always holds focus
+    /// and therefore always receives its own Back. One line
+    /// either way, so the next log shows where focus landed.
+    private func verifyLanding(reason: String, after: Int) {
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(after))
+            guard appeared, isTopOfStack else { return }
+            let engine = TVFocusProbe.engineFocus()
+            if focusedElement == "none", engine.state != .inWindow {
+                DiagLog.log("browse", "landing rescue reason=\(reason) engine=\(engine.label) item=\(engine.description)")
+                filterFocused = true
+            } else {
+                DiagLog.log("browse", "landing reason=\(reason) focus=\(focusedElement) engine=\(engine.label)")
+            }
+        }
+    }
+
+    /// This Browse screen is the top of its stack (a Detail
+    /// pushed over it owns focus then).
+    private var isTopOfStack: Bool {
+        if case .category? = nav.path.last { return true }
+        return false
+    }
+
+    private func handOffToFirstCardIfOwed() {
+        guard firstCardHandOffOwed else { return }
+        firstCardHandOffOwed = false
+        guard filterFocused else { return }
+        firstCardFocused = true
+        verifyLanding(reason: "first-card", after: 300)
     }
 
     private var headerBand: some View {
@@ -446,7 +540,11 @@ struct TVBrowseView: View {
             TVPosterGrid(items: items, pluginId: pluginId,
                          isLoadingMore: isLoadingMore,
                          onLoadMore: { Task { await loadMore() } },
-                         firstCellEntryFocus: $firstCardFocused)
+                         firstCellEntryFocus: $firstCardFocused,
+                         onCellFocusChange: { movie, focused in
+                             noteFocus("card movie=\(movie.id)", focused)
+                         },
+                         onFirstCellAppear: { handOffToFirstCardIfOwed() })
                 .browseFocusSection(if: !items.isEmpty)
         }
     }
@@ -456,9 +554,15 @@ struct TVBrowseView: View {
         let gen = loadGeneration
         isLoading = true
         loadError = nil
+        let started = Date()
+        DiagLog.log("browse", "load begin plugin=\(pluginId) slug=\(slug) page=1 gen=\(gen)")
         do {
             let result = try await service.list(pluginId: pluginId, slug: slug, filters: filters, page: 1)
-            guard gen == loadGeneration else { return }
+            guard gen == loadGeneration else {
+                DiagLog.log("browse", "load superseded plugin=\(pluginId) slug=\(slug) gen=\(gen)")
+                return
+            }
+            DiagLog.log("browse", "load end plugin=\(pluginId) slug=\(slug) page=1 items=\(result.items.count) totalPages=\(result.pagination.totalPages) ms=\(Int(Date().timeIntervalSince(started) * 1000))")
             items = result.items.uniquedById()
             // FL-489: this view OWNS its counter — page 1 was
             // requested, so the counter is 1. The parser-reported
@@ -502,6 +606,7 @@ struct TVBrowseView: View {
             } else {
                 totalPages = max(result.pagination.totalPages, 1)
             }
+            DiagLog.log("browse", "loadMore end plugin=\(pluginId) slug=\(slug) page=\(requestedPage) added=\(newItems.count) total=\(items.count)")
         } catch {
             // Non-fatal (iOS discipline): keep what's on screen.
             DiagLog.log("browse", "loadMore failed plugin=\(pluginId) slug=\(slug) kind=\((error as NSError).domain)#\((error as NSError).code)")
@@ -619,10 +724,24 @@ struct TVFilterSheet: View {
         .task {
             if !didLoad {
                 didLoad = true
-                config = await service.filterConfig(pluginId: pluginId)
-                categories = await service.categories(pluginId: pluginId)
-                countries = await service.countries(pluginId: pluginId)
-                years = await service.years(pluginId: pluginId)
+                // 1.3.19 (scan finding S-2): the four lists are
+                // fetched together and published in ONE turn.
+                // Published one by one, `firstGroupKey` changed
+                // up to four times during the load (config's
+                // first key, then "category", …), and the
+                // first-group chip's entry binding migrated
+                // between chips while focus was being handed to
+                // it — the same binding-migration bounce as
+                // Home's chip rail (L-T48).
+                async let c = service.filterConfig(pluginId: pluginId)
+                async let cats = service.categories(pluginId: pluginId)
+                async let cos = service.countries(pluginId: pluginId)
+                async let ys = service.years(pluginId: pluginId)
+                let (c1, c2, c3, c4) = await (c, cats, cos, ys)
+                config = c1
+                categories = c2
+                countries = c3
+                years = c4
             }
         }
     }

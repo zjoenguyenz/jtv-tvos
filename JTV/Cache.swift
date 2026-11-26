@@ -215,6 +215,135 @@ final class ImageCacheManager: @unchecked Sendable {
     private var prefetchQueue: [(urlString: String, headers: [String: String], key: String)] = []
     private var prefetchActive = 0
     private static let prefetchWorkers = 3
+
+    // MARK: Per-host circuit breaker (L-T50 / FL-509, 1.3.19)
+    //
+    // log_8: missav's poster CDN failed with -1005 hundreds of
+    // times across three sessions while every other host was
+    // healthy, and the pipeline kept firing new requests into it
+    // at full rate (3 attempts each, up to 8 connections). The
+    // breaker makes a dead host cost a handful of requests, not
+    // hundreds: after `breakerThreshold` CONSECUTIVE transient
+    // attempt failures on one host the host is OPEN for a
+    // cooldown (10 s, doubling per re-open, capped at 120 s);
+    // while open, loads for that host fail fast with no network
+    // and no per-URL log line. When the cooldown expires the
+    // host is HALF-OPEN: exactly one request goes out as a
+    // probe, the rest keep failing fast; the probe's success
+    // closes the breaker (cooldown resets), its failure re-opens
+    // it at double the cooldown. Any successful response resets
+    // the host's failure streak. Permanent (4xx) answers prove
+    // the host is alive and never count. The iOS tree has had a
+    // per-host breaker since 1.22.18 (L-17); this is the tvOS
+    // shape of the same idea on the plain-fetch lane. All state
+    // is guarded by `lock`, like inFlight.
+    private struct HostHealth {
+        var streak = 0
+        var openUntil: Date?
+        var cooldown: TimeInterval = 0
+        var probeInFlight = false
+        var suppressed = 0
+        var openedAt: Date?
+    }
+    private var hostHealth: [String: HostHealth] = [:]
+    private static let breakerThreshold = 4
+    private static let breakerBaseCooldown: TimeInterval = 10
+    private static let breakerMaxCooldown: TimeInterval = 120
+    /// Per-URL memo for PERMANENT failures (404/403/…): the
+    /// same dead URL is not re-requested every time its cell
+    /// re-appears. Keyed by the bucketless base key; a user
+    /// retry tap (`force`) bypasses it. Guarded by `lock`.
+    private var permanentFailures: [String: Date] = [:]
+    private static let permanentFailureTTL: TimeInterval = 300
+    /// Byte-level request coalescing: the decoded-image
+    /// in-flight map is keyed per BUCKET, so a poster (720) and
+    /// a backdrop (1920) of the same URL used to download twice.
+    /// Downloads are now shared by the bucketless base key.
+    private var inFlightBytes: [String: Task<Data?, Never>] = [:]
+
+    private enum Admission { case allowed, probe, blocked }
+
+    /// Decides whether a network attempt to `host` may go out.
+    /// Called under no lock; takes it.
+    private func admit(host: String) -> Admission {
+        lock.withLock {
+            var h = hostHealth[host] ?? HostHealth()
+            defer { hostHealth[host] = h }
+            guard let until = h.openUntil else { return .allowed }
+            if Date() < until || h.probeInFlight {
+                h.suppressed += 1
+                return .blocked
+            }
+            h.probeInFlight = true
+            return .probe
+        }
+    }
+
+    /// Records one attempt's outcome for the breaker. `ok` is a
+    /// response that proves the host alive (2xx or a permanent
+    /// 4xx); `!ok` is a transient failure (thrown error, 408,
+    /// 429, ≥500, undecodable body).
+    private func recordAttempt(host: String, ok: Bool, wasProbe: Bool) {
+        var line: String?
+        lock.withLock {
+            var h = hostHealth[host] ?? HostHealth()
+            if wasProbe { h.probeInFlight = false }
+            if ok {
+                if h.openUntil != nil {
+                    let after = h.openedAt.map { Int(Date().timeIntervalSince($0)) } ?? 0
+                    line = "host backoff closed host=\(host) after=\(after)s suppressed=\(h.suppressed)"
+                }
+                h = HostHealth()
+            } else {
+                h.streak += 1
+                if wasProbe || (h.openUntil == nil && h.streak >= Self.breakerThreshold) {
+                    let reopen = h.openUntil != nil
+                    h.cooldown = h.cooldown == 0
+                        ? Self.breakerBaseCooldown
+                        : min(Self.breakerMaxCooldown, h.cooldown * 2)
+                    h.openUntil = Date().addingTimeInterval(h.cooldown)
+                    if h.openedAt == nil { h.openedAt = Date() }
+                    line = "host backoff \(reopen ? "reopen" : "open") host=\(host) streak=\(h.streak) cooldown=\(Int(h.cooldown))s suppressed=\(h.suppressed)"
+                }
+            }
+            hostHealth[host] = h
+        }
+        if let line { DiagLog.log("image", line) }
+    }
+
+    /// A cancelled probe hands the half-open slot back.
+    private func releaseProbe(host: String) {
+        lock.withLock {
+            if var h = hostHealth[host] {
+                h.probeInFlight = false
+                hostHealth[host] = h
+            }
+        }
+    }
+
+    /// Seconds until a load for this URL could reach the
+    /// network again (host breaker cooldown remaining), or nil
+    /// when nothing is holding it back. TVRemoteImage uses it
+    /// to schedule its own retry instead of staying blank until
+    /// the view is rebuilt.
+    func retryDelay(urlString: String) -> TimeInterval? {
+        guard let host = URL(string: urlString)?.host else { return nil }
+        return lock.withLock {
+            guard let until = hostHealth[host]?.openUntil else { return nil }
+            return max(0.5, until.timeIntervalSinceNow)
+        }
+    }
+
+    /// Whether the host behind this URL string is currently
+    /// held by the breaker (open, or half-open with its probe
+    /// out). CALLER HOLDS `lock` (the prefetch pump reads it
+    /// inside its own critical section; NSLock is not
+    /// recursive).
+    private func hostBlockedLocked(_ urlString: String) -> Bool {
+        guard let host = URL(string: urlString)?.host,
+              let h = hostHealth[host], let until = h.openUntil else { return false }
+        return Date() < until || h.probeInFlight
+    }
     /// Decode size ladder (Phase 2): a requested bucket is
     /// normalised UP to the smallest rung ≥ the request,
     /// capped at 1920, so cache keys stay stable across call
@@ -343,12 +472,18 @@ final class ImageCacheManager: @unchecked Sendable {
         cachedImage(urlString: urlString, headers: headers)
     }
 
-    func loadImage(urlString: String, headers: [String: String] = [:], bucket: Int = 720) async -> UIImage? {
+    /// `force` (1.3.19): a user's explicit retry tap — bypasses
+    /// the permanent-failure memo (never the host breaker, which
+    /// still admits its one probe when the cooldown is spent).
+    func loadImage(urlString: String, headers: [String: String] = [:], bucket: Int = 720, force: Bool = false) async -> UIImage? {
         let rung = Self.bucket(forPixels: bucket)
         let baseKey = key(for: urlString, headers: headers)
         let k = baseKey + "|b\(rung)"
         if let hit = cache.object(forKey: k as NSString) { return hit }
         guard let url = URL(string: urlString) else { return nil }
+        if force {
+            lock.withLock { _ = permanentFailures.removeValue(forKey: baseKey) }
+        }
 
         // Swift 6: NSLock.lock()/unlock() are unavailable in
         // async contexts; scoped withLock is the sanctioned
@@ -378,9 +513,8 @@ final class ImageCacheManager: @unchecked Sendable {
                     self.cache.setObject(cappedImage, forKey: k as NSString, cost: self.decodedCost(cappedImage))
                     return cappedImage
                 }
-                guard let data = await self.fetchBytes(url: url, headers: headers),
+                guard let data = await self.sharedBytes(baseKey: baseKey, url: url, headers: headers, disk: disk),
                       let image = Self.decodeImage(data: data, bucket: rung) else { return nil }
-                try? data.write(to: disk, options: .atomic)
                 let cappedImage = self.capped(image)
                 self.cache.setObject(cappedImage, forKey: k as NSString, cost: self.decodedCost(cappedImage))
                 return cappedImage
@@ -391,6 +525,36 @@ final class ImageCacheManager: @unchecked Sendable {
         return await task.value
     }
 
+    /// Byte-level coalescing (1.3.19): one download per base key
+    /// no matter how many buckets ask at once. The fetched bytes
+    /// are written to the disk tier here (once), and the
+    /// permanent-failure memo is consulted/updated here.
+    private func sharedBytes(baseKey: String, url: URL, headers: [String: String], disk: URL) async -> Data? {
+        let task: Task<Data?, Never>? = lock.withLock {
+            if let until = permanentFailures[baseKey] {
+                if Date() < until { return nil }
+                permanentFailures[baseKey] = nil
+            }
+            if let existing = inFlightBytes[baseKey] { return existing }
+            let created = Task<Data?, Never> {
+                defer { self.lock.withLock { self.inFlightBytes[baseKey] = nil } }
+                let (data, permanent) = await self.fetchBytes(url: url, headers: headers)
+                if let data {
+                    try? data.write(to: disk, options: .atomic)
+                } else if permanent {
+                    self.lock.withLock {
+                        self.permanentFailures[baseKey] = Date().addingTimeInterval(Self.permanentFailureTTL)
+                    }
+                }
+                return data
+            }
+            inFlightBytes[baseKey] = created
+            return created
+        }
+        guard let task else { return nil }
+        return await task.value
+    }
+
     /// tvOS adaptation: plain fetch only. The iOS original's
     /// WebView fallback ladder (clear the host's wall in a web
     /// view, retry direct, then pull the bytes out of the web
@@ -398,7 +562,15 @@ final class ImageCacheManager: @unchecked Sendable {
     /// response that does not decode as an image fails,
     /// exactly as ordinary failures (404, dead host, timeout)
     /// always did.
-    private func fetchBytes(url: URL, headers: [String: String]) async -> Data? {
+    /// Returns the image bytes, or nil plus whether the failure
+    /// was PERMANENT (a non-retryable HTTP answer — memoised by
+    /// the caller so the URL is not re-requested on every cell
+    /// re-appearance). 1.3.19 (L-T50): every attempt first asks
+    /// the host breaker for admission; a blocked attempt ends
+    /// the load at once, silently (the breaker's own open/close
+    /// lines carry the evidence and the suppressed count), and
+    /// every attempt's outcome feeds the breaker.
+    private func fetchBytes(url: URL, headers: [String: String]) async -> (Data?, Bool) {
         // Some hosts (sayhentai.cx's /storage/ covers, measured
         // 2026-11-18) refuse image requests that arrive with no
         // Referer at all — Cloudflare serves its hard block page
@@ -414,6 +586,7 @@ final class ImageCacheManager: @unchecked Sendable {
         if !hdrs.keys.contains(where: { $0.lowercased() == "referer" }), let host = url.host, !host.isEmpty {
             hdrs["Referer"] = "\(url.scheme ?? "https")://\(host)/"
         }
+        let host = url.host ?? "?"
         // Phase 2 (JoeTV adoption): bounded retry on the
         // dedicated image session — up to 3 attempts, backoff
         // 0.5 s / 1.5 s, with JoeTV's transient-vs-permanent
@@ -432,6 +605,9 @@ final class ImageCacheManager: @unchecked Sendable {
         var lastErr = ""
         let backoffs: [UInt64] = [500_000_000, 1_500_000_000]
         for attempt in 0..<3 {
+            let admission = admit(host: host)
+            if admission == .blocked { return (nil, false) }
+            let isProbe = admission == .probe
             do {
                 var req = Net.makeRequest(url: url, headers: hdrs)
                 req.timeoutInterval = 30
@@ -440,8 +616,10 @@ final class ImageCacheManager: @unchecked Sendable {
                     lastStatus = http.statusCode
                     if http.statusCode == 429 || http.statusCode == 408 || http.statusCode >= 500 {
                         lastClass = "transient"
+                        recordAttempt(host: host, ok: false, wasProbe: isProbe)
                     } else if !(200...299).contains(http.statusCode) {
                         lastClass = "permanent"
+                        recordAttempt(host: host, ok: true, wasProbe: isProbe)
                         break
                     } else if Self.decodeImage(data: data, bucket: 240) != nil {
                         // Validity gate: a successful decode at
@@ -450,18 +628,25 @@ final class ImageCacheManager: @unchecked Sendable {
                         // replaces the old full-size
                         // UIImage(data:) test, which WebP bodies
                         // could never pass on tvOS).
-                        return data
+                        recordAttempt(host: host, ok: true, wasProbe: isProbe)
+                        return (data, false)
                     } else {
                         lastClass = "transient"
+                        recordAttempt(host: host, ok: false, wasProbe: isProbe)
                     }
                 } else {
                     lastClass = "permanent"
+                    if isProbe { recordAttempt(host: host, ok: true, wasProbe: true) }
                     break
                 }
             } catch {
-                if (error as? URLError)?.code == .cancelled { return nil }
+                if (error as? URLError)?.code == .cancelled {
+                    if isProbe { releaseProbe(host: host) }
+                    return (nil, false)
+                }
                 lastClass = "transient"
                 lastErr = "\((error as NSError).domain)#\((error as NSError).code)"
+                recordAttempt(host: host, ok: false, wasProbe: isProbe)
             }
             if attempt < backoffs.count {
                 try? await Task.sleep(nanoseconds: backoffs[attempt])
@@ -472,7 +657,7 @@ final class ImageCacheManager: @unchecked Sendable {
         // walled image host stays diagnosable from the
         // exported log (FL-146/147/214).
         DiagLog.log("image", "fetch failed host=\(url.host ?? "?") class=\(lastClass) status=\(lastStatus) err=\(lastErr.isEmpty ? "none" : lastErr)")
-        return nil
+        return (nil, lastClass == "permanent")
     }
 
     // MARK: - Decode (Phase 2 — JoeTV pipeline adoption)
@@ -742,11 +927,19 @@ final class ImageCacheManager: @unchecked Sendable {
     /// at 3 leaves the pool to visible loads). A new call
     /// REPLACES the pending (not-yet-started) queue — the
     /// newest list is what the owner is looking at now.
-    func prefetch(urlStrings: [String], headers: [String: String] = [:]) {
+    /// `replace` (1.3.19, scan finding S-3): Home publishes its
+    /// sections in parallel, one prefetch call per section as
+    /// each lands, and with replace-only semantics every call
+    /// discarded the previous sections' pending posters — only
+    /// the last rail to land was ever warmed. Home now passes
+    /// `replace: false`, which APPENDS (deduped) to the pending
+    /// queue; every other caller keeps the replace default.
+    func prefetch(urlStrings: [String], headers: [String: String] = [:], replace: Bool = true) {
         let rung = Self.bucket(forPixels: 720)
         lock.withLock {
             var seen = Set<String>()
-            var queue: [(urlString: String, headers: [String: String], key: String)] = []
+            var queue: [(urlString: String, headers: [String: String], key: String)] = replace ? [] : prefetchQueue
+            for entry in queue { seen.insert(entry.key) }
             for urlString in urlStrings {
                 let k = key(for: urlString, headers: headers) + "|b\(rung)"
                 if !seen.insert(k).inserted { continue }
@@ -771,6 +964,11 @@ final class ImageCacheManager: @unchecked Sendable {
                     let next = prefetchQueue.removeFirst()
                     if cache.object(forKey: next.key as NSString) != nil { continue }
                     if inFlight[next.key] != nil { continue }
+                    // 1.3.19 (L-T50): warm-up never spends a
+                    // worker on a host the breaker is holding —
+                    // it would fail fast anyway, and the slot
+                    // belongs to the healthy hosts.
+                    if hostBlockedLocked(next.urlString) { continue }
                     prefetchActive += 1
                     return next
                 }
@@ -786,7 +984,10 @@ final class ImageCacheManager: @unchecked Sendable {
     }
 
     func clear() {
-        lock.withLock { prefetchQueue = [] }
+        lock.withLock {
+            prefetchQueue = []
+            permanentFailures = [:]
+        }
         cache.removeAllObjects()
         // v1.22.15 (F-2): the Settings action ("Xoá bộ nhớ đệm
         // ảnh") now tells the truth — it also empties the disk

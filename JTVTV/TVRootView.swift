@@ -74,6 +74,7 @@ struct TVRootView: View {
                     .tvNavigationDestinations()
             }
             .environment(homeNav)
+            .environment(\.tvHomeTabSelected, selection == 0)
             .tabItem { Label("Trang chủ", systemImage: "house") }
             .tag(0)
 
@@ -113,6 +114,25 @@ struct TVRootView: View {
         .environment(homeStore)
         .environment(\.tvTheme, theme)
         .background(theme.backgroundGradient.ignoresSafeArea())
+        // L-T49 / FL-508 (1.3.19): the ROOT Menu net. Every pushed
+        // surface owns its Back (`.onExitCommand` → pop to root,
+        // L-T31), but that handler only runs while focus is INSIDE
+        // the pushed screen. log_8 shows two Category pushes
+        // (15:09:53.690, 15:10:59.757) where no `[menu]` line ever
+        // fired and the app left the foreground ~10 s later: focus
+        // had fallen out of the pushed screen (onto the tab bar —
+        // the only other focusable in the window), and a Menu
+        // press on the tab bar is the system's "exit app". This
+        // net sits on the TabView, which contains the tab bar AND
+        // every stack, so a Menu press anywhere in the window
+        // reaches it when no inner surface claimed it. It is
+        // installed ONLY while the selected tab's stack has
+        // something pushed (nil action = the system default), so
+        // Back at a tab's root keeps tvOS's own behaviour (content
+        // → tab bar → exit), and an inner surface's own handler —
+        // Detail's actor exception included — still wins whenever
+        // focus is inside it.
+        .onExitCommand(perform: selectedNavDepth > 0 ? { rootMenuFallback() } : nil)
         .fullScreenCover(item: $presenter.request) { request in
             // L-T06: the player's dependencies ride as VALUES
             // from this root (their owner) — the cover's
@@ -143,6 +163,26 @@ struct TVRootView: View {
             // (TVHomeView's tracker).
             DiagLog.log("focus", "tab selected=\(newSelection)")
         }
+    }
+
+    /// The selected tab's navigation path (Settings has none).
+    private var selectedNav: TVNavPath? {
+        switch selection {
+        case 0: return homeNav
+        case 1: return categoryNav
+        case 2: return searchNav
+        case 3: return libraryNav
+        default: return nil
+        }
+    }
+
+    private var selectedNavDepth: Int { selectedNav?.path.count ?? 0 }
+
+    private func rootMenuFallback() {
+        guard let nav = selectedNav, !nav.path.isEmpty else { return }
+        let engine = TVFocusProbe.engineFocus()
+        DiagLog.log("menu", "back-to-root surface=root-fallback tab=\(selection) depth=\(nav.path.count) engine=\(engine.label) item=\(engine.description)")
+        nav.popToRoot()
     }
 }
 

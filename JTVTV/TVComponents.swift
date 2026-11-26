@@ -109,7 +109,11 @@ struct TVRemoteImage: View {
             if bucket == 1920 {
                 DiagLog.log("detail", "backdrop.load.begin host=\(URL(string: urlString)?.host ?? "?")")
             }
-            let loaded = await ImageCacheManager.shared.loadImage(urlString: urlString, headers: headers, bucket: bucket)
+            // 1.3.19 (L-T50): a retry tap (retryToken > 0) is
+            // an explicit user retry — it bypasses the manager's
+            // permanent-failure memo.
+            let loaded = await ImageCacheManager.shared.loadImage(urlString: urlString, headers: headers, bucket: bucket,
+                                                                  force: retryToken > 0)
             if bucket == 1920 {
                 DiagLog.log("detail", "backdrop.load.end host=\(URL(string: urlString)?.host ?? "?") ok=\(loaded != nil)")
             }
@@ -118,15 +122,37 @@ struct TVRemoteImage: View {
             // explicit form of the same guarantee.
             guard key == taskKey else { return }
             if let loaded {
-                loadedImage = loaded
-                loadedKey = key
-                if failedKey == key { failedKey = nil }
-                failed?.wrappedValue = false
-            } else {
-                failedKey = key
-                failed?.wrappedValue = true
+                apply(loaded, key: key)
+                return
+            }
+            failedKey = key
+            failed?.wrappedValue = true
+            // 1.3.19 (L-T50): when the failure came from a host
+            // the breaker is holding, the cell schedules its own
+            // retry for when the cooldown ends (bounded: four
+            // rounds, then it waits for the user / a rebuild),
+            // so posters of a host that comes back fill in by
+            // themselves instead of staying blank until the view
+            // is recreated. The sleep dies with the view (.task
+            // cancellation), so off-screen cells cost nothing.
+            for _ in 0..<4 {
+                guard let delay = ImageCacheManager.shared.retryDelay(urlString: urlString) else { return }
+                try? await Task.sleep(for: .milliseconds(Int(delay * 1000) + Int.random(in: 0...750)))
+                if Task.isCancelled || key != taskKey { return }
+                if let again = await ImageCacheManager.shared.loadImage(urlString: urlString, headers: headers, bucket: bucket) {
+                    guard key == taskKey else { return }
+                    apply(again, key: key)
+                    return
+                }
             }
         }
+    }
+
+    private func apply(_ image: UIImage, key: String) {
+        loadedImage = image
+        loadedKey = key
+        if failedKey == key { failedKey = nil }
+        failed?.wrappedValue = false
     }
 }
 
@@ -530,6 +556,16 @@ struct TVChip: View {
     /// need to know when a chip takes or leaves focus.
     /// Default nil: every existing call site is unchanged.
     var onFocusChange: ((Bool) -> Void)? = nil
+    /// 1.3.19 (L-T48): an optional VALUE-form focus identity —
+    /// the chip is focused exactly when `valueFocus` holds
+    /// `focusID`. Home gives every chip on its rail the SAME
+    /// String? FocusState with the chip's own plugin id, so a
+    /// chip's focus identity never changes when the active
+    /// plugin does (the 1.3.15 shape moved ONE Bool binding from
+    /// chip to chip, and each move bounced focus). When handed
+    /// in it replaces both other bindings.
+    var valueFocus: FocusState<String?>.Binding? = nil
+    var focusID: String? = nil
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var isFocused: Bool
@@ -539,6 +575,8 @@ struct TVChip: View {
          badge18: Bool = false,
          selected: Bool,
          entryFocus: FocusState<Bool>.Binding? = nil,
+         valueFocus: FocusState<String?>.Binding? = nil,
+         focusID: String? = nil,
          onFocusChange: ((Bool) -> Void)? = nil,
          onSelect: @escaping () -> Void) {
         self.title = title
@@ -546,15 +584,33 @@ struct TVChip: View {
         self.badge18 = badge18
         self.selected = selected
         self.entryFocus = entryFocus
+        self.valueFocus = valueFocus
+        self.focusID = focusID
         self.onFocusChange = onFocusChange
         self.onSelect = onSelect
     }
 
     private var focusActive: Bool {
-        isFocused || (entryFocus?.wrappedValue ?? false)
+        if let valueFocus, let focusID {
+            return valueFocus.wrappedValue == focusID
+        }
+        return isFocused || (entryFocus?.wrappedValue ?? false)
     }
 
+    @ViewBuilder
     var body: some View {
+        if let valueFocus, let focusID {
+            button
+                .focused(valueFocus, equals: focusID)
+                .onChange(of: focusActive) { _, focused in onFocusChange?(focused) }
+        } else {
+            button
+                .focused(entryFocus ?? $isFocused)
+                .onChange(of: focusActive) { _, focused in onFocusChange?(focused) }
+        }
+    }
+
+    private var button: some View {
         Button {
             onSelect()
         } label: {
@@ -583,8 +639,6 @@ struct TVChip: View {
             .contentShape(Capsule())
         }
         .tvCardButton()
-        .focused(entryFocus ?? $isFocused)
-        .onChange(of: focusActive) { _, focused in onFocusChange?(focused) }
     }
 }
 
@@ -885,5 +939,76 @@ struct TVErrorState: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(60)
         .defaultFocus($retryFocused, retryIsDefaultFocus)
+    }
+}
+
+// MARK: - Engine focus probe (shared, 1.3.19)
+
+/// Where the ENGINE says focus is — read from
+/// `UIFocusSystem.focusedItem`, the UIKit-level witness SwiftUI's
+/// FocusState hooks cannot be. Moved here from Home's private
+/// tracker (L-T43, 1.3.17) so the Browse screen's landing check
+/// can ask the same question. The classes: `focusedItem == nil`
+/// → .nowhere (a genuine void); an item with a UITabBar ancestor
+/// → .onTabBar (focus belongs to the shell); anything else →
+/// .inWindow. The description is the moveFail line's format:
+/// item class, a `tabbar:` marker, the folded accessibility
+/// label (ids/labels only — the DiagLog discipline) — or "nil".
+enum TVFocusProbe {
+    enum Place {
+        case nowhere
+        case onTabBar
+        case inWindow
+    }
+
+    struct Reading {
+        let state: Place
+        let description: String
+        var label: String {
+            switch state {
+            case .nowhere: return "nowhere"
+            case .onTabBar: return "tabbar"
+            case .inWindow: return "window"
+            }
+        }
+    }
+
+    @MainActor
+    static func engineFocus() -> Reading {
+        guard let window = activeKeyWindow(),
+              let item = UIFocusSystem(for: window)?.focusedItem
+        else { return Reading(state: .nowhere, description: "nil") }
+        var desc = String(describing: type(of: item))
+        var onTabBar = false
+        if let view = item as? UIView {
+            var ancestor: UIView? = view
+            while let a = ancestor {
+                if a is UITabBar {
+                    onTabBar = true
+                    break
+                }
+                ancestor = a.superview
+            }
+            if onTabBar { desc = "tabbar:" + desc }
+            if let label = view.accessibilityLabel, !label.isEmpty {
+                let folded = label.replacingOccurrences(of: " ", with: "_")
+                desc += " label=\(String(folded.prefix(40)))"
+            }
+        }
+        return Reading(state: onTabBar ? .onTabBar : .inWindow, description: desc)
+    }
+
+    @MainActor
+    private static func activeKeyWindow() -> UIWindow? {
+        for scene in UIApplication.shared.connectedScenes {
+            guard let windowScene = scene as? UIWindowScene,
+                  windowScene.activationState == .foregroundActive
+            else { continue }
+            if let key = windowScene.windows.first(where: { $0.isKeyWindow }) {
+                return key
+            }
+            return windowScene.windows.first
+        }
+        return nil
     }
 }
