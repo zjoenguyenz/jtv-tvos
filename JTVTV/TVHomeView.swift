@@ -97,7 +97,7 @@ final class TVHomeStore {
             sectionPages = [:]
             sectionTotalPages = [:]
             sectionFinished = []
-            sectionsLoadingMore = []
+            sectionsLoadingMore = [:]
             loadedPluginId = nil
             loadedAt = nil
             heroMovie = nil
@@ -153,7 +153,7 @@ final class TVHomeStore {
             sectionPages = [:]
             sectionTotalPages = [:]
             sectionFinished = []
-            sectionsLoadingMore = []
+            sectionsLoadingMore = [:]
         }
         isLoading = true
         let secs = await service.homeSections(pluginId: pid)
