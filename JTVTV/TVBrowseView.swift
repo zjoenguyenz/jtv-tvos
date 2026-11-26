@@ -211,6 +211,12 @@ struct TVPosterGrid: View {
     /// focus should be its first card can declare it (the
     /// Browse screen does; other grid users pass nothing).
     var firstCellEntryFocus: FocusState<Bool>.Binding? = nil
+    /// L-T41 (1.3.15): an optional per-cell focus-change
+    /// passthrough — Home's focus diagnostics need to know
+    /// when one of its grid-band cells takes or leaves
+    /// focus. Default nil: every existing grid user is
+    /// unchanged.
+    var onCellFocusChange: ((Movie, Bool) -> Void)? = nil
 
     @EnvironmentObject private var favorites: FavoritesManager
     @Environment(TVNavPath.self) private var nav
@@ -244,6 +250,9 @@ struct TVPosterGrid: View {
                         },
                         onLongPress: {
                             favorites.toggle(pluginId: pluginId, movie: movie)
+                        },
+                        onFocusChange: { focused in
+                            onCellFocusChange?(movie, focused)
                         },
                         entryFocus: movie.id == items.first?.id ? firstCellEntryFocus : nil
                     )

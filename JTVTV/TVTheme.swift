@@ -422,13 +422,22 @@ extension View {
 struct TVSectionHeader: View {
     let title: String
     var action: (() -> Void)?
+    /// L-T41 (1.3.15): an optional focus-change hook, the
+    /// poster card's contract — Home's focus diagnostics
+    /// need to know when a section header takes or leaves
+    /// focus. Only the Button form can ever report (the
+    /// plain label is not focusable). Default nil: every
+    /// existing call site is unchanged.
+    var onFocusChange: ((Bool) -> Void)?
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var isFocused: Bool
 
-    init(title: String, action: (() -> Void)? = nil) {
+    init(title: String, action: (() -> Void)? = nil,
+         onFocusChange: ((Bool) -> Void)? = nil) {
         self.title = title
         self.action = action
+        self.onFocusChange = onFocusChange
     }
 
     var body: some View {
@@ -436,6 +445,7 @@ struct TVSectionHeader: View {
             Button(action: action) { label }
                 .tvCardButton()
                 .focused($isFocused)
+                .onChange(of: isFocused) { _, focused in onFocusChange?(focused) }
         } else {
             label
         }

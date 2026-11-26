@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// JTV tvOS Phase 2 — Home: the pinned plugin chip rail, the
 /// hero, Continue Watching, and one band per plugin section —
@@ -58,7 +59,17 @@ final class TVHomeStore {
         return out
     }
 
-    func load(plugins: PluginManager, service: MovieService, force: Bool = false) async {
+    /// Returns whether this call SETTLED as the latest
+    /// generation — its outcome (a publish, a snapshot
+    /// restore, a freshness no-op, the no-plugin clear) is
+    /// the surface's current state. A superseded call
+    /// (a newer load started while this one was in flight)
+    /// returns false at its generation guards and publishes
+    /// nothing. The view's hand-off arm lifetime hangs off
+    /// this (gate R2 Lens 1 N1/N2): only a settled load may
+    /// close the arm.
+    @discardableResult
+    func load(plugins: PluginManager, service: MovieService, force: Bool = false) async -> Bool {
         generation &+= 1
         let gen = generation
         guard let pid = plugins.activePlugin?.id else {
@@ -69,12 +80,17 @@ final class TVHomeStore {
             loadedAt = nil
             heroMovie = nil
             isLoading = false
-            return
+            // L-T41 §5.3 (1.3.15, gate R1 Lens 3): this
+            // exit publishes an empty state too — it gets
+            // its own label so a swap into the no-plugin
+            // state is visible beside the two named paths.
+            DiagLog.log("home", "publish path=clear plugin=none sections=0 items=0 hero=nil")
+            return true
         }
         if !force, !isLoading, loadedPluginId == pid, let loadedAt,
            Date().timeIntervalSince(loadedAt) < Self.freshnessWindow {
             isLoading = false
-            return
+            return true
         }
         // A-14: a fresh snapshot of the TARGET plugin
         // restores instantly — no section refetch.
@@ -88,7 +104,11 @@ final class TVHomeStore {
             loadedAt = snapshot.loadedAt
             didLoad = true
             isLoading = false
-            return
+            // L-T41 §5.3 (1.3.15): the publish line — which
+            // swap just landed on Home, in which shape. The
+            // focus lines beside it say where focus went.
+            DiagLog.log("home", "publish path=snapshot plugin=\(pid) sections=\(sections.count) items=\(items.values.reduce(0) { $0 + $1.count }) hero=\(heroMovie?.id ?? "nil")")
+            return true
         }
         if loadedPluginId != pid {
             // A-14: stash the outgoing plugin's published
@@ -106,7 +126,7 @@ final class TVHomeStore {
         }
         isLoading = true
         let secs = await service.homeSections(pluginId: pid)
-        guard gen == generation else { return }
+        guard gen == generation else { return false }
         sections = secs
         loadedPluginId = pid
         if secs.isEmpty {
@@ -117,7 +137,11 @@ final class TVHomeStore {
             snapshots[pid] = PluginSnapshot(
                 sections: secs, items: items, sectionErrors: sectionErrors,
                 heroMovie: nil, loadedAt: Date())
-            return
+            // L-T41 §5.3 (1.3.15): publish line, fresh path
+            // (the empty-sections landing) — computed from
+            // the published state, like the other two.
+            DiagLog.log("home", "publish path=fresh plugin=\(pid) sections=\(sections.count) items=\(items.values.reduce(0) { $0 + $1.count }) hero=\(heroMovie?.id ?? "nil")")
+            return true
         }
         // Per-section page-1 fetches in parallel; each row
         // publishes as its own fetch lands (the iOS shape).
@@ -171,7 +195,11 @@ final class TVHomeStore {
             snapshots[pid] = PluginSnapshot(
                 sections: sections, items: items, sectionErrors: sectionErrors,
                 heroMovie: hero, loadedAt: Date())
+            // L-T41 §5.3 (1.3.15): publish line, fresh path.
+            DiagLog.log("home", "publish path=fresh plugin=\(pid) sections=\(sections.count) items=\(items.values.reduce(0) { $0 + $1.count }) hero=\(heroMovie?.id ?? "nil")")
+            return true
         }
+        return false
     }
 }
 
@@ -188,15 +216,58 @@ struct TVHomeView: View {
     @Environment(\.tvTheme) private var theme
 
     @Namespace private var focusNS
+    /// L-T41 (1.3.15): the content region's OWN landing
+    /// focus, inside the swapped region at last — the hero
+    /// carries it through its A-6/A-7 entryFocus, the way
+    /// Browse's first card carries that screen's. While no
+    /// hero exists (loading / empty / error), the landing
+    /// falls back to the active chip, which carries the
+    /// fallback binding through its own entryFocus so
+    /// `.defaultFocus` has a real view to land on.
+    @FocusState private var heroFocused: Bool
+    @FocusState private var chipFocused: Bool
+    /// L-T41 (1.3.15, gate R1 Lens 1): where focus
+    /// physically sits, as the hooks report it — true while
+    /// any chip on the rail holds focus, false once a
+    /// content element (hero / header / card) gains it.
+    /// THIS is the hand-off's guard, not chipFocused: the
+    /// binding migrates between chips as the active plugin
+    /// changes (a rebind produces no focus event and is not
+    /// guaranteed to rewrite the newly attached binding),
+    /// while the hooks fire on real focus gains — including
+    /// the gain of the chip the user just selected, whose
+    /// focus at that moment still lives in its own internal
+    /// state. Browse's A-6 rule, with the guard read from
+    /// observed focus instead of a binding.
+    @State private var focusOnRail = false
+    /// L-T41 (1.3.15, gate R1 Lens 1): the hand-off is
+    /// armed only by a landing the app itself designed —
+    /// the launch load (initial value) and user-initiated
+    /// plugin switches. A silent sync reload that lands a
+    /// new hero while the user browses the rail must not
+    /// steal focus to it. One-shot: the hero-id trigger and
+    /// the post-load check both disarm after firing.
+    @State private var heroSwapArmed = true
+    /// L-T41 §5.3 (1.3.15): the focus diagnostics owner —
+    /// the move-fail observer and the last focus owner the
+    /// hooks reported.
+    @State private var focusTracker = TVHomeFocusTracker()
 
     var body: some View {
         VStack(spacing: 0) {
             if plugins.visiblePlugins.isEmpty {
+                // L-T41 (1.3.15, gate R1 Lens 1): with no
+                // visible plugins the chip rail and content
+                // leave the tree, taking the only other
+                // landing declarations with them — this
+                // state's button carries the surface's
+                // declared landing itself.
                 TVEmptyState(icon: "puzzlepiece.extension",
                              title: "Chưa có nguồn plugin",
-                             actionTitle: "Đồng bộ ngay") {
-                    Task { await plugins.syncAll() }
-                }
+                             actionTitle: "Đồng bộ ngay",
+                             action: { Task { await plugins.syncAll() } },
+                             actionIsDefaultFocus: true,
+                             onFocusChange: focusHook("empty action=sync"))
             } else {
                 chipRail
                 content
@@ -204,20 +275,56 @@ struct TVHomeView: View {
         }
         .tvThemedBackground()
         .focusScope(focusNS)
-        .onAppear { session.touch() }
+        .onAppear {
+            session.touch()
+            focusTracker.install()
+            logLanding()
+        }
+        .onDisappear { focusTracker.uninstall() }
         .task {
             if plugins.installed.isEmpty {
                 await plugins.syncAll()
             } else {
                 Task { await plugins.syncAll(silent: true) }
             }
-            await store.load(plugins: plugins, service: service)
+            if await store.load(plugins: plugins, service: service) {
+                settleHeroHandOff()
+            }
         }
         .onChange(of: plugins.activePluginId) { _, _ in
-            Task { await store.load(plugins: plugins, service: service) }
+            // L-T41 (1.3.15, gate R1 Lens 1): a user switch
+            // arms the hero hand-off, and the check runs
+            // again when the load SETTLES — the hero-id
+            // trigger alone misses a switch whose new hero
+            // carries the same movie id as the old one.
+            // Gate R2 Lens 1 N1/N2: the settle runs only if
+            // this load actually settled as the latest
+            // generation; a superseded load leaves the arm
+            // for the winning load, and a settled load
+            // always closes it (see settleHeroHandOff).
+            heroSwapArmed = true
+            Task {
+                if await store.load(plugins: plugins, service: service) {
+                    settleHeroHandOff()
+                }
+            }
+            logLanding()
+        }
+        .onChange(of: store.heroMovie?.id) { _, _ in
+            logLanding()
         }
         .onChange(of: plugins.syncGeneration) { _, _ in
-            Task { await store.load(plugins: plugins, service: service) }
+            // A sync load never ARMS the hand-off (gate R1
+            // Lens 1 F5); if one settles while an arm is
+            // live, it is the freshest load, so it closes
+            // the arm like any other settle (gate R2 Lens 1
+            // N1/N2) — including delivering the landing when
+            // it is the load that won a switch race.
+            Task {
+                if await store.load(plugins: plugins, service: service) {
+                    settleHeroHandOff()
+                }
+            }
         }
     }
 
@@ -230,7 +337,17 @@ struct TVHomeView: View {
                     TVChip(title: plugin.manifest.name,
                            iconURL: plugin.manifest.iconUrl,
                            badge18: plugins.isAdult(plugin.id),
-                           selected: plugin.id == plugins.activePluginId) {
+                           selected: plugin.id == plugins.activePluginId,
+                           // L-T41 (1.3.15): the ACTIVE chip
+                           // also carries the shared fallback
+                           // binding, so the content region's
+                           // .defaultFocus has a real view to
+                           // land on while no hero exists. Its
+                           // prefersDefaultFocus claim below is
+                           // unchanged — it remains the landing
+                           // whenever the content has no hero.
+                           entryFocus: plugin.id == plugins.activePluginId ? $chipFocused : nil,
+                           onFocusChange: focusHook("chip plugin=\(plugin.id)", rail: true)) {
                         plugins.activePluginId = plugin.id
                     }
                     .prefersDefaultFocus(plugin.id == plugins.activePluginId, in: focusNS)
@@ -244,10 +361,27 @@ struct TVHomeView: View {
 
     private var content: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 44) {
+            // L-T41 §5.2 (1.3.15): a plain VStack, not a
+            // LazyVStack — the band count is small (one hero
+            // + at most ~14 bands) and the real laziness
+            // lives INSIDE the rails (LazyHStack) and grids
+            // (LazyVGrid), which are untouched. A lazy stack
+            // only realizes a band when it is about to render,
+            // and on tvOS scrolling is a side effect of focus
+            // movement: an unrealized band is a focus target
+            // that does not exist yet, so the move down fails,
+            // nothing scrolls, and the band never realizes —
+            // the self-sustaining freeze of L-T41. Realizing
+            // every band at publish removes the trap.
+            VStack(alignment: .leading, spacing: 44) {
                 if let hero = store.heroMovie, let pid = plugins.activePlugin?.id {
+                    // L-T41 §5.1 (1.3.15): the hero is no
+                    // longer a single-leaf focus section of
+                    // its own — the content ScrollView's
+                    // section (below) frames the whole scroll
+                    // region, and the hero's landing is the
+                    // declared defaultFocus + hand-off pair.
                     heroBand(hero: hero, pluginId: pid)
-                        .focusSection()
                 }
                 if !history.continueWatching.isEmpty {
                     continueWatchingBand
@@ -267,18 +401,26 @@ struct TVHomeView: View {
                 }
                 ForEach(store.sections) { section in
                     if let error = store.sectionErrors[section.id], (store.items[section.id] ?? []).isEmpty {
+                        // L-T41 (1.3.15, gate R1 Lens 1):
+                        // the all-error band holds ONE
+                        // focusable (the retry button) — no
+                        // section wrapper of its own; the
+                        // content ScrollView's section frames
+                        // it, like every other band.
                         sectionBand(section)
-                            .focusSection()
                     } else if !(store.items[section.id] ?? []).isEmpty {
                         sectionBand(section)
                             .focusSection()
                     }
                 }
                 if store.didLoad && store.sections.isEmpty && !store.isLoading {
-                    TVEmptyState(icon: "film.stack", title: "Chưa có nội dung", actionTitle: "Tải lại") {
-                        Task { await store.load(plugins: plugins, service: service, force: true) }
-                    }
-                    .focusSection()
+                    // One focusable (the reload button) —
+                    // no section wrapper, same rule as the
+                    // all-error band above.
+                    TVEmptyState(icon: "film.stack", title: "Chưa có nội dung",
+                                 actionTitle: "Tải lại",
+                                 action: { Task { if await store.load(plugins: plugins, service: service, force: true) { settleHeroHandOff() } } },
+                                 onFocusChange: focusHook("empty action=reload"))
                 }
                 if store.isLoading && store.sections.isEmpty {
                     ProgressView()
@@ -289,12 +431,129 @@ struct TVHomeView: View {
             .padding(.horizontal, 80)
             .padding(.bottom, 48)
         }
+        // L-T41 §5.2 (1.3.15): the scroll region itself is a
+        // focus section, so the engine has a section frame
+        // spanning the whole content for the step from the
+        // pinned chip rail into and through the bands,
+        // instead of depending on each band's own section
+        // and realization state.
+        .focusSection()
+        // L-T41 §5.1 (1.3.15): the content region's declared
+        // landing, the Browse A-6 shape — the hero whenever
+        // one exists, the active chip while it does not
+        // (loading / empty / error states included, so the
+        // landing exists for EVERY Home state).
+        .defaultFocus(store.heroMovie != nil ? $heroFocused : $chipFocused, true)
+        // L-T41 §5.1 (1.3.15): the hand-off, Browse's A-6
+        // gate fix in shape — a defaultFocus declaration
+        // does not move focus that was ALREADY assigned, so
+        // when a hero lands (fresh publish or snapshot
+        // restore) while focus still sits on the chip rail,
+        // hand it to the hero explicitly. Two gate-R1
+        // hardenings over the naive shape: the guard reads
+        // OBSERVED focus (focusOnRail, fed by the hooks),
+        // not the chip's binding — the binding migrates
+        // between chips on every switch and a rebind is not
+        // guaranteed to rewrite it; and the trigger only
+        // fires while a designed landing is armed (launch
+        // or a user switch), so a silent sync reload can
+        // never steal focus to a new hero. The post-load
+        // check in the activePluginId handler covers the
+        // same-hero-id switch this trigger cannot see.
+        .onChange(of: store.heroMovie?.id) { _, _ in
+            if heroSwapArmed {
+                handOffToHeroIfOnRail()
+            }
+        }
+    }
+
+    // MARK: - Focus diagnostics (L-T41 §5.3)
+
+    /// One hook body for every focusable Home element:
+    /// a gain/lost line per transition (user-gesture pace,
+    /// never per-frame) plus the tracker's current-owner
+    /// note that the moveFail and landing lines read. Only
+    /// element kinds and ids are logged — the same
+    /// secrets-free discipline as every other DiagLog line.
+    /// A gain also records whether focus sits on the chip
+    /// rail (`rail`) — the hand-off's guard state.
+    private func focusHook(_ element: String, rail: Bool = false) -> (Bool) -> Void {
+        { focused in
+            if focused {
+                focusOnRail = rail
+                focusTracker.note(element)
+                DiagLog.log("focus", "home gain element=\(element)")
+            } else {
+                focusTracker.clear(if: element)
+                DiagLog.log("focus", "home lost element=\(element)")
+            }
+        }
+    }
+
+    /// The hero hand-off (see the trigger on `content`):
+    /// if a designed landing is armed and focus observably
+    /// sits on the chip rail, give it to the hero. Firing
+    /// disarms, so a later publish in the same swap cannot
+    /// move focus twice — but the arm is spent ONLY by a
+    /// decision, never by a non-event (gate R2 Lens 1):
+    /// focus observed off the rail closes it (the user has
+    /// moved on; this landing is not ours to deliver),
+    /// while a hero publish that has not landed yet leaves
+    /// it armed — a superseding load is still in flight
+    /// and its publish will fire the hero-id trigger (N1).
+    /// The arm's outer bound is the settle below (N2).
+    private func handOffToHeroIfOnRail() {
+        guard heroSwapArmed else { return }
+        guard focusOnRail else {
+            heroSwapArmed = false
+            return
+        }
+        guard store.heroMovie != nil else { return }
+        heroSwapArmed = false
+        heroFocused = true
+    }
+
+    /// A load that settled as the latest generation closes
+    /// the hand-off arm: try the hand-off (this is the
+    /// same-hero-id rescue — the settled load may have
+    /// republished the hero the trigger cannot see), then
+    /// disarm regardless. The arm therefore never outlives
+    /// the load it was armed for: a launch or switch whose
+    /// load settles hero-less lands on the chip by design,
+    /// and no later background publish can spend a stale
+    /// arm to yank focus (gate R2 Lens 1 N2). A SUPERSEDED
+    /// load never reaches here — its caller saw `false`
+    /// and skipped the settle, leaving the arm for the
+    /// winning load's publish (N1).
+    private func settleHeroHandOff() {
+        handOffToHeroIfOnRail()
+        heroSwapArmed = false
+    }
+
+    /// The landing audit line: which element SHOULD hold
+    /// focus after an (re)entry or a content swap vs the
+    /// owner the hooks actually reported. Both sides are
+    /// read at sample time, 300 ms after the trigger, so
+    /// the publish and the hand-off have settled (gate R1
+    /// Lens 3: a target captured at trigger time can be
+    /// stale for the swap it audits). Together with the
+    /// gain lines it separates "landed in the wrong place"
+    /// from "landed right, cannot move".
+    private func logLanding() {
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(300))
+            let target = store.heroMovie != nil ? "hero" : "chip"
+            DiagLog.log("focus", "landing scope=home target=\(target) actual=\(focusTracker.current)")
+        }
     }
 
     private func heroBand(hero: Movie, pluginId: String) -> some View {
-        TVHeroCard(movie: hero) {
-            nav.push(.movie(MovieRoute(pluginId: pluginId, movie: hero, autoResume: false)))
-        }
+        TVHeroCard(movie: hero,
+                   onSelect: {
+                       nav.push(.movie(MovieRoute(pluginId: pluginId, movie: hero, autoResume: false)))
+                   },
+                   onFocusChange: focusHook("hero movie=\(hero.id)"),
+                   entryFocus: $heroFocused)
     }
 
     private var continueWatchingBand: some View {
@@ -316,7 +575,8 @@ struct TVHomeView: View {
                                         },
                                         onLongPress: {
                                             history.remove(record)
-                                        })
+                                        },
+                                        onFocusChange: focusHook("card movie=\(record.movie.id)"))
                     }
                 }
                 .padding(.horizontal, 4)
@@ -330,20 +590,31 @@ struct TVHomeView: View {
         if let error = store.sectionErrors[section.id], movies.isEmpty {
             VStack(alignment: .leading, spacing: 14) {
                 TVSectionHeader(title: section.title)
-                TVSectionErrorRow(message: error) {
-                    Task { await store.load(plugins: plugins, service: service, force: true) }
-                }
+                TVSectionErrorRow(message: error,
+                                  onRetry: {
+                                      Task {
+                                          if await store.load(plugins: plugins, service: service, force: true) {
+                                              settleHeroHandOff()
+                                          }
+                                      }
+                                  },
+                                  onFocusChange: focusHook("retry section=\(section.slug)"))
             }
         } else if !movies.isEmpty, let pid = plugins.activePlugin?.id {
             VStack(alignment: .leading, spacing: 18) {
-                TVSectionHeader(title: section.title) {
-                    nav.push(.category(CategoryRoute(pluginId: pid, slug: section.slug,
-                                                     title: section.title, filters: ListFilters())))
-                }
+                TVSectionHeader(title: section.title,
+                                action: {
+                                    nav.push(.category(CategoryRoute(pluginId: pid, slug: section.slug,
+                                                                     title: section.title, filters: ListFilters())))
+                                },
+                                onFocusChange: focusHook("header section=\(section.slug)"))
                 if section.isGrid {
                     TVPosterGrid(items: Array(movies.prefix(9)), pluginId: pid,
                                  isLoadingMore: false, onSelect: nil,
-                                 onLoadMore: {})
+                                 onLoadMore: {},
+                                 onCellFocusChange: { movie, focused in
+                                     focusHook("card movie=\(movie.id)")(focused)
+                                 })
                 } else {
                     ScrollView(.horizontal, showsIndicators: false) {
                         LazyHStack(spacing: 24) {
@@ -355,7 +626,8 @@ struct TVHomeView: View {
                                              },
                                              onLongPress: {
                                                  favorites.toggle(pluginId: pid, movie: movie)
-                                             })
+                                             },
+                                             onFocusChange: focusHook("card movie=\(movie.id)"))
                             }
                         }
                         .padding(.horizontal, 4)
@@ -373,6 +645,12 @@ struct TVHomeView: View {
 private struct TVSectionErrorRow: View {
     let message: String
     let onRetry: () -> Void
+    /// L-T41 (1.3.15, gate R1 Lens 3): an optional
+    /// focus-change hook, the poster card's contract —
+    /// Home's focus diagnostics need to know when the
+    /// retry button takes or leaves focus. Default nil:
+    /// the row behaves exactly as before.
+    var onFocusChange: ((Bool) -> Void)? = nil
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var retryFocused: Bool
@@ -397,6 +675,7 @@ private struct TVSectionErrorRow: View {
             }
             .tvCardButton()
             .focused($retryFocused)
+            .onChange(of: retryFocused) { _, focused in onFocusChange?(focused) }
         }
     }
 }
@@ -409,6 +688,17 @@ private struct TVSectionErrorRow: View {
 private struct TVHeroCard: View {
     let movie: Movie
     let onSelect: () -> Void
+    /// L-T41 (1.3.15): the A-6/A-7 opt-ins, the poster
+    /// card's exact contract — Home's landing hand-off
+    /// drives the hero through `entryFocus`, and its focus
+    /// diagnostics read `onFocusChange`. Before 1.3.15 the
+    /// hero was mute: a private @FocusState nobody outside
+    /// could drive or observe, so after every content swap
+    /// the engine's fallback decided where focus went.
+    /// Both default to the pre-1.3.15 behaviour (own
+    /// binding, no hook).
+    var onFocusChange: ((Bool) -> Void)? = nil
+    var entryFocus: FocusState<Bool>.Binding? = nil
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var isFocused: Bool
@@ -420,6 +710,10 @@ private struct TVHeroCard: View {
     @State private var retriedSinceFailure = false
 
     private let radius: CGFloat = 22
+
+    private var focusActive: Bool {
+        entryFocus?.wrappedValue ?? isFocused
+    }
 
     var body: some View {
         Button {
@@ -489,20 +783,121 @@ private struct TVHeroCard: View {
             .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
-                    .fill(Color.white.opacity(isFocused ? 0.08 : 0))
+                    .fill(Color.white.opacity(focusActive ? 0.08 : 0))
             }
             .overlay {
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
-                    .strokeBorder(isFocused ? theme.focusRing : .clear,
-                                  lineWidth: isFocused ? theme.ringWidth : 0)
+                    .strokeBorder(focusActive ? theme.focusRing : .clear,
+                                  lineWidth: focusActive ? theme.ringWidth : 0)
             }
             .contentShape(Rectangle())
         }
         .tvCardButton()
-        .focused($isFocused)
+        .focused(entryFocus ?? $isFocused)
         .onChange(of: movie.id) { imageFailed = false; retryToken = 0; retriedSinceFailure = false }
         .onChange(of: imageFailed) { _, failed in
             if !failed { retriedSinceFailure = false }
+        }
+        .onChange(of: focusActive) { _, focused in onFocusChange?(focused) }
+    }
+}
+
+// MARK: - Focus tracker (L-T41 §5.3)
+
+/// Owns Home's passive focus-movement-failure observer
+/// and the last focus owner the view's hooks reported.
+///
+/// The observer is PASSIVE: it only listens for
+/// `UIFocusSystem.movementDidFailNotification` — the
+/// engine's own broadcast when a remote press finds no
+/// candidate in that direction — and writes one DiagLog
+/// line pairing the failure with the element the hooks
+/// say held focus. That pairing is the decisive evidence
+/// for this fault family: a moveFail line with
+/// `focused=hero …` convicts the candidate search; a press
+/// that produces neither a gain nor a moveFail line points
+/// at the input path instead. The tree forbids
+/// `.onMoveCommand` for this (an active handler can itself
+/// change focus behaviour); nothing here ever requests a
+/// focus update.
+///
+/// Concurrency shape (the FL-495 discipline): all state
+/// is instance state of this one object, and EVERY access
+/// to it goes through `lock` — the hooks call in from
+/// SwiftUI callbacks, the observer block from the main
+/// queue — which is what the `@unchecked Sendable`
+/// conformance states. The codebase's own shape for
+/// lock-guarded shared state (DiagLog, SourceReputation).
+/// No static or global mutable state is introduced.
+private final class TVHomeFocusTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    /// The element descriptor the hooks last reported as
+    /// focused ("hero movie=…", "chip plugin=…", …), or
+    /// "none" before the first gain / after its loss.
+    /// Read and written only under `lock`.
+    private var _current = "none"
+    private var token: NSObjectProtocol?
+
+    var current: String {
+        lock.withLock { _current }
+    }
+
+    func note(_ element: String) {
+        lock.withLock { _current = element }
+    }
+
+    func clear(if element: String) {
+        lock.withLock {
+            if _current == element { _current = "none" }
+        }
+    }
+
+    func install() {
+        let shouldRegister = lock.withLock {
+            guard token == nil else { return false }
+            return true
+        }
+        guard shouldRegister else { return }
+        let newToken = NotificationCenter.default.addObserver(
+            forName: UIFocusSystem.movementDidFailNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self else { return }
+            DiagLog.log("focus", "moveFail dir=\(Self.direction(of: notification)) focused=\(self.current)")
+        }
+        lock.withLock { token = newToken }
+    }
+
+    /// The failed press's direction, best-effort: the
+    /// focus update context rides the notification's
+    /// userInfo under the UIFocusUpdateContext key (the
+    /// payload WWDC17 documents for the sibling
+    /// UIFocusDidUpdate notification) and its
+    /// `focusHeading` names the direction. If the payload
+    /// is absent or carries no cardinal heading, the line
+    /// says `unknown` rather than guessing — the decisive
+    /// half of the line is `focused=`, which never depends
+    /// on this.
+    private static func direction(of notification: Notification) -> String {
+        guard let context = notification.userInfo?["UIFocusUpdateContext"] as? UIFocusUpdateContext
+        else { return "unknown" }
+        let heading = context.focusHeading
+        if heading.contains(.up) { return "up" }
+        if heading.contains(.down) { return "down" }
+        if heading.contains(.left) { return "left" }
+        if heading.contains(.right) { return "right" }
+        return "unknown"
+    }
+
+    func uninstall() {
+        let old: NSObjectProtocol? = lock.withLock {
+            let old = token
+            token = nil
+            return old
+        }
+        if let old {
+            NotificationCenter.default.removeObserver(old)
         }
     }
 }

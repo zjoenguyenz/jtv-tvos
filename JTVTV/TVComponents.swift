@@ -390,6 +390,12 @@ struct TVLandscapeCard: View {
     var width: CGFloat = 400
     let onSelect: () -> Void
     let onLongPress: () -> Void
+    /// L-T41 (1.3.15): an optional focus-change hook, the
+    /// poster card's contract — Home's focus diagnostics
+    /// need to know when a Continue Watching card takes or
+    /// leaves focus. Default nil: every existing call site
+    /// is unchanged.
+    var onFocusChange: ((Bool) -> Void)? = nil
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var isFocused: Bool
@@ -397,11 +403,13 @@ struct TVLandscapeCard: View {
     init(record: HistoryRecord,
          width: CGFloat = 400,
          onSelect: @escaping () -> Void,
-         onLongPress: @escaping () -> Void) {
+         onLongPress: @escaping () -> Void,
+         onFocusChange: ((Bool) -> Void)? = nil) {
         self.record = record
         self.width = width
         self.onSelect = onSelect
         self.onLongPress = onLongPress
+        self.onFocusChange = onFocusChange
     }
 
     private var artHeight: CGFloat { width * 9 / 16 }
@@ -433,6 +441,7 @@ struct TVLandscapeCard: View {
         }
         .tvCardButton()
         .focused($isFocused)
+        .onChange(of: isFocused) { _, focused in onFocusChange?(focused) }
         .onLongPressGesture(minimumDuration: 0.5) {
             onLongPress()
         }
@@ -516,6 +525,11 @@ struct TVChip: View {
     /// states, so the chip that carries a screen's entry
     /// focus still draws its ring.
     var entryFocus: FocusState<Bool>.Binding? = nil
+    /// L-T41 (1.3.15): an optional focus-change hook, the
+    /// poster card's contract — Home's focus diagnostics
+    /// need to know when a chip takes or leaves focus.
+    /// Default nil: every existing call site is unchanged.
+    var onFocusChange: ((Bool) -> Void)? = nil
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var isFocused: Bool
@@ -525,12 +539,14 @@ struct TVChip: View {
          badge18: Bool = false,
          selected: Bool,
          entryFocus: FocusState<Bool>.Binding? = nil,
+         onFocusChange: ((Bool) -> Void)? = nil,
          onSelect: @escaping () -> Void) {
         self.title = title
         self.iconURL = iconURL
         self.badge18 = badge18
         self.selected = selected
         self.entryFocus = entryFocus
+        self.onFocusChange = onFocusChange
         self.onSelect = onSelect
     }
 
@@ -568,6 +584,7 @@ struct TVChip: View {
         }
         .tvCardButton()
         .focused(entryFocus ?? $isFocused)
+        .onChange(of: focusActive) { _, focused in onFocusChange?(focused) }
     }
 }
 
@@ -729,6 +746,12 @@ struct TVEmptyState: View {
     var actionTitle: String? = nil
     var action: (() -> Void)? = nil
     var actionIsDefaultFocus: Bool = false
+    /// L-T41 (1.3.15): an optional focus-change hook for
+    /// the action button, the poster card's contract —
+    /// Home's focus diagnostics need to know when an empty
+    /// state's button takes or leaves focus. Default nil:
+    /// every existing call site is unchanged.
+    var onFocusChange: ((Bool) -> Void)? = nil
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var actionFocused: Bool
@@ -738,13 +761,15 @@ struct TVEmptyState: View {
          message: String? = nil,
          actionTitle: String? = nil,
          action: (() -> Void)? = nil,
-         actionIsDefaultFocus: Bool = false) {
+         actionIsDefaultFocus: Bool = false,
+         onFocusChange: ((Bool) -> Void)? = nil) {
         self.icon = icon
         self.title = title
         self.message = message
         self.actionTitle = actionTitle
         self.action = action
         self.actionIsDefaultFocus = actionIsDefaultFocus
+        self.onFocusChange = onFocusChange
     }
 
     var body: some View {
@@ -770,6 +795,7 @@ struct TVEmptyState: View {
                 }
                 .tvCardButton()
                 .focused($actionFocused)
+                .onChange(of: actionFocused) { _, focused in onFocusChange?(focused) }
                 .padding(.top, 12)
             }
         }
