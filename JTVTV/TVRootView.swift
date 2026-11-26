@@ -131,8 +131,17 @@ struct TVRootView: View {
                 plugins.adultEnabled = true
             }
         }
-        .onChange(of: selection) { _, _ in
+        .onChange(of: selection) { _, newSelection in
             session.touch()
+            // L-T41 vòng 2 (1.3.16, DIAGNOSIS-2 §7.1): a
+            // tab change is the observable half of the tab
+            // gain/lost witness — SwiftUI exposes no focus
+            // hook on TabView tab items themselves, so the
+            // selection change is logged here and the
+            // tab-bar-vs-nowhere half of the question is
+            // answered by the moveFail line's focusedItem
+            // (TVHomeView's tracker).
+            DiagLog.log("focus", "tab selected=\(newSelection)")
         }
     }
 }
