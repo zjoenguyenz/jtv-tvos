@@ -429,23 +429,59 @@ struct TVSectionHeader: View {
     /// plain label is not focusable). Default nil: every
     /// existing call site is unchanged.
     var onFocusChange: ((Bool) -> Void)?
+    /// L-T41 return landing (1.3.17, DESIGN §2.2.1): the
+    /// A-6/A-7 entryFocus opt-in in VALUE form — the hero
+    /// card's shape, one step removed. Before 1.3.15 the
+    /// hero was mute (a private @FocusState nobody outside
+    /// could drive) and the A-6 fix gave its owner a Bool
+    /// binding; a header needs the slug-valued form: when
+    /// BOTH `focusSlug` and `entryFocus` are handed in, the
+    /// Button is driven by `.focused(entryFocus, equals:
+    /// focusSlug)`, so the owning screen can write the slug
+    /// to land focus back on THIS header — the return
+    /// landing after a pop. `focusActive` then reads the
+    /// binding instead of the private state, and the hook
+    /// is fed from it — the hero card's `focusActive` shape
+    /// exactly. Both default nil: with either absent the
+    /// header behaves exactly as before (own @FocusState),
+    /// so every call site outside Home is unchanged.
+    var focusSlug: String?
+    var entryFocus: FocusState<String?>.Binding?
 
     @Environment(\.tvTheme) private var theme
     @FocusState private var isFocused: Bool
 
     init(title: String, action: (() -> Void)? = nil,
-         onFocusChange: ((Bool) -> Void)? = nil) {
+         onFocusChange: ((Bool) -> Void)? = nil,
+         focusSlug: String? = nil,
+         entryFocus: FocusState<String?>.Binding? = nil) {
         self.title = title
         self.action = action
         self.onFocusChange = onFocusChange
+        self.focusSlug = focusSlug
+        self.entryFocus = entryFocus
+    }
+
+    private var focusActive: Bool {
+        if let entryFocus, let focusSlug {
+            return entryFocus.wrappedValue == focusSlug
+        }
+        return isFocused
     }
 
     var body: some View {
         if let action {
-            Button(action: action) { label }
-                .tvCardButton()
-                .focused($isFocused)
-                .onChange(of: isFocused) { _, focused in onFocusChange?(focused) }
+            if let entryFocus, let focusSlug {
+                Button(action: action) { label }
+                    .tvCardButton()
+                    .focused(entryFocus, equals: focusSlug)
+                    .onChange(of: focusActive) { _, focused in onFocusChange?(focused) }
+            } else {
+                Button(action: action) { label }
+                    .tvCardButton()
+                    .focused($isFocused)
+                    .onChange(of: isFocused) { _, focused in onFocusChange?(focused) }
+            }
         } else {
             label
         }
@@ -469,9 +505,9 @@ struct TVSectionHeader: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
-            .fill(isFocused ? Color.white.opacity(0.10) : Color.clear))
+            .fill(focusActive ? Color.white.opacity(0.10) : Color.clear))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-            .strokeBorder(isFocused ? theme.focusRing : .clear,
-                          lineWidth: isFocused ? theme.ringWidth : 0))
+            .strokeBorder(focusActive ? theme.focusRing : .clear,
+                          lineWidth: focusActive ? theme.ringWidth : 0))
     }
 }
