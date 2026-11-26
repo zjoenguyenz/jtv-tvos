@@ -690,8 +690,7 @@ struct TVHomeView: View {
         case .hero:
             return element.hasPrefix("hero")
         case .chip:
-            guard let pid = plugins.activePluginId else { return false }
-            return element == "chip plugin=\(pid)"
+            return element == "chip plugin=\(plugins.activePluginId)"
         }
     }
 
@@ -829,8 +828,8 @@ struct TVHomeView: View {
             closeLandingObligation(event: "discharged-by-gain", detail: "element=\(element)")
             return
         }
-        if landingTarget == .hero, let pid = plugins.activePluginId,
-           element == "chip plugin=\(pid)" {
+        if landingTarget == .hero,
+           element == "chip plugin=\(plugins.activePluginId)" {
             return
         }
         closeLandingObligation(event: "closed-by-user-takeover", detail: "element=\(element)")
