@@ -491,6 +491,16 @@ struct TVHomeView: View {
     /// proves the loss was a move, not a void, and the
     /// pending edge dies silently.
     @State private var focusEventEpoch = 0
+    /// L-T45 dwell-to-switch (1.3.18, DESIGN §1.4): the
+    /// one pending chip dwell — the task sleeping out the
+    /// 600 ms threshold and the plugin it is armed for.
+    /// Focus sits on at most one chip, so one pending
+    /// dwell is the whole state. Arming and cancelling
+    /// log NOTHING (the absence discipline of the
+    /// chip-edge guard's pending edge); only a dwell that
+    /// actually fires writes its one line, at the fire.
+    @State private var dwellTask: Task<Void, Never>?
+    @State private var dwellPluginId: String?
     /// Watchdog state (DIAGNOSIS-2 §7.2.3): whether Home
     /// is the appeared surface, its polling task, and the
     /// last confirmed gain (element + time + whether it
@@ -532,6 +542,14 @@ struct TVHomeView: View {
         .onAppear {
             session.touch()
             focusTracker.install()
+            // L-T46 (1.3.18, DESIGN §2.2): every Home
+            // appear starts with the user NOT yet holding
+            // focus in this appearance — the tracker's
+            // userHasTakenFocus resets here, beside the
+            // install, on the one appear path every Home
+            // entry (launch, PIN return, tab return,
+            // pop-back) funnels through.
+            focusTracker.beginAppearance()
             // L-T41 vòng 2 (1.3.16, DIAGNOSIS-2 §7.1):
             // appear/disappear are logged so navigation
             // windows can never again masquerade as focus
@@ -564,6 +582,12 @@ struct TVHomeView: View {
             DiagLog.log("home", "disappear")
             watchdogTask?.cancel()
             watchdogTask = nil
+            // L-T45 (1.3.18, DESIGN §1.4.6): a pending
+            // dwell dies with the surface — its deferred
+            // check also reads homeAppeared, but the
+            // explicit cancel keeps a dead dwell from
+            // sleeping on across a long absence.
+            cancelChipDwell()
             focusTracker.uninstall()
         }
         .task {
@@ -590,6 +614,15 @@ struct TVHomeView: View {
             // winning load. A settle never CLOSES the
             // obligation (DIAGNOSIS-2 §7.2.1) — only a
             // confirmed gain does.
+            // L-T45 (1.3.18, DESIGN §1.4.6): ANY switch,
+            // from any cause (a select, another chip's
+            // dwell), kills a pending dwell — a dwell
+            // armed on chip P must never fire after the
+            // user has explicitly selected R and override
+            // the choice 600 ms later. (A dwell's own fire
+            // lands here too; it cleared its own state at
+            // the fire, so this cancel is a no-op for it.)
+            cancelChipDwell()
             openLandingObligation(preferChip: false, reason: "switch")
             Task {
                 if await store.load(plugins: plugins, service: service) {
@@ -638,7 +671,19 @@ struct TVHomeView: View {
                            // unchanged — it remains the landing
                            // whenever the content has no hero.
                            entryFocus: plugin.id == plugins.activePluginId ? $chipFocused : nil,
-                           onFocusChange: focusHook("chip plugin=\(plugin.id)", rail: true)) {
+                           // L-T45 dwell-to-switch (1.3.18,
+                           // DESIGN §1.4.1): the chip's hook
+                           // is wrapped AT THIS CALL SITE —
+                           // TVChip itself is unchanged. The
+                           // standing focusHook runs FIRST
+                           // (it advances focusEventEpoch)
+                           // and the dwell note runs second,
+                           // so a dwell arm reads the epoch
+                           // AFTER its own gain's increment.
+                           onFocusChange: { focused in
+                               focusHook("chip plugin=\(plugin.id)", rail: true)(focused)
+                               noteChipDwell(pluginId: plugin.id, focused: focused)
+                           }) {
                         plugins.activePluginId = plugin.id
                     }
                     .prefersDefaultFocus(plugin.id == plugins.activePluginId, in: focusNS)
@@ -791,6 +836,108 @@ struct TVHomeView: View {
                 DiagLog.log("focus", "home lost element=\(element)")
                 noteLandingLoss(element)
             }
+        }
+    }
+
+    // MARK: - Dwell-to-switch (L-T45, 1.3.18)
+
+    /// Kills the pending chip dwell, if any: the task is
+    /// cancelled and the armed plugin forgotten. The
+    /// deferred check ALSO re-reads dwellPluginId, so a
+    /// task that wakes anyway (a cancelled sleep swallows
+    /// its error and runs on) finds nothing armed for it
+    /// and dies silently. Called from the three designed
+    /// edges: the armed chip's own focus loss, ANY
+    /// activePluginId change, and Home's disappear.
+    private func cancelChipDwell() {
+        dwellTask?.cancel()
+        dwellTask = nil
+        dwellPluginId = nil
+    }
+
+    /// L-T45 dwell-to-switch (1.3.18, DESIGN §1.4): in
+    /// the shipped tree a plugin switch ran ONLY from
+    /// the chip Button's action — focus resting on a chip
+    /// loaded nothing, so the owner's natural gesture
+    /// (land on a source's chip, press down into its
+    /// content) met an unloaded Home and dead presses
+    /// (123av three times in the evidence session; the
+    /// relay recorded zero requests). A chip that HOLDS
+    /// focus for the dwell threshold now switches itself.
+    /// The threshold is 600 ms (DESIGN §1.3): 1.7× the
+    /// slowest pure traversal step measured in the
+    /// evidence session (0.352 s), at most half the
+    /// shortest convicted intent dwell (1.252 s), for a
+    /// focus-to-content total of ~1.0–1.1 s with the
+    /// measured post-switch publish latency.
+    ///
+    /// GAIN of chip P: any pending dwell dies first —
+    /// even when P is the active chip. P == the active
+    /// plugin then stops here (no arm, no log: resting on
+    /// the loaded source's chip is not a switch request).
+    /// Otherwise the dwell arms: the epoch is captured
+    /// AFTER this gain's own hook increment (the call
+    /// site runs focusHook first), and a task sleeps out
+    /// the threshold.
+    ///
+    /// FIRE — only when ALL of these still hold at the
+    /// wake (the chip-edge guard's deferred-check shape,
+    /// DESIGN §1.4.4): this dwell is still the armed one
+    /// (not cancelled at any edge); the epoch is
+    /// unchanged since the arm (no gain or loss
+    /// intervened — leaving the chip, stepping to another
+    /// chip, or landing on the hero all move the epoch
+    /// and kill the dwell silently); the tracker still
+    /// names THIS chip as focus's owner; P is still not
+    /// the active plugin (a select during the wait has
+    /// already switched — never switch twice); Home is
+    /// still the appeared surface; and no category/detail
+    /// is pushed. The fire logs its ONE line and then
+    /// performs literally the chip Button's own
+    /// assignment — from there the standing switch
+    /// machinery (the onChange obligation, the load, the
+    /// settle refresh) does everything, exactly as for a
+    /// select, and focus stays parked on the chip while
+    /// the source loads, the designed parking spot.
+    ///
+    /// LOSS of chip P: if the pending dwell is P's, it is
+    /// cancelled outright (the epoch check would kill it
+    /// anyway; the explicit cancel keeps a dead task from
+    /// sleeping on through a long traversal).
+    ///
+    /// Declared limits (DESIGN §1.5): a press landing
+    /// BEFORE the fire still dies — no design loads a
+    /// source before any intent signal exists, and the
+    /// earlier signal (the dead press itself) is
+    /// direction-blind and was rejected for cause. A
+    /// ≥600 ms rest WITHOUT intent (a thinking pause on
+    /// an unloaded chip) fires a switch the user did not
+    /// ask for; the cost is one ordinary switch, nothing
+    /// is lost, and the dwell= column in the next device
+    /// log is the evidence the threshold is tuned by.
+    private func noteChipDwell(pluginId: String, focused: Bool) {
+        if focused {
+            cancelChipDwell()
+            guard pluginId != plugins.activePluginId else { return }
+            dwellPluginId = pluginId
+            let dwellEpoch = focusEventEpoch
+            let gainedAt = Date()
+            dwellTask = Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(600))
+                guard dwellPluginId == pluginId,
+                      focusEventEpoch == dwellEpoch,
+                      focusTracker.current == "chip plugin=\(pluginId)",
+                      pluginId != plugins.activePluginId,
+                      homeAppeared, nav.path.isEmpty
+                else { return }
+                dwellTask = nil
+                dwellPluginId = nil
+                let dwellMs = Int(Date().timeIntervalSince(gainedAt) * 1000)
+                DiagLog.log("focus", "dwell switch plugin=\(pluginId) dwell=\(dwellMs)ms")
+                plugins.activePluginId = pluginId
+            }
+        } else if dwellPluginId == pluginId {
+            cancelChipDwell()
         }
     }
 
@@ -977,6 +1124,16 @@ struct TVHomeView: View {
     /// post-pop transient responder, where the rescue shot
     /// proved harmless in the evidence log; only the tab
     /// bar is a convicted harm. Do not "even this out".
+    /// L-T46 (1.3.18, DESIGN §2.3): the tab-bar branch is
+    /// refined, not repealed — it closes the obligation
+    /// ONLY when the tracker proves the user has taken
+    /// focus at some point in this appearance
+    /// (userHasTakenFocus). Before the first take, a
+    /// tab-bar reading is the shell's cold-start park, and
+    /// the shot fires through it under a park-override log
+    /// line; the window self-closes at the first gain,
+    /// after which the L-T43 protection covers the rest of
+    /// the appearance.
     private func fireLandingShot() {
         guard landingOwed else { return }
         let current = focusTracker.current
@@ -991,8 +1148,32 @@ struct TVHomeView: View {
         if current == "none" {
             let engine = TVHomeFocusTracker.engineFocus()
             if engine.state == .onTabBar {
-                closeLandingObligation(event: "closed-focus-outside-scope", detail: "engine=tabbar item=\(engine.description)")
-                return
+                // L-T46 (1.3.18, DESIGN §2.3): the
+                // tab-bar reading alone cannot tell the
+                // shell's cold-start PARK — the user has
+                // not touched anything this appearance,
+                // and in the evidence session 1.3.17
+                // closed every launch and PIN-return
+                // obligation before his first gain,
+                // leaving focus on the menu until he
+                // pressed — from the user's genuinely
+                // standing on the tab bar (L-T43's
+                // convicted harm, the mid-session settle
+                // shot that dragged him off it). The
+                // tracker's userHasTakenFocus is exactly
+                // that distinction: SET → the 1.3.17 rule
+                // stands verbatim (close, no shot);
+                // CLEAR → this is the park: log the
+                // park-override and FALL THROUGH to the
+                // shot below, restoring the cold landing
+                // 1.3.16 had. The flag is read ONLY here
+                // — the watchdog and the chip-edge guard
+                // never consult it (DESIGN §2.4).
+                if focusTracker.userHasTakenFocus {
+                    closeLandingObligation(event: "closed-focus-outside-scope", detail: "engine=tabbar item=\(engine.description)")
+                    return
+                }
+                DiagLog.log("focus", "landing shot park-override engine=tabbar item=\(engine.description)")
             }
         }
         switch landingTarget {
@@ -1589,20 +1770,77 @@ private final class TVHomeFocusTracker: @unchecked Sendable {
     /// "none" before the first gain / after its loss.
     /// Read and written only under `lock`.
     private var _current = "none"
+    /// L-T46 (1.3.18, DESIGN §2.2): whether the user has
+    /// TAKEN focus at any point in the current Home
+    /// appearance — the witness that separates the
+    /// shell's cold-start tab-bar PARK (focus never
+    /// taken; the TabView simply placed it on the tab)
+    /// from the user genuinely standing on the tab bar
+    /// (taken inside Home, then walked up). Set by
+    /// exactly three events, all already flowing through
+    /// this tracker: S1 any Home gain (note), S2 any Home
+    /// loss that actually clears the current owner
+    /// (clear), S3 a moveFail whose engine reading is
+    /// .onTabBar (the observer in install). Reset by
+    /// exactly one: beginAppearance(), called beside
+    /// install() on every Home appear. Read at exactly
+    /// one place: the landing shot's tab-bar gate in
+    /// fireLandingShot — the watchdog and the chip-edge
+    /// guard never consult it (DESIGN §2.4). Same lock
+    /// as every other access (the FL-495 discipline).
+    private var _userHasTakenFocus = false
     private var token: NSObjectProtocol?
 
     var current: String {
         lock.withLock { _current }
     }
 
+    var userHasTakenFocus: Bool {
+        lock.withLock { _userHasTakenFocus }
+    }
+
+    /// The one reset (L-T46, DESIGN §2.2): a new Home
+    /// appearance begins with focus not yet taken.
+    func beginAppearance() {
+        lock.withLock { _userHasTakenFocus = false }
+    }
+
     func note(_ element: String) {
-        lock.withLock { _current = element }
+        lock.withLock {
+            _current = element
+            // S1: a gain proves focus has been inside
+            // Home in this appearance — including a gain
+            // a landing shot delivered, after which every
+            // later tab-bar reading is the user walking
+            // up, and the park-override window is closed.
+            _userHasTakenFocus = true
+        }
     }
 
     func clear(if element: String) {
         lock.withLock {
-            if _current == element { _current = "none" }
+            if _current == element {
+                _current = "none"
+                // S2: a loss that actually clears the
+                // owner proves focus WAS in the user's
+                // hands inside Home — even when its
+                // destination is the tab bar, which is
+                // exactly how the convicted L-T43 drag
+                // began.
+                _userHasTakenFocus = true
+            }
         }
+    }
+
+    /// S3 (L-T46, DESIGN §2.2): a dead press whose
+    /// engine witness sits on the tab bar — the user is
+    /// pressing on the menu itself, possibly without
+    /// ever having entered Home content this appearance.
+    /// Called only from the moveFail observer in
+    /// install(), and only when its engine reading is
+    /// .onTabBar.
+    func noteTabBarMoveFail() {
+        lock.withLock { _userHasTakenFocus = true }
     }
 
     func install() {
@@ -1617,6 +1855,18 @@ private final class TVHomeFocusTracker: @unchecked Sendable {
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
+            // L-T46 S3 (1.3.18, DESIGN §2.2): a dead
+            // press whose engine witness sits ON the tab
+            // bar marks the user as holding focus there —
+            // the witness for a user who never entered
+            // Home content this appearance but is walking
+            // the menu. The convicted L-T43 window opened
+            // with exactly this line 87 ms before the
+            // dragging shot, so the flag is set before
+            // that shot's gate reads it.
+            if Self.engineFocus().state == .onTabBar {
+                self.noteTabBarMoveFail()
+            }
             DiagLog.log("focus", "moveFail focusedItem=\(Self.focusedItemDescription()) tracker=\(self.current)")
         }
         lock.withLock { token = newToken }
