@@ -23,6 +23,21 @@ final class TVHomeStore {
     /// from the final sections/items: first movie, in section
     /// order, whose displayBackdrop is non-empty.
     private(set) var heroMovie: Movie?
+    /// L-T42 (1.3.16): per-section rail paging state —
+    /// the view-owned page counter per FL-489 (the
+    /// REQUESTED page; the parser's pagination.currentPage
+    /// never overwrites it), the adopted total, and the
+    /// finished set (a page adding zero new items after
+    /// dedupe, or an empty page 1, ends paging for that
+    /// section). Instance state only (FL-495).
+    private(set) var sectionPages: [String: Int] = [:]
+    private(set) var sectionTotalPages: [String: Int] = [:]
+    private(set) var sectionFinished: Set<String> = []
+    /// In-flight rail appends, tokenised: sectionId → the
+    /// store generation captured by the attempt that owns
+    /// the marker, so an attempt's defer can only ever
+    /// remove its OWN marker, never a successor's.
+    private var sectionsLoadingMore: [String: Int] = [:]
 
     private var loadedAt: Date?
     private var generation = 0
@@ -39,6 +54,9 @@ final class TVHomeStore {
         var sectionErrors: [String: String]
         var heroMovie: Movie?
         var loadedAt: Date
+        var pages: [String: Int]
+        var totalPages: [String: Int]
+        var finished: Set<String>
     }
     private var snapshots: [String: PluginSnapshot] = [:]
 
@@ -76,6 +94,10 @@ final class TVHomeStore {
             sections = []
             items = [:]
             sectionErrors = [:]
+            sectionPages = [:]
+            sectionTotalPages = [:]
+            sectionFinished = []
+            sectionsLoadingMore = []
             loadedPluginId = nil
             loadedAt = nil
             heroMovie = nil
@@ -99,6 +121,9 @@ final class TVHomeStore {
             sections = snapshot.sections
             items = snapshot.items
             sectionErrors = snapshot.sectionErrors
+            sectionPages = snapshot.pages
+            sectionTotalPages = snapshot.totalPages
+            sectionFinished = snapshot.finished
             heroMovie = snapshot.heroMovie
             loadedPluginId = pid
             loadedAt = snapshot.loadedAt
@@ -118,11 +143,17 @@ final class TVHomeStore {
                 snapshots[outgoing] = PluginSnapshot(
                     sections: sections, items: items,
                     sectionErrors: sectionErrors,
-                    heroMovie: heroMovie, loadedAt: outAt)
+                    heroMovie: heroMovie, loadedAt: outAt,
+                    pages: sectionPages, totalPages: sectionTotalPages,
+                    finished: sectionFinished)
             }
             heroMovie = nil
             items = [:]
             sectionErrors = [:]
+            sectionPages = [:]
+            sectionTotalPages = [:]
+            sectionFinished = []
+            sectionsLoadingMore = []
         }
         isLoading = true
         let secs = await service.homeSections(pluginId: pid)
@@ -136,7 +167,9 @@ final class TVHomeStore {
             loadedAt = Date()
             snapshots[pid] = PluginSnapshot(
                 sections: secs, items: items, sectionErrors: sectionErrors,
-                heroMovie: nil, loadedAt: Date())
+                heroMovie: nil, loadedAt: Date(),
+                pages: sectionPages, totalPages: sectionTotalPages,
+                finished: sectionFinished)
             // L-T41 §5.3 (1.3.15): publish line, fresh path
             // (the empty-sections landing) — computed from
             // the published state, like the other two.
@@ -145,13 +178,13 @@ final class TVHomeStore {
         }
         // Per-section page-1 fetches in parallel; each row
         // publishes as its own fetch lands (the iOS shape).
-        await withTaskGroup(of: (String, Result<[Movie], Error>).self) { group in
+        await withTaskGroup(of: (String, Result<ListPage, Error>).self) { group in
             for section in secs {
                 group.addTask {
                     do {
                         let page = try await service.list(pluginId: pid, slug: section.slug,
                                                           filters: ListFilters(), page: 1)
-                        return (section.id, .success(page.items))
+                        return (section.id, .success(page))
                     } catch {
                         return (section.id, .failure(error))
                     }
@@ -160,8 +193,20 @@ final class TVHomeStore {
             for await (sectionId, result) in group {
                 guard gen == self.generation else { continue }
                 switch result {
-                case .success(let movies):
+                case .success(let page):
+                    let movies = page.items
                     items[sectionId] = movies.uniquedById()
+                    // L-T42 (1.3.16) + FL-489: page 1 was
+                    // REQUESTED, so the counter is 1 — never
+                    // the parser-reported currentPage;
+                    // totalPages is adopted from the parser.
+                    sectionPages[sectionId] = 1
+                    sectionTotalPages[sectionId] = max(page.pagination.totalPages, 1)
+                    if movies.isEmpty {
+                        sectionFinished.insert(sectionId)
+                    } else {
+                        sectionFinished.remove(sectionId)
+                    }
                     sectionErrors[sectionId] = nil
                     if !movies.isEmpty {
                         // FL-488: a section's movies were all
@@ -194,12 +239,69 @@ final class TVHomeStore {
             loadedAt = Date()
             snapshots[pid] = PluginSnapshot(
                 sections: sections, items: items, sectionErrors: sectionErrors,
-                heroMovie: hero, loadedAt: Date())
+                heroMovie: hero, loadedAt: Date(),
+                pages: sectionPages, totalPages: sectionTotalPages,
+                finished: sectionFinished)
             // L-T41 §5.3 (1.3.15): publish line, fresh path.
             DiagLog.log("home", "publish path=fresh plugin=\(pid) sections=\(sections.count) items=\(items.values.reduce(0) { $0 + $1.count }) hero=\(heroMovie?.id ?? "nil")")
             return true
         }
         return false
+    }
+
+    /// L-T42 (1.3.16): append the next page to ONE home
+    /// rail, in place at the tail of items[sectionId] —
+    /// sections order, heroMovie and focus state are never
+    /// touched. FL-489 ownership, same as Browse: the local
+    /// counter becomes the REQUESTED page, totalPages is
+    /// adopted (never shrunk), and a page adding zero new
+    /// items after dedupe finishes the section.
+    /// Revalidation: the cursor and item count captured at
+    /// entry must still match after the fetch — a
+    /// same-generation page-1 republish in between drops
+    /// the append instead of stitching a stale page onto
+    /// fresh page 1.
+    func loadMoreSection(sectionId: String, plugins: PluginManager, service: MovieService) async {
+        guard let pid = loadedPluginId, pid == plugins.activePlugin?.id else { return }
+        guard let section = sections.first(where: { $0.id == sectionId }) else { return }
+        guard let current = sectionPages[sectionId],
+              let total = sectionTotalPages[sectionId] else { return }
+        guard current < total else { return }
+        guard !sectionFinished.contains(sectionId) else { return }
+        guard sectionErrors[sectionId] == nil else { return }
+        guard sectionsLoadingMore[sectionId] == nil else { return }
+        let gen = generation
+        sectionsLoadingMore[sectionId] = gen
+        defer {
+            if sectionsLoadingMore[sectionId] == gen {
+                sectionsLoadingMore.removeValue(forKey: sectionId)
+            }
+        }
+        let countAtStart = items[sectionId]?.count ?? 0
+        let next = current + 1
+        do {
+            let result = try await service.list(pluginId: pid, slug: section.slug,
+                                                filters: ListFilters(), page: next)
+            guard gen == generation, loadedPluginId == pid else { return }
+            guard sectionPages[sectionId] == current,
+                  (items[sectionId]?.count ?? 0) == countAtStart else { return }
+            let existing = items[sectionId] ?? []
+            var seen = Set(existing.map(\.id))
+            let fresh = result.items.filter { seen.insert($0.id).inserted }
+            if !fresh.isEmpty {
+                items[sectionId] = existing + fresh
+                ImageCacheManager.shared.prefetch(urlStrings: fresh.map(\.posterUrl),
+                                                  headers: fresh.first?.sourcePageURL.map { ["Referer": $0] } ?? [:])
+            }
+            sectionPages[sectionId] = next
+            sectionTotalPages[sectionId] = max(sectionTotalPages[sectionId] ?? total, result.pagination.totalPages)
+            if fresh.isEmpty {
+                sectionFinished.insert(sectionId)
+            }
+            DiagLog.log("home", "rail append section=\(section.slug) page=\(next) added=\(fresh.count) total=\(items[sectionId]?.count ?? 0)")
+        } catch {
+            DiagLog.log("home", "rail append failed section=\(section.slug) page=\(next) kind=\((error as NSError).domain)#\((error as NSError).code)")
+        }
     }
 }
 
@@ -618,7 +720,7 @@ struct TVHomeView: View {
                 } else {
                     ScrollView(.horizontal, showsIndicators: false) {
                         LazyHStack(spacing: 24) {
-                            ForEach(movies) { movie in
+                            ForEach(Array(movies.enumerated()), id: \.element.id) { index, movie in
                                 TVPosterCard(movie: movie, width: 240,
                                              isFavorite: favorites.isFavorite(pluginId: pid, movieId: movie.id),
                                              onSelect: {
@@ -627,7 +729,12 @@ struct TVHomeView: View {
                                              onLongPress: {
                                                  favorites.toggle(pluginId: pid, movie: movie)
                                              },
-                                             onFocusChange: focusHook("card movie=\(movie.id)"))
+                                             onFocusChange: { focused in
+                                                 focusHook("card movie=\(movie.id)")(focused)
+                                                 if focused == true, index >= movies.count - 4 {
+                                                     Task { await store.loadMoreSection(sectionId: section.id, plugins: plugins, service: service) }
+                                                 }
+                                             })
                             }
                         }
                         .padding(.horizontal, 4)
