@@ -199,7 +199,14 @@ extension View {
 /// (no own ScrollView). Column count is derived from the measured
 /// container width (FL-126 — never a hard-coded resolution).
 /// Load-more hangs on the bottom sentinel's appearance — a
-/// scroll-position signal (FL-234), guarded by the parent.
+/// scroll-position signal (FL-234), guarded by the parent — AND,
+/// since 1.3.21 (L-T54), on a focus-lookahead trigger inside the
+/// grid itself: the sentinel fires while the first pages are
+/// being laid out and never again under tvOS focus scrolling
+/// (log_10: every Browse session stopped at exactly 3 pages
+/// while its source reported thousands), so the paging surfaces
+/// are driven by the one signal that provably moves on tvOS —
+/// focus reaching the tail of the loaded items.
 struct TVPosterGrid: View {
     let items: [Movie]
     let pluginId: String
@@ -261,6 +268,7 @@ struct TVPosterGrid: View {
                         },
                         onFocusChange: { focused in
                             onCellFocusChange?(movie, focused)
+                            if focused { noteFocusForPaging(movie) }
                         },
                         entryFocus: movie.id == items.first?.id ? firstCellEntryFocus : nil
                     )
@@ -289,6 +297,22 @@ struct TVPosterGrid: View {
             }
         }
         .onPreferenceChange(TVWidthKey.self) { [binding = $measuredWidth] in binding.wrappedValue = $0 }
+    }
+
+    /// L-T54 (1.3.21): the focus-lookahead paging trigger. When
+    /// focus lands within the last 18 loaded items, the next page
+    /// is requested through the parent's `onLoadMore` — whose own
+    /// guards (loading flags, page < totalPages) make repeat
+    /// fires harmless. Surfaces whose `onLoadMore` is a deliberate
+    /// no-op (Home's fixed 9-item grid band) are unaffected. The
+    /// trigger logs every fire, so the next device log separates
+    /// "trigger never fired" from "loadMore refused or failed".
+    private func noteFocusForPaging(_ movie: Movie) {
+        guard items.count >= 24,
+              let idx = items.firstIndex(where: { $0.id == movie.id }),
+              idx >= items.count - 18 else { return }
+        DiagLog.log("grid", "loadMore focus-trigger plugin=\(pluginId) idx=\(idx) total=\(items.count)")
+        onLoadMore()
     }
 }
 

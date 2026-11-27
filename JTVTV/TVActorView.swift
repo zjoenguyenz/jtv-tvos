@@ -530,6 +530,7 @@ struct TVActorView: View {
                                 onLongPress: { favorites.toggle(pluginId: row.pluginId, movie: row.movie) },
                                 onFocusChange: { focused in
                                     if focused { focusedRow = row }
+                                    if focused { noteFocusForPaging(row) }
                                 },
                                 selectOnImageFailure: true
                             )
@@ -910,6 +911,25 @@ struct TVActorView: View {
         isLoadingMore = true
         await coordinator.loadMore()
         isLoadingMore = false
+    }
+
+    /// L-T54 (1.3.21): focus-lookahead paging trigger — the
+    /// same repair as TVPosterGrid's. This grid's only paging
+    /// trigger was the bottom sentinel's onAppear (FL-234),
+    /// the scroll-position signal log_10 convicted on the
+    /// Browse/Search grids: it fires while the first pages are
+    /// being laid out and never again under tvOS focus
+    /// scrolling. When focus lands within the last 18 loaded
+    /// rows, the next lockstep page is requested through
+    /// loadMore(); its own guards (and the coordinator's
+    /// cursors) make repeat fires harmless and stop the
+    /// paging when every source is settled.
+    private func noteFocusForPaging(_ row: ActorFilmRow) {
+        guard rows.count >= 24,
+              let idx = rows.firstIndex(where: { $0.id == row.id }),
+              idx >= rows.count - 18 else { return }
+        DiagLog.log("actor", "loadMore focus-trigger idx=\(idx) total=\(rows.count)")
+        Task { await loadMore() }
     }
 
     // MARK: Focus-dwell preview
