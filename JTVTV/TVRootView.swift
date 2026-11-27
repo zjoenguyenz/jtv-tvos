@@ -42,6 +42,9 @@ struct TVRootView: View {
     @State private var categoryNav = TVNavPath()
     @State private var searchNav = TVNavPath()
     @State private var libraryNav = TVNavPath()
+    /// 1.3.20: the engine-focus witness (TVComponents), shared
+    /// with Home and Browse through the environment.
+    @State private var focusMonitor = TVFocusMonitor()
 
     @AppStorage(TVThemeStore.defaultsKey) private var themeRaw = JTVThemeID.ultraBlack.rawValue
     @State private var selection = 0
@@ -112,27 +115,26 @@ struct TVRootView: View {
         .environmentObject(history)
         .environmentObject(presenter)
         .environment(homeStore)
+        .environment(focusMonitor)
         .environment(\.tvTheme, theme)
         .background(theme.backgroundGradient.ignoresSafeArea())
-        // L-T49 / FL-508 (1.3.19): the ROOT Menu net. Every pushed
-        // surface owns its Back (`.onExitCommand` → pop to root,
-        // L-T31), but that handler only runs while focus is INSIDE
-        // the pushed screen. log_8 shows two Category pushes
-        // (15:09:53.690, 15:10:59.757) where no `[menu]` line ever
-        // fired and the app left the foreground ~10 s later: focus
-        // had fallen out of the pushed screen (onto the tab bar —
-        // the only other focusable in the window), and a Menu
-        // press on the tab bar is the system's "exit app". This
-        // net sits on the TabView, which contains the tab bar AND
-        // every stack, so a Menu press anywhere in the window
-        // reaches it when no inner surface claimed it. It is
-        // installed ONLY while the selected tab's stack has
-        // something pushed (nil action = the system default), so
-        // Back at a tab's root keeps tvOS's own behaviour (content
-        // → tab bar → exit), and an inner surface's own handler —
-        // Detail's actor exception included — still wins whenever
-        // focus is inside it.
-        .onExitCommand(perform: selectedNavDepth > 0 ? { rootMenuFallback() } : nil)
+        // L-T49 / FL-508 (1.3.19), narrowed 1.3.20: the ROOT Menu
+        // net. Every pushed surface owns its Back
+        // (`.onExitCommand` → pop to root, L-T31). The net exists
+        // for the case log_8 convicted — focus OUTSIDE the pushed
+        // screen (on the tab bar, or nowhere), where a Menu press
+        // is the system's "exit app". 1.3.19 installed it
+        // whenever a stack was pushed, and log_9 shows what that
+        // cost: all 5 Browse Backs were taken by the net, two of
+        // them with the engine's focus INSIDE the window
+        // (11:57:43.417, 11:58:17.817) — the TabView-level handler
+        // pre-empted the screen's own (and with it Detail's actor
+        // exception). 1.3.20 installs it ONLY while the engine
+        // says focus is not in content (TVFocusMonitor.place is
+        // the tab bar or nowhere). Focus in a pushed screen →
+        // nil action → that screen's own handler fires.
+        .onExitCommand(perform: selectedNavDepth > 0 && focusMonitor.place != .inWindow
+                       ? { rootMenuFallback() } : nil)
         .fullScreenCover(item: $presenter.request) { request in
             // L-T06: the player's dependencies ride as VALUES
             // from this root (their owner) — the cover's
@@ -150,6 +152,22 @@ struct TVRootView: View {
             if !plugins.adultEnabled {
                 plugins.adultEnabled = true
             }
+            focusMonitor.install()
+            // 1.3.20 (F-1/F-2): the UP-to-tab-bar bridge. The
+            // UIKit tab bar exists only once the TabView is on
+            // screen, so retry briefly until it is found.
+            Task { @MainActor in
+                for delay in [100, 400, 1200, 3000] {
+                    try? await Task.sleep(for: .milliseconds(delay))
+                    let status = TVTabBarFocusBridge.install(reason: "root-appear")
+                    if status == "installed" || status == "present" || status == "repointed" { return }
+                }
+            }
+        }
+        // 1.3.20: the UP-to-tab-bar bridge is live only while the
+        // selected tab is at its root (see TVTabBarFocusBridge).
+        .onChange(of: selectedNavDepth == 0, initial: true) { _, atRoot in
+            TVTabBarFocusBridge.setEnabled(atRoot)
         }
         .onChange(of: selection) { _, newSelection in
             session.touch()

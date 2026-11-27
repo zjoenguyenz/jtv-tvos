@@ -53,11 +53,28 @@ final class TVHomeStore {
     /// plugin; a new load cancels it (and its generation guard
     /// would drop its results anyway).
     @ObservationIgnored private var fillTask: Task<Void, Never>?
-    /// Each horizontal rail is filled up to this many cards in
-    /// the background (≈4 pages of a 12-item source, 2 of a
-    /// 24-item one). Past it, the focus-driven append below
-    /// keeps paging the rail endlessly as the user walks it.
-    static let backgroundFillTarget = 48
+    /// 1.3.20 (F-3): the fill's identity and liveness, so a
+    /// freshness no-op can tell whether a fill is still running
+    /// and resume one that is not.
+    @ObservationIgnored private var fillID = 0
+    @ObservationIgnored private var fillActive = false
+    /// 1.3.20 (F-4): the background fill is a HEAD START, not a
+    /// size. Each horizontal rail is pre-loaded this far ahead
+    /// in the background (≈4 pages of a 12-item source) so the
+    /// first screens never wait; past it, `ensureLookahead`
+    /// keeps `scrollLookahead` cards loaded ahead of the focused
+    /// card for as long as the user keeps scrolling, until the
+    /// SOURCE's own last page. No app-side cap exists anywhere.
+    static let fillLookahead = 48
+    static let scrollLookahead = 36
+    /// 1.3.20 (F-4): per-rail scroll-lookahead loops, and the
+    /// furthest card index the user has focused in each rail.
+    @ObservationIgnored private var lookaheadRunning: Set<String> = []
+    @ObservationIgnored private var lookaheadFocus: [String: Int] = [:]
+    /// 1.3.20 (F-3): the plugin the in-flight load belongs to
+    /// (nil when nothing is loading) — a second load request
+    /// for the same plugin JOINS it instead of restarting it.
+    @ObservationIgnored private var loadingPluginId: String?
 
     /// A-14 (1.3.9): per-plugin snapshots of a completed
     /// load. Switching A→B→A inside the freshness window
@@ -129,9 +146,9 @@ final class TVHomeStore {
     /// close the arm.
     @discardableResult
     func load(plugins: PluginManager, service: MovieService, force: Bool = false) async -> Bool {
-        generation &+= 1
-        let gen = generation
         guard let pid = plugins.activePlugin?.id else {
+            generation &+= 1
+            loadingPluginId = nil
             sections = []
             items = [:]
             sectionErrors = [:]
@@ -150,11 +167,36 @@ final class TVHomeStore {
             DiagLog.log("home", "publish path=clear plugin=none sections=0 items=0 hero=nil")
             return true
         }
+        // 1.3.20 (F-3): the two no-op exits come BEFORE the
+        // generation bump. In 1.3.19 every call bumped the
+        // generation first, so a freshness no-op — the plugin
+        // sync's settle reload (log_9 11:55:46.837) or a Home
+        // re-appear's `.task` (11:58:18.872) — silently killed
+        // the running background fill (`rail fill stopped …
+        // reason=superseded pages=1`) without loading anything.
+        // A no-op now leaves the generation, and therefore the
+        // fill, alone; an idle fill is resumed instead.
         if !force, !isLoading, loadedPluginId == pid, let loadedAt,
            Date().timeIntervalSince(loadedAt) < Self.freshnessWindow {
             isLoading = false
+            if !fillActive {
+                startBackgroundFill(plugins: plugins, service: service, reason: "resume")
+            }
             return true
         }
+        // 1.3.20 (F-3): a load of THIS plugin already in flight
+        // is joined, not restarted. log_9 11:57:44.002: Home's
+        // re-appear restarted hentaihub's in-flight load and
+        // threw away 8 settled sections (`load superseded
+        // plugin=hentaihub settled=8`) — the load the user was
+        // looking at. Only a switch to another plugin (or an
+        // explicit retry, `force`) supersedes a running load.
+        if !force, isLoading, loadingPluginId == pid {
+            DiagLog.log("home", "load joined plugin=\(pid) reason=in-flight")
+            return false
+        }
+        generation &+= 1
+        let gen = generation
         // A-14: a fresh snapshot of the TARGET plugin
         // restores instantly — no section refetch.
         // L-T44 (1.3.17, DESIGN §4.2.3): restore must
@@ -187,8 +229,10 @@ final class TVHomeStore {
             // L-T41 §5.3 (1.3.15): the publish line — which
             // swap just landed on Home, in which shape. The
             // focus lines beside it say where focus went.
+            loadingPluginId = nil
+            lookaheadFocus = [:]
             DiagLog.log("home", "publish path=snapshot plugin=\(pid) sections=\(sections.count) items=\(items.values.reduce(0) { $0 + $1.count }) hero=\(heroMovie?.id ?? "nil") failed=\(sectionErrors.count)")
-            startBackgroundFill(plugins: plugins, service: service)
+            startBackgroundFill(plugins: plugins, service: service, reason: "publish")
             return true
         }
         if loadedPluginId != pid {
@@ -221,10 +265,13 @@ final class TVHomeStore {
             sectionTotalPages = [:]
             sectionFinished = []
             sectionsLoadingMore = [:]
+            lookaheadFocus = [:]
         }
         fillTask?.cancel()
         fillTask = nil
+        fillActive = false
         isLoading = true
+        loadingPluginId = pid
         let secs = await service.homeSections(pluginId: pid)
         // L-T44 (1.3.17, DESIGN §4.2.5): a superseded load
         // logs its own death — in the evidence session the
@@ -243,6 +290,7 @@ final class TVHomeStore {
             heroMovie = nil
             didLoad = true
             isLoading = false
+            loadingPluginId = nil
             loadedAt = Date()
             storeSnapshot(for: pid, hero: nil, at: Date())
             // L-T41 §5.3 (1.3.15): publish line, fresh path
@@ -329,11 +377,12 @@ final class TVHomeStore {
             heroMovie = hero
             didLoad = true
             isLoading = false
+            loadingPluginId = nil
             loadedAt = Date()
             storeSnapshot(for: pid, hero: hero, at: Date())
             // L-T41 §5.3 (1.3.15): publish line, fresh path.
             DiagLog.log("home", "publish path=fresh plugin=\(pid) sections=\(sections.count) items=\(items.values.reduce(0) { $0 + $1.count }) hero=\(heroMovie?.id ?? "nil") failed=\(sectionErrors.count)")
-            startBackgroundFill(plugins: plugins, service: service)
+            startBackgroundFill(plugins: plugins, service: service, reason: "publish")
             return true
         }
         // L-T44 (1.3.17, DESIGN §4.2.5): the last guard
@@ -359,15 +408,16 @@ final class TVHomeStore {
     /// same-generation page-1 republish in between drops
     /// the append instead of stitching a stale page onto
     /// fresh page 1.
-    /// 1.3.19: `prefetchImages` is false for the background
-    /// fill — ImageCacheManager.prefetch REPLACES its pending
-    /// queue, so a background page must never evict the warm-up
-    /// of the posters the user is actually looking at; fill
-    /// cards load their own art when they scroll into view.
-    /// Returns whether the call appended at least one item.
+    /// `via` (1.3.20) names the caller in the append line:
+    /// "fill" (the background head start — no image prefetch,
+    /// so a background page never evicts the warm-up of the
+    /// posters the user is looking at) or "scroll" (the
+    /// focus-driven lookahead). Returns whether the call
+    /// appended at least one item.
     @discardableResult
     func loadMoreSection(sectionId: String, plugins: PluginManager, service: MovieService,
-                         prefetchImages: Bool = true) async -> Bool {
+                         via: String) async -> Bool {
+        let prefetchImages = via != "fill"
         guard let pid = loadedPluginId, pid == plugins.activePlugin?.id else { return false }
         guard let section = sections.first(where: { $0.id == sectionId }) else { return false }
         guard let current = sectionPages[sectionId],
@@ -406,7 +456,15 @@ final class TVHomeStore {
             if fresh.isEmpty {
                 sectionFinished.insert(sectionId)
             }
-            DiagLog.log("home", "rail append section=\(section.slug) page=\(next) added=\(fresh.count) total=\(items[sectionId]?.count ?? 0)\(prefetchImages ? "" : " via=fill")")
+            DiagLog.log("home", "rail append section=\(section.slug) page=\(next) added=\(fresh.count) total=\(items[sectionId]?.count ?? 0) via=\(via)")
+            // 1.3.20 (F-4): the ONLY ways a rail stops growing —
+            // the source returned nothing new, or its own last
+            // page was reached. One line, so the next log shows
+            // the end came from the source, never from the app.
+            let totalNow = sectionTotalPages[sectionId] ?? total
+            if fresh.isEmpty || next >= totalNow {
+                DiagLog.log("home", "rail end section=\(section.slug) page=\(next) totalPages=\(totalNow) total=\(items[sectionId]?.count ?? 0) reason=\(fresh.isEmpty ? "empty" : "lastPage")")
+            }
             return !fresh.isEmpty
         } catch {
             DiagLog.log("home", "rail append failed section=\(section.slug) page=\(next) kind=\((error as NSError).domain)#\((error as NSError).code)")
@@ -422,30 +480,40 @@ final class TVHomeStore {
         return current < total && !sectionFinished.contains(sectionId) && sectionErrors[sectionId] == nil
     }
 
-    /// L-T42 vòng 3 (1.3.19): top up every horizontal rail of
-    /// the published plugin to `backgroundFillTarget` cards,
-    /// round-robin across rails (so the first rails don't hog
-    /// it), one page at a time, through the same loadMoreSection
-    /// door the focus trigger uses — FL-489 page ownership,
-    /// dedupe, the finish rule and the generation guards all
-    /// apply unchanged. Grid bands show a fixed 9 cells on Home
-    /// and are skipped. A failed page stops that rail only.
-    /// The fill gives the visible screen a head start (300 ms)
-    /// before its first request.
-    func startBackgroundFill(plugins: PluginManager, service: MovieService) {
+    /// L-T42 vòng 3 (1.3.19), revised 1.3.20 (F-3/F-4): pre-load
+    /// every horizontal rail of the published plugin to
+    /// `fillLookahead` cards in the background — a HEAD START
+    /// so the first screens never wait, not the rail's size
+    /// (`ensureLookahead` takes over from there as the user
+    /// scrolls). Round-robin across rails, one page at a time,
+    /// through the same loadMoreSection door the scroll trigger
+    /// uses — FL-489 page ownership, dedupe, the finish rule
+    /// and the generation guards all apply unchanged. Grid
+    /// bands show a fixed 9 cells on Home and are skipped. A
+    /// failed page stops that rail only. 300 ms head start for
+    /// the visible screen. `reason` is "publish" or "resume"
+    /// (a freshness no-op found no fill running).
+    func startBackgroundFill(plugins: PluginManager, service: MovieService, reason: String) {
         fillTask?.cancel()
+        fillActive = false
         guard let pid = loadedPluginId else { return }
         let gen = generation
-        let target = Self.backgroundFillTarget
+        let target = Self.fillLookahead
         let railIds = sections.filter { !$0.isGrid }.map(\.id)
         let wanted = railIds.filter { (items[$0]?.count ?? 0) < target && canPage($0) }
         guard !wanted.isEmpty else { return }
+        fillID &+= 1
+        let myID = fillID
+        fillActive = true
         fillTask = Task { @MainActor [weak self] in
+            defer {
+                if let self, self.fillID == myID { self.fillActive = false }
+            }
             try? await Task.sleep(for: .milliseconds(300))
             guard let self, !Task.isCancelled, gen == self.generation, self.loadedPluginId == pid else { return }
             let started = Date()
             let before = self.items.values.reduce(0) { $0 + $1.count }
-            DiagLog.log("home", "rail fill start plugin=\(pid) rails=\(wanted.count) target=\(target) items=\(before)")
+            DiagLog.log("home", "rail fill start plugin=\(pid) rails=\(wanted.count) lookahead=\(target) items=\(before) reason=\(reason)")
             var active = wanted
             var pages = 0
             while !active.isEmpty {
@@ -456,7 +524,7 @@ final class TVHomeStore {
                         return
                     }
                     let grew = await self.loadMoreSection(sectionId: sid, plugins: plugins, service: service,
-                                                          prefetchImages: false)
+                                                          via: "fill")
                     if grew { pages += 1 }
                     if grew, (self.items[sid]?.count ?? 0) < target, self.canPage(sid) {
                         next.append(sid)
@@ -466,7 +534,46 @@ final class TVHomeStore {
             }
             guard gen == self.generation, self.loadedPluginId == pid else { return }
             let after = self.items.values.reduce(0) { $0 + $1.count }
-            DiagLog.log("home", "rail fill done plugin=\(pid) pages=\(pages) items=\(before)->\(after) ms=\(Int(Date().timeIntervalSince(started) * 1000))")
+            DiagLog.log("home", "rail fill done plugin=\(pid) pages=\(pages) items=\(before)->\(after) ms=\(Int(Date().timeIntervalSince(started) * 1000)) handoff=scroll")
+        }
+    }
+
+    /// 1.3.20 (F-4): the endless rail. Called on EVERY card
+    /// focus with the card's index: while fewer than
+    /// `scrollLookahead` cards remain after the furthest card
+    /// the user has focused in this rail, keep appending the
+    /// next page — no app-side cap, the loop ends only when the
+    /// user is far enough ahead of the end, the source's own
+    /// last page is reached (`rail end`), a page fails, or a
+    /// new load supersedes. One loop per rail; a later, deeper
+    /// focus just raises the mark the running loop reads. If
+    /// the background fill holds the rail's page slot, the loop
+    /// waits for it instead of giving up.
+    func ensureLookahead(sectionId: String, focusIndex: Int, plugins: PluginManager, service: MovieService) {
+        lookaheadFocus[sectionId] = max(lookaheadFocus[sectionId] ?? 0, focusIndex)
+        guard !lookaheadRunning.contains(sectionId), canPage(sectionId) else { return }
+        guard (items[sectionId]?.count ?? 0) - focusIndex <= Self.scrollLookahead else { return }
+        guard let pid = loadedPluginId else { return }
+        lookaheadRunning.insert(sectionId)
+        let gen = generation
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.lookaheadRunning.remove(sectionId) }
+            var pages = 0
+            while !Task.isCancelled, gen == self.generation, self.loadedPluginId == pid, self.canPage(sectionId) {
+                let mark = self.lookaheadFocus[sectionId] ?? 0
+                guard (self.items[sectionId]?.count ?? 0) - mark <= Self.scrollLookahead else { break }
+                if self.sectionsLoadingMore[sectionId] != nil {
+                    try? await Task.sleep(for: .milliseconds(150))
+                    continue
+                }
+                let grew = await self.loadMoreSection(sectionId: sectionId, plugins: plugins, service: service,
+                                                      via: "scroll")
+                if grew { pages += 1 } else { break }
+            }
+            if pages > 0 {
+                DiagLog.log("home", "rail lookahead section=\(sectionId) pages=\(pages) total=\(self.items[sectionId]?.count ?? 0) focus=\(self.lookaheadFocus[sectionId] ?? 0)")
+            }
         }
     }
 }
@@ -502,6 +609,8 @@ struct TVHomeView: View {
     @Environment(TVNavPath.self) private var nav
     @Environment(\.tvTheme) private var theme
     @Environment(\.tvHomeTabSelected) private var homeTabSelected
+    /// 1.3.20: the app-wide engine-focus witness (TVRootView).
+    @Environment(TVFocusMonitor.self) private var focusMonitor
 
     // MARK: Focus model (1.3.19 — L-T47/L-T48 structural rework)
     //
@@ -556,18 +665,20 @@ struct TVHomeView: View {
     /// disappear or a tab change kills the older one.
     @State private var landingGeneration = 0
     @State private var homeAppeared = false
-    /// Advances on EVERY focus hook event; the dwell captures it
-    /// at arm time and dies if anything moved.
-    @State private var focusEventEpoch = 0
-    /// L-T45 dwell-to-switch, revised (1.3.19, L-T48 (b)).
-    @State private var dwellTask: Task<Void, Never>?
-    @State private var dwellPluginId: String?
-    /// Gain times of the last few chip gains — the traversal
-    /// witness the dwell threshold reads.
-    @State private var recentChipGains: [Date] = []
-    /// Times of recent dead presses on the tab bar (rescue).
-    @State private var tabBarDeadPresses: [Date] = []
+    /// 1.3.20: the dwell's and the rescues' bookkeeping lives in
+    /// a plain reference box, NOT in @State. In 1.3.19 every
+    /// focus move wrote @State (an epoch counter, the chip-gain
+    /// ring, the dwell task) and so re-evaluated the whole Home
+    /// body — every rail, every band — on every single press.
+    /// None of it is ever displayed.
+    @State private var scratch = TVHomeFocusScratch()
     @State private var focusTracker = TVHomeFocusTracker()
+    /// 1.3.20 (F-2): the load has shown nothing for
+    /// `stallSeconds` — Home shows a focusable, escapable
+    /// "source not answering" state instead of a void.
+    @State private var loadStalled = false
+    @State private var stallGeneration = 0
+    private static let stallSeconds = 4
     @State private var lastSilentSyncAt: Date?
 
     /// Home is the surface the user is actually looking at.
@@ -613,6 +724,11 @@ struct TVHomeView: View {
             focusTracker.onTabBarMoveFail = { handleTabBarDeadPress() }
             homeAppeared = true
             DiagLog.log("home", "appear tabSelected=\(homeTabSelected) depth=\(nav.path.count)")
+            // 1.3.20 (F-1/F-2): make sure UP from the top row
+            // reaches the tab bar (idempotent; re-points after a
+            // PIN-return rebuild).
+            TVTabBarFocusBridge.install(reason: "home-appear")
+            armStallWatch()
             if !didColdLanding {
                 didColdLanding = true
                 runColdLanding()
@@ -631,6 +747,21 @@ struct TVHomeView: View {
             focusTracker.onTabBarMoveFail = nil
             focusTracker.uninstall()
         }
+        // 1.3.20 (F-2): a focus VOID on Home (the engine has no
+        // focused item at all) that lasts 400 ms is rescued onto
+        // the active chip — focus is never left without a
+        // destination.
+        .onChange(of: focusMonitor.voidEpoch) { _, epoch in
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(400))
+                guard epoch == focusMonitor.voidEpoch, focusMonitor.place == .nowhere,
+                      homeVisible, let target = landingChipId else { return }
+                DiagLog.log("focus", "void-rescue surface=home target=chip plugin=\(target)")
+                chipFocus = target
+            }
+        }
+        .onChange(of: store.isLoading) { _, _ in armStallWatch() }
+        .onChange(of: contentHasBands) { _, _ in armStallWatch() }
         .onChange(of: homeTabSelected) { _, selected in
             // Leaving the tab kills every pending focus action
             // at once (the appear/disappear pair lags the tab
@@ -668,6 +799,7 @@ struct TVHomeView: View {
             cancelChipDwell()
             DiagLog.log("home", "switch plugin=\(newId) visible=\(homeVisible) tracker=\(focusTracker.current)")
             Task { await store.load(plugins: plugins, service: service) }
+            armStallWatch()
         }
         .onChange(of: plugins.syncGeneration) { _, _ in
             // A sync settle reloads data only (freshness rules
@@ -740,13 +872,31 @@ struct TVHomeView: View {
                             .focusSection()
                     }
                 }
-                if store.didLoad && store.sections.isEmpty && !store.isLoading {
+                // 1.3.20 (F-2): the empty/loading/stalled states key
+                // off whether ANY band is on screen, not off
+                // `sections.isEmpty`. In 1.3.19 a switch set the new
+                // plugin's section list before any section had
+                // landed, so `sections` was non-empty while nothing
+                // rendered: no spinner, no empty state, no
+                // focusable — a void below the chips for as long as
+                // the source took (a dead source: Net's full 20 s
+                // budget per section). A load that settled with
+                // every section empty and error-free left the same
+                // void forever.
+                if store.didLoad && !contentHasBands && !store.isLoading {
                     TVEmptyState(icon: "film.stack", title: "Chưa có nội dung",
                                  actionTitle: "Tải lại",
                                  action: { Task { await store.load(plugins: plugins, service: service, force: true) } },
                                  onFocusChange: focusHook("empty action=reload"))
-                }
-                if store.isLoading && store.sections.isEmpty {
+                        .onMoveCommand { direction in escapeToChip(from: "empty", direction) }
+                } else if store.isLoading && !contentHasBands && loadStalled {
+                    TVEmptyState(icon: "wifi.exclamationmark", title: "Nguồn chưa phản hồi",
+                                 message: "Máy chủ của nguồn này đang chậm hoặc không trả lời.",
+                                 actionTitle: "Tải lại",
+                                 action: { Task { await store.load(plugins: plugins, service: service, force: true) } },
+                                 onFocusChange: focusHook("empty action=stalled-reload"))
+                        .onMoveCommand { direction in escapeToChip(from: "stalled", direction) }
+                } else if store.isLoading && !contentHasBands {
                     ProgressView()
                         .tint(.white)
                         .frame(maxWidth: .infinity, minHeight: 240)
@@ -769,7 +919,6 @@ struct TVHomeView: View {
     /// read. Only element kinds and ids are logged.
     private func focusHook(_ element: String) -> (Bool) -> Void {
         { focused in
-            focusEventEpoch &+= 1
             if focused {
                 focusTracker.note(element)
                 DiagLog.log("focus", "home gain element=\(element)")
@@ -783,9 +932,9 @@ struct TVHomeView: View {
     // MARK: - Dwell-to-switch (L-T45 1.3.18, revised 1.3.19)
 
     private func cancelChipDwell() {
-        dwellTask?.cancel()
-        dwellTask = nil
-        dwellPluginId = nil
+        scratch.dwellTask?.cancel()
+        scratch.dwellTask = nil
+        scratch.dwellPluginId = nil
     }
 
     /// A chip that HOLDS focus switches the source by itself
@@ -807,37 +956,85 @@ struct TVHomeView: View {
     /// Every log_8 dwell the owner meant (123av 15:09:11.811,
     /// avdbapi 15:10:13.776, 123av 15:10:23.946, avdbapi
     /// 15:10:49.572) was a single step and keeps its 600 ms.
-    /// FIRE conditions are the 1.3.18 ones (still the armed
-    /// dwell, no focus event since the arm, the tracker still
-    /// names this chip, not already active) plus Home visible.
+    /// FIRE conditions: still the armed dwell, the tracker still
+    /// names this chip, not already active, Home visible.
+    /// 1.3.20 (F-2): the 1.3.19 "no focus event since the arm"
+    /// epoch condition is GONE. SwiftUI delivers a chip-to-chip
+    /// move as gain-then-lost about half the time (log_9
+    /// 11:58:43.987: `gain chip avdbapi` / `lost chip 123av` in
+    /// the same millisecond); the old chip's LOST arrived after
+    /// the arm, bumped the epoch, and the dwell silently never
+    /// fired — the owner sat on avdbapi's chip for 2.8 s and
+    /// nothing happened. A loss of THIS chip still cancels the
+    /// dwell (below), and any other chip's gain re-arms it, so
+    /// the epoch added nothing but the race.
     private func noteChipDwell(pluginId: String, focused: Bool) {
         if focused {
             let now = Date()
-            let recent = recentChipGains.filter { now.timeIntervalSince($0) <= 1.2 }
-            recentChipGains = Array((recent + [now]).suffix(6))
+            let recent = scratch.recentChipGains.filter { now.timeIntervalSince($0) <= 1.2 }
+            scratch.recentChipGains = Array((recent + [now]).suffix(6))
             cancelChipDwell()
             guard pluginId != plugins.activePluginId, homeVisible else { return }
             let traversal = recent.count >= 2
             let threshold = traversal ? 1300 : 600
-            dwellPluginId = pluginId
-            let dwellEpoch = focusEventEpoch
-            dwellTask = Task { @MainActor in
+            scratch.dwellPluginId = pluginId
+            scratch.dwellTask = Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(threshold))
                 guard !Task.isCancelled,
-                      dwellPluginId == pluginId,
-                      focusEventEpoch == dwellEpoch,
+                      scratch.dwellPluginId == pluginId,
                       focusTracker.current == "chip plugin=\(pluginId)",
                       pluginId != plugins.activePluginId,
                       homeVisible
                 else { return }
-                dwellTask = nil
-                dwellPluginId = nil
+                scratch.dwellTask = nil
+                scratch.dwellPluginId = nil
                 let dwellMs = Int(Date().timeIntervalSince(now) * 1000)
                 DiagLog.log("focus", "dwell switch plugin=\(pluginId) dwell=\(dwellMs)ms threshold=\(threshold)ms traversal=\(traversal ? "yes" : "no")")
                 plugins.activePluginId = pluginId
             }
-        } else if dwellPluginId == pluginId {
+        } else if scratch.dwellPluginId == pluginId {
             cancelChipDwell()
+        }
+    }
+
+    // MARK: - 1.3.20 (F-2): no dead ends, no voids
+
+    /// Whether any band is actually on screen (a hero, a rail
+    /// with items, or a section's error row).
+    private var contentHasBands: Bool {
+        if store.heroMovie != nil { return true }
+        return store.sections.contains { section in
+            !(store.items[section.id] ?? []).isEmpty || store.sectionErrors[section.id] != nil
+        }
+    }
+
+    /// The full-surface states (empty / stalled) hold ONE
+    /// button, and the `.onMoveCommand` on it consumes every
+    /// direction — the engine's own search does not also run,
+    /// so no direction "reaches the chips by itself". Instead
+    /// of eating the press, all four directions hand focus
+    /// back to the active chip — the state can be left in
+    /// every direction. (Gate fix, 1.3.20: the `.up` exemption
+    /// in the first draft of this function made Up a dead
+    /// press here; two gate lenses convicted it independently.)
+    private func escapeToChip(from state: String, _ direction: MoveCommandDirection) {
+        guard homeVisible, let target = landingChipId else { return }
+        DiagLog.log("focus", "empty-escape state=\(state) dir=\(String(describing: direction)) target=chip plugin=\(target)")
+        chipFocus = target
+    }
+
+    /// Arms (or disarms) the stall watch: a load that has put
+    /// nothing on screen for `stallSeconds` flips `loadStalled`.
+    private func armStallWatch() {
+        stallGeneration &+= 1
+        let gen = stallGeneration
+        if loadStalled { loadStalled = false }
+        if !store.isLoading || contentHasBands { return }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(Self.stallSeconds))
+            guard gen == stallGeneration, store.isLoading, !contentHasBands else { return }
+            loadStalled = true
+            DiagLog.log("home", "load stalled plugin=\(plugins.activePluginId) after=\(Self.stallSeconds)s state=focusable-empty")
         }
     }
 
@@ -905,9 +1102,9 @@ struct TVHomeView: View {
     /// the active chip once, and log it.
     private func handleTabBarDeadPress() {
         let now = Date()
-        tabBarDeadPresses = tabBarDeadPresses.filter { now.timeIntervalSince($0) <= 2.0 } + [now]
-        guard tabBarDeadPresses.count >= 3, homeVisible, let target = landingChipId else { return }
-        tabBarDeadPresses = []
+        scratch.tabBarDeadPresses = scratch.tabBarDeadPresses.filter { now.timeIntervalSince($0) <= 2.0 } + [now]
+        guard scratch.tabBarDeadPresses.count >= 3, homeVisible, let target = landingChipId else { return }
+        scratch.tabBarDeadPresses = []
         DiagLog.log("focus", "tabbar-rescue target=chip plugin=\(target)")
         chipFocus = target
     }
@@ -935,10 +1132,10 @@ struct TVHomeView: View {
                    entryFocus: $heroFocused)
     }
 
-    /// One rail card. The focus-driven append (L-T42) now fires
-    /// within the last 12 cards (was 4) — one card is one press,
-    /// so the next page is asked for a full screen ahead of the
-    /// end; the background fill has usually got there first.
+    /// One rail card. 1.3.20 (F-4): every card focus feeds the
+    /// rail's endless lookahead (`ensureLookahead`) — pages keep
+    /// arriving `scrollLookahead` cards ahead of the user until
+    /// the source's own last page.
     private func railCard(movie: Movie, pluginId pid: String, section: HomeSection,
                           globalIndex index: Int, totalCount: Int) -> some View {
         TVPosterCard(movie: movie, width: 240,
@@ -952,8 +1149,12 @@ struct TVHomeView: View {
                      },
                      onFocusChange: { focused in
                          focusHook("card movie=\(movie.id)")(focused)
-                         if focused == true, index >= totalCount - 12 {
-                             Task { await store.loadMoreSection(sectionId: section.id, plugins: plugins, service: service) }
+                         if focused {
+                             // 1.3.20 (F-4): endless — keep a
+                             // lookahead of loaded cards past
+                             // this one, to the source's end.
+                             store.ensureLookahead(sectionId: section.id, focusIndex: index,
+                                                   plugins: plugins, service: service)
                          }
                      })
     }
@@ -1242,6 +1443,22 @@ private struct TVHeroCard: View {
         }
         .onChange(of: focusActive) { _, focused in onFocusChange?(focused) }
     }
+}
+
+// MARK: - Focus scratch (1.3.20)
+
+/// Home's non-displayed focus bookkeeping. A plain reference
+/// (not Observable), held in @State only for its lifetime, so
+/// writing it never re-evaluates Home's body. Main actor only.
+@MainActor
+private final class TVHomeFocusScratch {
+    var dwellTask: Task<Void, Never>?
+    var dwellPluginId: String?
+    /// Gain times of the last few chip gains — the traversal
+    /// witness the dwell threshold reads.
+    var recentChipGains: [Date] = []
+    /// Times of recent dead presses on the tab bar (rescue).
+    var tabBarDeadPresses: [Date] = []
 }
 
 // MARK: - Focus tracker (L-T41 §5.3, simplified 1.3.19)

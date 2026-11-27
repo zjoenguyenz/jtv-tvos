@@ -975,9 +975,18 @@ enum TVFocusProbe {
 
     @MainActor
     static func engineFocus() -> Reading {
-        guard let window = activeKeyWindow(),
-              let item = UIFocusSystem(for: window)?.focusedItem
-        else { return Reading(state: .nowhere, description: "nil") }
+        guard let window = activeKeyWindow() else {
+            return Reading(state: .nowhere, description: "nil")
+        }
+        return classify(UIFocusSystem(for: window)?.focusedItem)
+    }
+
+    /// 1.3.20: the classification on its own, so the focus
+    /// monitor can classify the `nextFocusedItem` of a focus
+    /// update without re-reading the engine.
+    @MainActor
+    static func classify(_ item: UIFocusItem?) -> Reading {
+        guard let item else { return Reading(state: .nowhere, description: "nil") }
         var desc = String(describing: type(of: item))
         var onTabBar = false
         if let view = item as? UIView {
@@ -999,7 +1008,7 @@ enum TVFocusProbe {
     }
 
     @MainActor
-    private static func activeKeyWindow() -> UIWindow? {
+    static func activeKeyWindow() -> UIWindow? {
         for scene in UIApplication.shared.connectedScenes {
             guard let windowScene = scene as? UIWindowScene,
                   windowScene.activationState == .foregroundActive
@@ -1008,6 +1017,168 @@ enum TVFocusProbe {
                 return key
             }
             return windowScene.windows.first
+        }
+        return nil
+    }
+}
+
+// MARK: - Engine focus monitor (1.3.20)
+
+/// The app-wide, PASSIVE witness of where the focus ENGINE put
+/// focus after every update — `UIFocusSystem.didUpdateNotification`,
+/// classified by TVFocusProbe into tab bar / window / nowhere.
+///
+/// Why it exists (log_9): Home's hooks only see Home elements, so
+/// every move onto the TAB BAR read as `home lost …` with no gain
+/// anywhere (11:58:46.772 — the owner's "focus vanished" moment
+/// was focus going to the tab bar, then a second Menu press
+/// exiting the app). The monitor writes one `[focus] engine
+/// place=…` line whenever the CLASS of the focused item changes
+/// (tab bar ↔ content ↔ nowhere), so every `lost` now pairs with
+/// a destination in the log.
+///
+/// It also drives behaviour: the root Menu net is installed only
+/// while focus is NOT in content (TVRootView), and Home/Browse
+/// rescue a void (`place == .nowhere` that lasts) onto a stable
+/// element. Created once by TVRootView, injected through the
+/// environment. Main-actor only.
+@MainActor
+@Observable
+final class TVFocusMonitor {
+    private(set) var place: TVFocusProbe.Place = .inWindow
+    /// Bumped on every transition INTO .nowhere — the void
+    /// rescues key off it.
+    private(set) var voidEpoch = 0
+    @ObservationIgnored private var token: NSObjectProtocol?
+
+    func install() {
+        guard token == nil else { return }
+        place = TVFocusProbe.engineFocus().state
+        token = NotificationCenter.default.addObserver(
+            forName: UIFocusSystem.didUpdateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            MainActor.assumeIsolated {
+                let context = note.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey] as? UIFocusUpdateContext
+                self?.update(TVFocusProbe.classify(context?.nextFocusedItem))
+            }
+        }
+        DiagLog.log("focus", "engine monitor installed place=\(TVFocusProbe.engineFocus().label)")
+    }
+
+    private func update(_ reading: TVFocusProbe.Reading) {
+        guard reading.state != place else { return }
+        place = reading.state
+        if reading.state == .nowhere { voidEpoch &+= 1 }
+        DiagLog.log("focus", "engine place=\(reading.label) item=\(reading.description)")
+    }
+}
+
+// MARK: - Tab-bar focus bridge (1.3.20, F-1/F-2)
+
+/// UP from the content's top row must always reach the tab bar
+/// (the owner's "main menu").
+///
+/// log_9: every run of dead presses on a chip in the MIDDLE or
+/// RIGHT of the source rail was the owner pressing UP to reach
+/// the menu — misskon 11:57:47.500–47.928 (4×, arriving from the
+/// header below, pressing up), hentaihub 11:58:20.792–22.315 (5×,
+/// arriving UP from the hero). UP worked only from the chips that
+/// sit under the tab bar's own buttons (missav 11:58:40.547,
+/// 123av 11:56:34.213, sextop1 11:57:00.755): the focus engine
+/// searches straight up, the tab bar's buttons cover only part of
+/// the screen's width, and a chip with no tab button above it has
+/// no candidate. He then walked the rail end to end hunting for a
+/// spot where UP worked (the row-end runs at javmost and missav),
+/// found it at missav, and finally left with Menu.
+///
+/// The bridge is the platform's own tool for exactly this gap: a
+/// `UIFocusGuide` spanning the FULL width of the window along its
+/// top edge, whose preferred focus environment is the tab bar.
+/// An UP search from anywhere along the top row now meets the
+/// guide and is redirected to the tab bar (its selected tab). It
+/// sits above everything, so no DOWN/LEFT/RIGHT search from the
+/// content can reach it, and a search from the tab bar itself is
+/// redirected to the tab bar (a no-op). Installed in the tab bar
+/// controller's view (idempotent), re-pointed when the tab bar
+/// instance changes (the PIN gate rebuilds the root).
+@MainActor
+enum TVTabBarFocusBridge {
+    private static weak var guide: UIFocusGuide?
+    private static weak var tabBar: UITabBar?
+    /// Whether the bridge should be live: only while the
+    /// selected tab's stack is at its ROOT (TVRootView drives
+    /// it). On a pushed screen Back is the way home, and a wide
+    /// UP-to-tab-bar would only pull focus out of the screen —
+    /// where its own Back can no longer receive the press.
+    private static var wanted = true
+
+    static func setEnabled(_ enabled: Bool) {
+        wanted = enabled
+        guide?.isEnabled = enabled
+    }
+
+    /// Returns a short status for the log line.
+    @discardableResult
+    static func install(reason: String) -> String {
+        guard let window = TVFocusProbe.activeKeyWindow() else {
+            DiagLog.log("focus", "tabbar-bridge unavailable reason=no-window via=\(reason)")
+            return "no-window"
+        }
+        guard let bar = findTabBar(in: window) else {
+            DiagLog.log("focus", "tabbar-bridge unavailable reason=no-tabbar via=\(reason)")
+            return "no-tabbar"
+        }
+        // The guide lives in the TAB BAR CONTROLLER's own view
+        // (the TabView's hierarchy), not on the window: when a
+        // full-screen cover (the player, the filter sheet) is
+        // presented, that hierarchy is outside the focus scope,
+        // so the guide cannot redirect anything there.
+        guard let host = owningController(of: bar)?.view ?? bar.superview else {
+            DiagLog.log("focus", "tabbar-bridge unavailable reason=no-host via=\(reason)")
+            return "no-host"
+        }
+        if let guide, guide.owningView === host {
+            if tabBar !== bar {
+                guide.preferredFocusEnvironments = [bar]
+                tabBar = bar
+                DiagLog.log("focus", "tabbar-bridge repointed tabs=\(bar.items?.count ?? 0) via=\(reason)")
+                return "repointed"
+            }
+            return "present"
+        }
+        let newGuide = UIFocusGuide()
+        host.addLayoutGuide(newGuide)
+        NSLayoutConstraint.activate([
+            newGuide.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+            newGuide.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+            newGuide.topAnchor.constraint(equalTo: host.topAnchor),
+            newGuide.heightAnchor.constraint(equalToConstant: 2)
+        ])
+        newGuide.preferredFocusEnvironments = [bar]
+        newGuide.isEnabled = wanted
+        guide = newGuide
+        tabBar = bar
+        DiagLog.log("focus", "tabbar-bridge installed host=\(String(describing: type(of: host))) width=\(Int(host.bounds.width)) tabs=\(bar.items?.count ?? 0) via=\(reason)")
+        return "installed"
+    }
+
+    /// The UITabBarController that owns this tab bar, found
+    /// through the responder chain.
+    private static func owningController(of bar: UITabBar) -> UITabBarController? {
+        var responder: UIResponder? = bar.next
+        while let r = responder {
+            if let controller = r as? UITabBarController { return controller }
+            responder = r.next
+        }
+        return nil
+    }
+
+    private static func findTabBar(in view: UIView) -> UITabBar? {
+        if let bar = view as? UITabBar { return bar }
+        for sub in view.subviews {
+            if let found = findTabBar(in: sub) { return found }
         }
         return nil
     }

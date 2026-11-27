@@ -335,6 +335,8 @@ struct TVBrowseView: View {
     @EnvironmentObject private var session: PinSession
     @Environment(\.tvTheme) private var theme
     @Environment(TVNavPath.self) private var nav
+    /// 1.3.20: the app-wide engine-focus witness (TVRootView).
+    @Environment(TVFocusMonitor.self) private var focusMonitor
 
     @State private var items: [Movie] = []
     @State private var page = 0
@@ -356,7 +358,11 @@ struct TVBrowseView: View {
     @State private var firstCardHandOffOwed = false
     /// Diagnostics: the element this screen's hooks last saw
     /// holding focus ("filter", "card movie=<id>", "none").
-    @State private var focusedElement = "none"
+    /// 1.3.20: kept in a plain reference box, not @State — it is
+    /// never displayed, and as @State every card-to-card move
+    /// re-evaluated the whole grid screen.
+    @State private var focusBox = TVBrowseFocusBox()
+    private var focusedElement: String { focusBox.element }
     @State private var appeared = false
 
     init(pluginId: String, slug: String, title: String, initialFilters: ListFilters) {
@@ -413,6 +419,19 @@ struct TVBrowseView: View {
                 }
             }
         }
+        // 1.3.20 (F-2): a focus void inside Browse that lasts
+        // 400 ms is rescued onto the filter button (present from
+        // the first frame) — the screen keeps focus, so it keeps
+        // receiving its own Back.
+        .onChange(of: focusMonitor.voidEpoch) { _, epoch in
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(400))
+                guard epoch == focusMonitor.voidEpoch, focusMonitor.place == .nowhere,
+                      appeared, isTopOfStack else { return }
+                DiagLog.log("browse", "void-rescue target=filter plugin=\(pluginId)")
+                filterFocused = true
+            }
+        }
         .onChange(of: filterFocused) { _, focused in
             noteFocus("filter", focused)
         }
@@ -445,11 +464,17 @@ struct TVBrowseView: View {
         }
     }
 
+    /// 1.3.20: every Browse focus transition is now a log line
+    /// (`[focus] browse gain|lost element=…`) — log_9 had no
+    /// witness at all of where focus went inside Browse before
+    /// each Back.
     private func noteFocus(_ element: String, _ focused: Bool) {
         if focused {
-            focusedElement = element
-        } else if focusedElement == element {
-            focusedElement = "none"
+            focusBox.element = element
+            DiagLog.log("focus", "browse gain element=\(element)")
+        } else {
+            if focusBox.element == element { focusBox.element = "none" }
+            DiagLog.log("focus", "browse lost element=\(element)")
         }
     }
 
@@ -824,4 +849,11 @@ private struct TVSheetActionButton: View {
         .tvCardButton()
         .modifier(TVEntryFocusModifier(binding: focusBinding ?? $internalFocused))
     }
+}
+
+/// 1.3.20: Browse's non-displayed focus bookkeeping (see
+/// `focusBox`). Main actor only.
+@MainActor
+private final class TVBrowseFocusBox {
+    var element = "none"
 }
