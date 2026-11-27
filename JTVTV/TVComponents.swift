@@ -1049,21 +1049,35 @@ final class TVFocusMonitor {
     /// Bumped on every transition INTO .nowhere — the void
     /// rescues key off it.
     private(set) var voidEpoch = 0
-    @ObservationIgnored private var token: NSObjectProtocol?
+    /// The selector-based observer (see TVFocusUpdateRelay).
+    /// Retained here; NotificationCenter holds it weakly. Its
+    /// presence is the install guard (idempotence).
+    @ObservationIgnored private var relay: TVFocusUpdateRelay?
 
     func install() {
-        guard token == nil else { return }
+        guard relay == nil else { return }
         place = TVFocusProbe.engineFocus().state
-        token = NotificationCenter.default.addObserver(
-            forName: UIFocusSystem.didUpdateNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] note in
-            MainActor.assumeIsolated {
-                let context = note.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey] as? UIFocusUpdateContext
-                self?.update(TVFocusProbe.classify(context?.nextFocusedItem))
-            }
+        // Compile fix (CI run #44): the 1.3.20 block observer was
+        // a `@Sendable` NONISOLATED closure that captured the
+        // non-Sendable `note` into the main-actor closure of
+        // `MainActor.assumeIsolated` — a cross-isolation send that
+        // region isolation rejects. The notification is now
+        // delivered through a selector to a MAIN-ACTOR method
+        // (TVFocusUpdateRelay.focusDidUpdate), so `note` is born
+        // and used inside one isolation domain and nothing is
+        // ever sent. Same notification, same payload
+        // (`nextFocusedItem` of THIS update), same synchronous
+        // delivery on the posting (main) thread.
+        let newRelay = TVFocusUpdateRelay { [weak self] nextItem in
+            self?.update(TVFocusProbe.classify(nextItem))
         }
+        NotificationCenter.default.addObserver(
+            newRelay,
+            selector: #selector(TVFocusUpdateRelay.focusDidUpdate(_:)),
+            name: UIFocusSystem.didUpdateNotification,
+            object: nil
+        )
+        relay = newRelay
         DiagLog.log("focus", "engine monitor installed place=\(TVFocusProbe.engineFocus().label)")
     }
 
@@ -1072,6 +1086,34 @@ final class TVFocusMonitor {
         place = reading.state
         if reading.state == .nowhere { voidEpoch &+= 1 }
         DiagLog.log("focus", "engine place=\(reading.label) item=\(reading.description)")
+    }
+}
+
+/// Main-actor receiver for `UIFocusSystem.didUpdateNotification`
+/// (compile fix for CI run #44). A selector-based observer is
+/// called synchronously on the thread that POSTS the notification
+/// — UIKit posts focus updates on the main thread — and, because
+/// this class is `@MainActor`, `focusDidUpdate` is main-actor
+/// isolated: the `Notification`, its `userInfo`, the
+/// `UIFocusUpdateContext` and its `nextFocusedItem` are all read
+/// inside the main actor, where every one of those UIKit symbols
+/// lives. No value crosses an isolation boundary, so there is no
+/// `sending` check to fail and no `nonisolated(unsafe)` to assert.
+/// The same shape — an `@objc` method of a `@MainActor` class used
+/// through `#selector` — already compiles in this tree
+/// (TVKSPlayerHostViewController's bar buttons).
+@MainActor
+private final class TVFocusUpdateRelay: NSObject {
+    private let onUpdate: @MainActor ((any UIFocusItem)?) -> Void
+
+    init(onUpdate: @escaping @MainActor ((any UIFocusItem)?) -> Void) {
+        self.onUpdate = onUpdate
+        super.init()
+    }
+
+    @objc func focusDidUpdate(_ note: Notification) {
+        let context = note.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey] as? UIFocusUpdateContext
+        onUpdate(context?.nextFocusedItem)
     }
 }
 

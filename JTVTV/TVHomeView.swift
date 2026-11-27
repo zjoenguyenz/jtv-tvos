@@ -472,6 +472,18 @@ final class TVHomeStore {
         }
     }
 
+    /// 1.3.20 (owner addition, ordered 2026-11-27 12:43 CST):
+    /// whether a rail append is in flight for this section —
+    /// drives the rail-end loading indicator in sectionBand, so
+    /// the end of a rail visibly says "still loading" instead of
+    /// standing still with no sign of life (his test report:
+    /// "kéo hết trang là nó đứng yên chứ ko có vòng tròn
+    /// loading"). sectionsLoadingMore is an observed property,
+    /// so the band re-renders when an append starts or ends.
+    func isPaging(_ sectionId: String) -> Bool {
+        sectionsLoadingMore[sectionId] != nil
+    }
+
     /// Whether the section can still page (the same guards
     /// loadMoreSection applies, minus the in-flight marker).
     private func canPage(_ sectionId: String) -> Bool {
@@ -1271,6 +1283,23 @@ struct TVHomeView: View {
                                                  globalIndex: head.count + index, totalCount: movies.count)
                                     }
                                 }
+                            }
+                            if store.isPaging(section.id) {
+                                // 1.3.20 (owner addition, ordered
+                                // 2026-11-27 12:43 CST): rail-end
+                                // loading indicator. While the next
+                                // page is in flight, the end of the
+                                // rail shows a spinner instead of
+                                // standing still, so "still loading"
+                                // is distinguishable from "the
+                                // source has ended". Deliberately
+                                // NOT focusable: the focus engine
+                                // skips it and focus stays on the
+                                // last card; it disappears the
+                                // moment the append lands (or the
+                                // attempt ends).
+                                ProgressView()
+                                    .frame(width: 120)
                             }
                         }
                         .padding(.horizontal, 4)
